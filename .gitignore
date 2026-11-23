@@ -1,2 +1,5 @@
 draft-royer-*
 *.zip
+build
+.qtcreator
+.qtcreator

@@ -83,6 +83,11 @@ int main(int ArgCount, char* ArgValues[])
         "background-color: #45619E; color: #FFFFFF; }"
         "QLineEdit:focus { border: 1px solid #5D86CA; }"
         "QComboBox:focus { border: 1px solid #5D86CA; }"
+        // The template picker in the start wizard stays disabled
+        // until "Create from an IETF template" is picked: without
+        // this rule it kept the live colors and read as broken
+        // (reported 2026-11-23).
+        "QComboBox:disabled { background-color: #28375E; color: #6E7FA3; }"
         // The abstract and section-body edits are QPlainTextEdit, and
         // the date edit is a QDateEdit: without these rules they kept
         // the default white background under the theme's white text

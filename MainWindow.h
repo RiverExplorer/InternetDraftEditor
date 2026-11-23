@@ -35,6 +35,7 @@
 
 #include <libxml/tree.h>
 
+#include "BibCache.h"
 #include "DocModel.h"
 #include "DocValidator.h"
 #include "SpellChecker.h"
@@ -188,6 +189,12 @@ private slots:
     void OnAddReferenceGroup();
 
     /**
+     * @brief Adds a nested reference list under the shown list,
+     *        asking for its name first.
+     */
+    void OnAddNestedReferenceGroup();
+
+    /**
      * @brief Removes the shown reference list and its entries,
      *        after confirming.
      */
@@ -213,6 +220,37 @@ private slots:
      *        its anchor first.
      */
     void OnAddReferenceEntry();
+
+    /**
+     * @brief Carries out a References-menu request from a text editor.
+     *
+     * A new reference makes the entry in the named list (an
+     * xi:include for an RFC number, a placeholder entry otherwise)
+     * and cites it; an internal reference gives the picked target
+     * an anchor when it has none, then cites it. The editor that
+     * asked gets the cross-reference marker.
+     * @param Editor The text editor that asked, borrowed.
+     * @param Action NewReferenceAction or InternalReferenceAction.
+     * @param Target The internal target element, for InternalReferenceAction.
+     * @param Anchor The reference anchor, for NewReferenceAction.
+     * @param ListName The nested list name, for NewReferenceAction.
+     */
+    void HandleMakeReference(TextEditor* Editor, int Action,
+                             xmlNodePtr Target, const QString& Anchor,
+                             const QString& ListName);
+
+    /**
+     * @brief The nested reference list with this name, creating it when missing.
+     *
+     * The named list under the outer "References" list, creating
+     * the back matter, the outer list, and both nested lists when
+     * the file has none. A file whose "References" list is flat
+     * (entries, no nested lists) returns that list itself: the
+     * normative/informative split does not exist there.
+     * @param ListName The nested list name.
+     * @return The list node, borrowed, or nullptr when there is no document.
+     */
+    xmlNodePtr EnsureReferenceList(const QString& ListName);
 
     /**
      * @brief Removes the shown reference entry, after confirming.
@@ -305,6 +343,11 @@ private slots:
      * @brief Asks for the xml2rfc program path and remembers it.
      */
     void OnSetXml2rfcPath();
+
+    /**
+     * @brief Shows the Bibliography dialog: the cache folder and entries.
+     */
+    void OnBibliography();
 
     /**
      * @brief Shows what the text editor's special characters mean.
@@ -471,6 +514,7 @@ private:
         KindReferenceGroup,
         KindReferenceEntry,
         KindReferenceAuthor,
+        KindReferenceInclude,
         KindDocumentSettings
     };
 
@@ -495,6 +539,16 @@ private:
      */
     void AddSectionItem(QTreeWidgetItem* Parent, xmlNodePtr Section,
                         const QString& Path);
+
+    /**
+     * @brief Adds one reference list, with its nested lists, entries,
+     *        and their authors, to the outline.
+     * @param Parent The outline item to add under.
+     * @param Group The <references> node to add (borrowed).
+     * @param Path The list's path (dot-separated indices).
+     */
+    void AddReferenceGroupItem(QTreeWidgetItem* Parent, xmlNodePtr Group,
+                               const QString& Path);
 
     /**
      * @brief Shows the details pane for one outline item.
@@ -532,21 +586,21 @@ private:
     xmlNodePtr ShownAuthor();
 
     /**
-     * @brief Finds the reference list at an index.
-     * @param Group The list index.
-     * @return The list node (borrowed), or nullptr when the index
+     * @brief Finds the reference list at a dotted path.
+     * @param Group The list path, such as "0" or "0.1".
+     * @return The list node (borrowed), or nullptr when the path
      *         is bad.
      */
-    xmlNodePtr FindReferenceGroup(int Group);
+    xmlNodePtr FindReferenceGroup(const QString& Group);
 
     /**
-     * @brief Finds the reference entry at a list and entry index.
-     * @param Group The list index.
+     * @brief Finds the reference entry at a list path and entry index.
+     * @param Group The list path, such as "0" or "0.1".
      * @param Entry The entry index in that list.
      * @return The entry node (borrowed), or nullptr when an index
      *         is bad.
      */
-    xmlNodePtr FindReferenceEntry(int Group, int Entry);
+    xmlNodePtr FindReferenceEntry(const QString& Group, int Entry);
 
     /**
      * @brief Fills the section form with the shown section.
@@ -677,20 +731,35 @@ private:
     DocValidationResult ValidateAndReport(const QString& Path, bool AlwaysShow);
 
     /**
+     * @brief Leaves out the validation errors a resolved include explains.
+     *
+     * The report stays about the file itself, so its line numbers
+     * match the file: an include the bibliography cache resolved
+     * explains its own "did not expect element include there" and
+     * the unknown-ID errors for the anchor it carries. An include
+     * that did not resolve keeps its errors, and a failed download
+     * gets a plain note. Returns how many includes were resolved.
+     * @param Result The validation result to filter, in place.
+     * @return The number of resolved includes.
+     */
+    int FilterIncludeErrors(DocValidationResult& Result);
+
+    /**
      * @brief Appends text to the run log dialog.
      * @param Text The text to append.
      */
     void AppendRunLog(const QString& Text);
 
     DocDocument _Document;
+    BibCache _BibCache;
     QString _FilePath;
     bool _Modified;
     std::unique_ptr<SpellChecker> _SpellChecker;
     QString _SelectedKey;
     int _AuthorIndex;
-    int _AuthorGroup;
+    QString _AuthorGroupPath;
     int _AuthorEntry;
-    int _ReferenceGroupIndex;
+    QString _ReferenceGroupPath;
     int _ReferenceEntryIndex;
     QString _SectionPath;
     bool _RunFailed;
@@ -739,6 +808,8 @@ private:
     QLabel* _SectionPreservedLabel;
     QLabel* _SectionRequiredLabel;
     QLineEdit* _ReferenceGroupNameEdit;
+    QPushButton* _AddReferenceEntryButton;
+    QPushButton* _AddNestedListButton;
     QLabel* _ReferenceGroupPreservedLabel;
     QLineEdit* _ReferenceAnchorEdit;
     QLineEdit* _ReferenceTargetEdit;

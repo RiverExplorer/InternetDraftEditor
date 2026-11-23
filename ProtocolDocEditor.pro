@@ -6,7 +6,7 @@
 #
 # See README.md for build instructions.
 
-QT += core gui widgets
+QT += core gui widgets network
 
 CONFIG += c++20
 CONFIG -= app_bundle
@@ -17,6 +17,7 @@ VERSION = 1.1.0
 
 SOURCES += \
     main.cpp \
+    BibCache.cpp \
     DocModel.cpp \
     DocValidator.cpp \
     StartWizard.cpp \
@@ -37,6 +38,7 @@ SOURCES += \
     hunspell/suggestmgr.cxx
 
 HEADERS += \
+    BibCache.h \
     DocModel.h \
     DocValidator.h \
     StartWizard.h \
@@ -73,9 +75,10 @@ DEFINES += HUNSPELL_STATIC
 RESOURCES += templates.qrc
 
 # libxml2 (static MinGW build) for in-app RelaxNG validation. The
-# headers and libraries live in RelatedProjects/include and
-# RelatedProjects/lib; see README-libxml2-mingw.md there. LIBXML_STATIC
-# is required: without it the headers assume a DLL.
+# headers and libraries live beside this file, in include/ and lib/
+# (moved into the tree for GitHub, 2026-11-23); see
+# README-libxml2-mingw.md there. LIBXML_STATIC is required:
+# without it the headers assume a DLL.
 INCLUDEPATH += $$PWD/include/libxml2 $$PWD/include
 LIBS += -L$$PWD/lib -lxml2 -lz -liconv -lbcrypt
 DEFINES += LIBXML_STATIC

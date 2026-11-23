@@ -34,6 +34,7 @@
 #include <QMimeData>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QSet>
 #include <QSettings>
 #include <QSignalBlocker>
@@ -5980,6 +5981,7 @@ TextEditor::TextEditor(QWidget* Parent)
     , _SettingParagraphs(false)
     , _SrcPlaceholderHintBlock(-1)
     , _SpellChecker(nullptr)
+    , _Document(nullptr)
     , _SpellHighlighter(nullptr)
 {
     _TextEdit = new DocTextEdit(this);
@@ -7526,6 +7528,7 @@ void TextEditor::OnContextMenuRequested(const QPoint& Pos)
     AddSpellActions(Menu, At);
     AddSourceOptionsActions(Menu, At);
     AddTagActions(Menu);
+    AddReferenceActions(Menu);
     bool CoveredMarkers = SelectionCoversOptionMarker(
         _TextEdit->document(), _TextEdit->textCursor());
     Menu->exec(_TextEdit->viewport()->mapToGlobal(At));
@@ -7627,6 +7630,276 @@ static bool TouchesSourceCode(QTextDocument* Document,
         Block = Block.next();
     }
     return false;
+}
+
+/**
+ * @brief Cleans highlighted text into a reference name.
+ *
+ * Line breaks become spaces, surrounding brackets and quotes
+ * come off ([iCal] names iCal), trailing sentence punctuation
+ * comes off, and runs of spaces collapse to one.
+ * @param Text The highlighted text.
+ * @return The cleaned name, or empty when nothing is left.
+ */
+static QString CleanReferenceName(const QString& Text)
+{
+    QString Cleaned = Text;
+    Cleaned.replace(QChar(0x2029), QLatin1Char(' '));
+    Cleaned.replace(QLatin1Char('\n'), QLatin1Char(' '));
+    Cleaned.replace(QLatin1Char('\r'), QLatin1Char(' '));
+    Cleaned = Cleaned.trimmed();
+    bool Stripped = true;
+    while (Stripped && Cleaned.length() >= 2) {
+        Stripped = false;
+        QChar First = Cleaned.front();
+        QChar Last = Cleaned.back();
+        if ((First == QLatin1Char('[') && Last == QLatin1Char(']')) ||
+            (First == QLatin1Char('(') && Last == QLatin1Char(')')) ||
+            (First == QLatin1Char('{') && Last == QLatin1Char('}')) ||
+            (First == QLatin1Char('"') && Last == QLatin1Char('"')) ||
+            (First == QLatin1Char('\'') && Last == QLatin1Char('\''))) {
+            Cleaned = Cleaned.mid(1, Cleaned.length() - 2).trimmed();
+            Stripped = true;
+        }
+    }
+    while (!Cleaned.isEmpty() &&
+           (Cleaned.back() == QLatin1Char('.') ||
+            Cleaned.back() == QLatin1Char(',') ||
+            Cleaned.back() == QLatin1Char(';') ||
+            Cleaned.back() == QLatin1Char(':'))) {
+        Cleaned.chop(1);
+        Cleaned = Cleaned.trimmed();
+    }
+    Cleaned.replace(QRegularExpression(QStringLiteral("\\s+")),
+                    QStringLiteral(" "));
+    return Cleaned.trimmed();
+}
+
+/**
+ * @brief The RFC anchor for highlighted text, or empty.
+ *
+ * RFC4324, RFC 4324, and [RFC4324] all name RFC4324; anything
+ * else names nothing here, and the author is asked for a name.
+ * @param Text The cleaned highlighted text.
+ * @return The anchor, or empty when the text is not an RFC number.
+ */
+static QString RfcReferenceAnchor(const QString& Text)
+{
+    QString Squashed = Text;
+    Squashed.remove(QRegularExpression(QStringLiteral("\\s+")));
+    if (Squashed.length() <= 3 ||
+        !Squashed.startsWith(QStringLiteral("RFC"), Qt::CaseInsensitive)) {
+        return QString();
+    }
+    QString Digits = Squashed.mid(3);
+    for (QChar Ch : Digits) {
+        if (!Ch.isDigit()) {
+            return QString();
+        }
+    }
+    return QStringLiteral("RFC") + Digits;
+}
+
+/**
+ * @brief The reference list with this name, at any level, or nullptr.
+ * @param Document The document, borrowed.
+ * @param Name The list name.
+ * @return The list node, borrowed, or nullptr.
+ */
+static xmlNodePtr FindReferenceList(const DocDocument* Document,
+                                    const QString& Name)
+{
+    if (Document == nullptr) {
+        return nullptr;
+    }
+    for (const QString& Path : Document->ReferenceGroupPaths()) {
+        xmlNodePtr Group = Document->ReferenceGroupAtPath(Path);
+        if (Group != nullptr &&
+            DocDocument::ChildText(Group, "name") == Name) {
+            return Group;
+        }
+    }
+    return nullptr;
+}
+
+/**
+ * @brief The citable entries of a list, anchor and label each.
+ *
+ * <reference> entries by anchor and outline label; <xi:include>
+ * entries by the anchor their href carries. Entries with no
+ * anchor cannot be cited and are left out.
+ * @param Group The <references> node, borrowed.
+ * @return The entries, in list order.
+ */
+static QVector<QPair<QString, QString>> ReferenceListEntries(xmlNodePtr Group)
+{
+    QVector<QPair<QString, QString>> Entries;
+    if (Group == nullptr) {
+        return Entries;
+    }
+    for (xmlNodePtr Entry : DocDocument::ReferenceEntries(Group)) {
+        QString Anchor =
+            DocDocument::NodeAttribute(Entry, "anchor").trimmed();
+        if (Anchor.isEmpty()) {
+            continue;
+        }
+        Entries.append(qMakePair(Anchor, DocDocument::ReferenceLabel(Entry)));
+    }
+    for (xmlNodePtr Include : DocDocument::ReferenceIncludeNodes(Group)) {
+        QString Anchor = DocDocument::ReferenceAnchorFromIncludeHref(
+            DocDocument::NodeAttribute(Include, "href"));
+        if (Anchor.isEmpty()) {
+            continue;
+        }
+        Entries.append(qMakePair(Anchor, Anchor));
+    }
+    return Entries;
+}
+
+void TextEditor::AddReferenceActions(QMenu* Menu)
+{
+    if (_Document == nullptr) {
+        return;
+    }
+    QTextCursor Cursor = _TextEdit->textCursor();
+    if (!Cursor.hasSelection()) {
+        return;
+    }
+    // Code, figures, and tables hold literal text only, so no
+    // reference is offered where the cursor touches a sourcecode
+    // block, a figure, or a table: the same rule as the tags.
+    if (TouchesSourceCode(_TextEdit->document(), Cursor) ||
+        TouchesFigure(_TextEdit->document(), Cursor) ||
+        TouchesTable(_TextEdit->document(), Cursor)) {
+        return;
+    }
+    QString Selected = CleanReferenceName(Cursor.selectedText());
+    if (Selected.isEmpty()) {
+        return;
+    }
+    QString RfcAnchor = RfcReferenceAnchor(Selected);
+    QMenu* ReferencesMenu = Menu->addMenu(tr("References"));
+
+    QMenu* NewMenu = ReferencesMenu->addMenu(tr("New"));
+    struct ReferenceListChoice
+    {
+        const char* Name;
+        const char* Label;
+    };
+    static const ReferenceListChoice Choices[] = {
+        {"Normative References", "Normative"},
+        {"Informative References", "Informative"},
+    };
+    for (const ReferenceListChoice& Choice : Choices) {
+        QString ListName = QString::fromLatin1(Choice.Name);
+        QAction* Action = NewMenu->addAction(tr(Choice.Label));
+        connect(Action, &QAction::triggered, this,
+                [this, ListName, Selected, RfcAnchor]() {
+            QString Anchor = RfcAnchor;
+            if (Anchor.isEmpty()) {
+                // Ask for the minimum information, a name,
+                // prefilled from the highlight; the author
+                // completes the details later, in the entry
+                // form. A bracketed key such as [iCal] arrives
+                // with the brackets already off. An RFC number
+                // never prompts: the highlight is the name.
+                bool Ok = false;
+                QString Name = QInputDialog::getText(
+                    this, tr("New Reference"), tr("Reference name:"),
+                    QLineEdit::Normal, Selected, &Ok);
+                if (!Ok) {
+                    return;
+                }
+                Anchor = CleanReferenceName(Name);
+                while (Anchor.isEmpty()) {
+                    Name = QInputDialog::getText(
+                        this, tr("New Reference"),
+                        tr("Reference name (required):"),
+                        QLineEdit::Normal, QString(), &Ok);
+                    if (!Ok) {
+                        return;
+                    }
+                    Anchor = CleanReferenceName(Name);
+                }
+            }
+            emit MakeReferenceRequested(NewReferenceAction, nullptr,
+                                        Anchor, ListName);
+        });
+    }
+
+    QAction* InternalAction = ReferencesMenu->addAction(tr("Internal"));
+    connect(InternalAction, &QAction::triggered, this, [this]() {
+        QVector<DocDocument::InternalTarget> Targets =
+            _Document->InternalTargets();
+        if (Targets.isEmpty()) {
+            QMessageBox::information(
+                this, tr("Internal Reference"),
+                tr("This document has no sections, figures, or tables "
+                   "to refer to."));
+            return;
+        }
+        QStringList Items;
+        QSet<QString> Seen;
+        for (const DocDocument::InternalTarget& Target : Targets) {
+            QString Item = Target.Title + QStringLiteral(" (") +
+                Target.Kind + QStringLiteral(")");
+            // QInputDialog returns the picked string, so two
+            // targets with the same title and kind need
+            // different strings.
+            QString Unique = Item;
+            int Suffix = 2;
+            while (Seen.contains(Unique)) {
+                Unique = Item + QStringLiteral(" ") +
+                    QString::number(Suffix++);
+            }
+            Seen.insert(Unique);
+            Items.append(Unique);
+        }
+        bool Ok = false;
+        QString Picked = QInputDialog::getItem(this,
+                                               tr("Internal Reference"),
+                                               tr("Refer to:"), Items, 0,
+                                               false, &Ok);
+        if (!Ok) {
+            return;
+        }
+        int Index = Items.indexOf(Picked);
+        if (Index < 0 || Index >= Targets.size()) {
+            return;
+        }
+        emit MakeReferenceRequested(InternalReferenceAction,
+                                    Targets[Index].Node, QString(),
+                                    QString());
+    });
+
+    QMenu* ExistingMenu = ReferencesMenu->addMenu(tr("Existing"));
+    for (const ReferenceListChoice& Choice : Choices) {
+        QString ListName = QString::fromLatin1(Choice.Name);
+        QMenu* ListMenu = ExistingMenu->addMenu(tr(Choice.Label));
+        xmlNodePtr Group = FindReferenceList(_Document, ListName);
+        if (Group == nullptr) {
+            ListMenu->setEnabled(false);
+            continue;
+        }
+        QVector<QPair<QString, QString>> Entries =
+            ReferenceListEntries(Group);
+        if (Entries.isEmpty()) {
+            ListMenu->setEnabled(false);
+            continue;
+        }
+        for (const QPair<QString, QString>& Entry : Entries) {
+            QAction* Action = ListMenu->addAction(Entry.second);
+            connect(Action, &QAction::triggered, this,
+                    [this, Anchor = Entry.first]() {
+                // No outline rebuild happens on this path, so
+                // the live selection is still the highlight.
+                int Start = -1;
+                int End = -1;
+                SelectedRange(Start, End);
+                InsertXrefMarker(Anchor, Start, End);
+            });
+        }
+    }
 }
 
 void TextEditor::AddTagActions(QMenu* Menu)
@@ -8397,6 +8670,51 @@ void TextEditor::InsertTag(const QString& Name)
     Cursor.insertText(MarkerText(Entry), FormatForMarker(Stack, Entry));
     Cursor.endEditBlock();
     _TextEdit->setTextCursor(Cursor);
+}
+
+void TextEditor::SetDocument(const DocDocument* Document)
+{
+    _Document = Document;
+}
+
+void TextEditor::SelectedRange(int& Start, int& End) const
+{
+    QTextCursor Cursor = _TextEdit->textCursor();
+    if (!Cursor.hasSelection()) {
+        Start = -1;
+        End = -1;
+        return;
+    }
+    Start = Cursor.selectionStart();
+    End = Cursor.selectionEnd();
+}
+
+void TextEditor::InsertXrefMarker(const QString& Anchor, int SelectionStart,
+                                  int SelectionEnd)
+{
+    DocTagEntry Entry;
+    Entry.Name = QStringLiteral("xref");
+    Entry.Attributes.append(
+        QPair<QString, QString>(QStringLiteral("target"), Anchor));
+    if (SelectionStart < 0 || SelectionEnd <= SelectionStart) {
+        // No text to cite: drop a bare marker at the cursor, as
+        // the tag menu does. The References menu only offers
+        // itself with a selection, so this is a fallback only.
+        QTextCursor Cursor = _TextEdit->textCursor();
+        Cursor.beginEditBlock();
+        DocTagStack Stack = StackOf(Cursor.charFormat());
+        Cursor.insertText(MarkerText(Entry), FormatForMarker(Stack, Entry));
+        Cursor.endEditBlock();
+        _TextEdit->setTextCursor(Cursor);
+        return;
+    }
+    // The highlighted text stays as the cross-reference's
+    // content, the same way the tag menu wraps a selection in
+    // a Cross-Reference, External Link, or Relative Reference.
+    // A fragment that already holds a cross-reference is left
+    // alone: remove the old link first, then cite the new one.
+    ChangeStacks(SelectionStart, SelectionEnd,
+                 QStringLiteral("xref"), &Entry);
 }
 
 /**

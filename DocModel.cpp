@@ -2368,6 +2368,83 @@ QVector<xmlNodePtr> DocDocument::ReferenceGroupNodes() const
     return ChildElements(BackNode(), "references");
 }
 
+QVector<xmlNodePtr> DocDocument::NestedReferenceGroups(xmlNodePtr Group)
+{
+    return ChildElements(Group, "references");
+}
+
+bool DocDocument::ReferenceGroupHasNestedLists(xmlNodePtr Group)
+{
+    return !NestedReferenceGroups(Group).isEmpty();
+}
+
+bool DocDocument::ReferenceGroupHasEntries(xmlNodePtr Group)
+{
+    if (Group == nullptr) {
+        return false;
+    }
+    if (!ReferenceEntries(Group).isEmpty()) {
+        return true;
+    }
+    for (xmlNodePtr Child = Group->children; Child != nullptr;
+         Child = Child->next) {
+        if (Child->type == XML_ELEMENT_NODE &&
+            NodeNameEquals(Child, "referencegroup")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+xmlNodePtr DocDocument::ReferenceGroupAtPath(const QString& Path) const
+{
+    if (Path.trimmed().isEmpty()) {
+        return nullptr;
+    }
+    QStringList Parts = Path.split(QLatin1Char('.'));
+    QVector<xmlNodePtr> Level = ReferenceGroupNodes();
+    xmlNodePtr Found = nullptr;
+    for (const QString& Part : Parts) {
+        bool Ok = false;
+        int Index = Part.toInt(&Ok);
+        if (!Ok || Index < 0 || Index >= Level.size()) {
+            return nullptr;
+        }
+        Found = Level[Index];
+        Level = NestedReferenceGroups(Found);
+    }
+    return Found;
+}
+
+/**
+ * @brief Appends one list's path and its nested lists' paths, depth-first.
+ * @param Group The list node, borrowed.
+ * @param Path The dotted path of the list.
+ * @param Paths The paths, appended to.
+ */
+static void CollectReferenceGroupPaths(xmlNodePtr Group, const QString& Path,
+                                       QStringList& Paths)
+{
+    Paths.append(Path);
+    QVector<xmlNodePtr> Nested = DocDocument::NestedReferenceGroups(Group);
+    for (int i = 0; i < Nested.size(); ++i) {
+        CollectReferenceGroupPaths(Nested[i],
+                                   Path + QStringLiteral(".") +
+                                       QString::number(i),
+                                   Paths);
+    }
+}
+
+QStringList DocDocument::ReferenceGroupPaths() const
+{
+    QStringList Paths;
+    QVector<xmlNodePtr> Top = ReferenceGroupNodes();
+    for (int i = 0; i < Top.size(); ++i) {
+        CollectReferenceGroupPaths(Top[i], QString::number(i), Paths);
+    }
+    return Paths;
+}
+
 QVector<xmlNodePtr> DocDocument::BackChildNodes() const
 {
     QVector<xmlNodePtr> Nodes;
@@ -2403,6 +2480,244 @@ QString DocDocument::ReferenceLabel(xmlNodePtr Entry)
             ? EntryTitle : Label + QStringLiteral(" - ") + EntryTitle;
     }
     return Label;
+}
+
+/**
+ * @brief The XInclude namespace URI, for xi:include references.
+ */
+static const char* XIncludeNamespaceUri = "http://www.w3.org/2001/XInclude";
+
+/**
+ * @brief True when this node or any node under it carries this anchor.
+ * @param Node The tree to walk, borrowed.
+ * @param Anchor The anchor to look for, trimmed.
+ * @return True when the anchor is already used.
+ */
+static bool TreeHasAnchor(xmlNodePtr Node, const QString& Anchor)
+{
+    if (Node == nullptr) {
+        return false;
+    }
+    if (IsElementKind(Node) &&
+        DocDocument::NodeAttribute(Node, "anchor").trimmed() == Anchor) {
+        return true;
+    }
+    for (xmlNodePtr Child = Node->children; Child != nullptr;
+         Child = Child->next) {
+        if (TreeHasAnchor(Child, Anchor)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief Adds the section targets under these sections, outline order.
+ * @param Sections The sections to list, borrowed.
+ * @param Targets The targets to add to.
+ */
+static void CollectSectionTargets(const QVector<xmlNodePtr>& Sections,
+                                  QVector<DocDocument::InternalTarget>& Targets)
+{
+    for (xmlNodePtr Section : Sections) {
+        DocDocument::InternalTarget Target;
+        Target.Title = DocDocument::SectionTitle(Section);
+        if (Target.Title.trimmed().isEmpty()) {
+            Target.Title = QStringLiteral("(unnamed section)");
+        }
+        Target.Kind = QStringLiteral("Section");
+        Target.Anchor = DocDocument::NodeAttribute(Section, "anchor");
+        Target.Node = Section;
+        Targets.append(Target);
+        CollectSectionTargets(DocDocument::ChildSectionNodes(Section), Targets);
+    }
+}
+
+/**
+ * @brief Adds the figure and table targets under this node, document order.
+ * @param Node The tree to walk, borrowed.
+ * @param Targets The targets to add to.
+ */
+static void CollectFigureTableTargets(xmlNodePtr Node,
+                                      QVector<DocDocument::InternalTarget>& Targets)
+{
+    if (Node == nullptr) {
+        return;
+    }
+    for (xmlNodePtr Child = Node->children; Child != nullptr;
+         Child = Child->next) {
+        if (!IsElementKind(Child)) {
+            continue;
+        }
+        QString Name = TextFromXmlChars(Child->name);
+        if (Name == QLatin1String("figure") ||
+            Name == QLatin1String("table")) {
+            DocDocument::InternalTarget Target;
+            Target.Title = DocDocument::ChildText(Child, "name");
+            if (Target.Title.trimmed().isEmpty()) {
+                Target.Title = (Name == QLatin1String("figure"))
+                    ? QStringLiteral("(unnamed figure)")
+                    : QStringLiteral("(unnamed table)");
+            }
+            Target.Kind = (Name == QLatin1String("figure"))
+                ? QStringLiteral("Figure") : QStringLiteral("Table");
+            Target.Anchor = DocDocument::NodeAttribute(Child, "anchor");
+            Target.Node = Child;
+            Targets.append(Target);
+        }
+        CollectFigureTableTargets(Child, Targets);
+    }
+}
+
+QVector<DocDocument::InternalTarget> DocDocument::InternalTargets() const
+{
+    QVector<InternalTarget> Targets;
+    CollectSectionTargets(TopSectionNodes(), Targets);
+    CollectFigureTableTargets(RfcNode(), Targets);
+    return Targets;
+}
+
+QVector<xmlNodePtr> DocDocument::ReferenceIncludeNodes(xmlNodePtr Group)
+{
+    QVector<xmlNodePtr> Includes;
+    if (Group == nullptr) {
+        return Includes;
+    }
+    for (xmlNodePtr Child = Group->children; Child != nullptr;
+         Child = Child->next) {
+        if (!IsElementKind(Child)) {
+            continue;
+        }
+        if (TextFromXmlChars(Child->name) != QLatin1String("include")) {
+            continue;
+        }
+        if (Child->ns == nullptr || Child->ns->href == nullptr ||
+            TextFromXmlChars(Child->ns->href) !=
+                QLatin1String(XIncludeNamespaceUri)) {
+            continue;
+        }
+        Includes.append(Child);
+    }
+    return Includes;
+}
+
+/**
+ * @brief Collects the <xi:include> nodes under this node, file order.
+ * @param Node The tree to walk, borrowed.
+ * @param Out The includes found so far.
+ */
+static void CollectIncludeNodes(xmlNodePtr Node, QVector<xmlNodePtr>& Out)
+{
+    if (Node == nullptr) {
+        return;
+    }
+    for (xmlNodePtr Child = Node->children; Child != nullptr;
+         Child = Child->next) {
+        if (!IsElementKind(Child)) {
+            continue;
+        }
+        if (TextFromXmlChars(Child->name) == QLatin1String("include") &&
+            Child->ns != nullptr && Child->ns->href != nullptr &&
+            TextFromXmlChars(Child->ns->href) ==
+                QLatin1String(XIncludeNamespaceUri)) {
+            Out.append(Child);
+        }
+        CollectIncludeNodes(Child, Out);
+    }
+}
+
+QVector<xmlNodePtr> DocDocument::DocumentIncludeNodes(xmlNodePtr Root)
+{
+    QVector<xmlNodePtr> Includes;
+    if (Root == nullptr) {
+        return Includes;
+    }
+    CollectIncludeNodes(Root, Includes);
+    return Includes;
+}
+
+QString DocDocument::ReferenceAnchorFromIncludeHref(const QString& Href)
+{
+    QString Base = Href.trimmed();
+    int Slash = Base.lastIndexOf(QLatin1Char('/'));
+    if (Slash >= 0) {
+        Base = Base.mid(Slash + 1);
+    }
+    // reference.RFC.4324.xml carries RFC4324.
+    QRegularExpression RfcPattern(
+        QStringLiteral("^reference\\.RFC\\.(\\d+)\\.xml$"),
+        QRegularExpression::CaseInsensitiveOption);
+    QRegularExpressionMatch Match = RfcPattern.match(Base);
+    if (Match.hasMatch()) {
+        return QStringLiteral("RFC") + Match.captured(1);
+    }
+    if (Base.endsWith(QStringLiteral(".xml"), Qt::CaseInsensitive)) {
+        Base.chop(4);
+    }
+    if (Base.startsWith(QStringLiteral("reference."))) {
+        Base = Base.mid(QStringLiteral("reference.").length());
+    }
+    return Base;
+}
+
+xmlNsPtr DocDocument::EnsureXIncludeNamespace(xmlNodePtr Rfc)
+{
+    if (Rfc == nullptr) {
+        return nullptr;
+    }
+    for (xmlNsPtr Ns = Rfc->nsDef; Ns != nullptr; Ns = Ns->next) {
+        if (Ns->href != nullptr &&
+            TextFromXmlChars(Ns->href) ==
+                QLatin1String(XIncludeNamespaceUri)) {
+            return Ns;
+        }
+    }
+    return xmlNewNs(Rfc,
+                    reinterpret_cast<const xmlChar*>(XIncludeNamespaceUri),
+                    reinterpret_cast<const xmlChar*>("xi"));
+}
+
+bool DocDocument::DocumentHasAnchor(xmlNodePtr Root, const QString& Anchor)
+{
+    QString Wanted = Anchor.trimmed();
+    if (Root == nullptr || Wanted.isEmpty()) {
+        return false;
+    }
+    return TreeHasAnchor(Root, Wanted);
+}
+
+/**
+ * @brief Renames the target on every cross-reference under this node.
+ * @param Node The tree to walk, borrowed.
+ * @param OldTarget The target to replace.
+ * @param NewTarget The target to put in its place.
+ */
+static void RenameXrefTargetsInTree(xmlNodePtr Node,
+                                    const QString& OldTarget,
+                                    const QString& NewTarget)
+{
+    if (Node == nullptr) {
+        return;
+    }
+    if (IsElementKind(Node) &&
+        TextFromXmlChars(Node->name) == QLatin1String("xref") &&
+        DocDocument::NodeAttribute(Node, "target") == OldTarget) {
+        DocDocument::SetNodeAttribute(Node, "target", NewTarget);
+    }
+    for (xmlNodePtr Child = Node->children; Child != nullptr;
+         Child = Child->next) {
+        RenameXrefTargetsInTree(Child, OldTarget, NewTarget);
+    }
+}
+
+void DocDocument::RenameXrefTargets(xmlNodePtr Root, const QString& OldTarget,
+                                    const QString& NewTarget)
+{
+    if (Root == nullptr || OldTarget.isEmpty() || NewTarget.isEmpty() ||
+        OldTarget == NewTarget) {
+        return;
+    }
+    RenameXrefTargetsInTree(Root, OldTarget, NewTarget);
 }
 
 QVector<xmlNodePtr> DocDocument::ReferenceAuthors(xmlNodePtr Entry)
@@ -3218,9 +3533,14 @@ QStringList DocDocument::Problems() const
     // themselves: the editor edits them, so a problem here is
     // fixable in the outline. Anchors on sections and other
     // preserved content are left to schema validation, since the
-    // editor does not edit them.
+    // editor does not edit them. Nested lists are walked too,
+    // so an anchor shared with a nested list is caught.
     QSet<QString> ReferenceAnchors;
-    for (xmlNodePtr Group : ReferenceGroupNodes()) {
+    for (const QString& Path : ReferenceGroupPaths()) {
+        xmlNodePtr Group = ReferenceGroupAtPath(Path);
+        if (Group == nullptr) {
+            continue;
+        }
         QString GroupAnchor = NodeAttribute(Group, "anchor").trimmed();
         if (!GroupAnchor.isEmpty()) {
             if (ReferenceAnchors.contains(GroupAnchor)) {
@@ -3581,6 +3901,98 @@ static bool IsModeledFrontChild(xmlNodePtr Child, bool& SawTitle,
         Name == QLatin1String("note");
 }
 
+/**
+ * @brief Appends descriptions for over-long lines in one reference list.
+ *
+ * Preserved children of the list and of its entries are walked;
+ * a nested list is walked in turn, under its own label, instead
+ * of being treated as preserved content.
+ * @param Group The <references> node, borrowed.
+ * @param Found The descriptions, appended to.
+ */
+static void CollectReferenceGroupLiteralLines(xmlNodePtr Group,
+                                              QStringList& Found)
+{
+    QString GroupName = DocDocument::SectionTitle(Group);
+    QString GroupLabel = GroupName.trimmed().isEmpty()
+        ? QStringLiteral("a reference list")
+        : QStringLiteral("reference list \"%1\"").arg(GroupName.trimmed());
+    for (xmlNodePtr Child = Group->children; Child != nullptr;
+         Child = Child->next) {
+        if (!IsElementKind(Child)) {
+            continue;
+        }
+        if (DocDocument::NodeNameEquals(Child, "reference") ||
+            DocDocument::NodeNameEquals(Child, "name")) {
+            continue;
+        }
+        if (DocDocument::NodeNameEquals(Child, "references")) {
+            CollectReferenceGroupLiteralLines(Child, Found);
+            continue;
+        }
+        CollectPreservedLiteralLines(Child, QString(), GroupLabel, Found);
+    }
+    for (xmlNodePtr Entry : DocDocument::ReferenceEntries(Group)) {
+        QString EntryAnchor = DocDocument::NodeAttribute(Entry, "anchor").trimmed();
+        QString EntryLabel = EntryAnchor.isEmpty()
+            ? QStringLiteral("a reference")
+            : QStringLiteral("reference \"%1\"").arg(EntryAnchor);
+        xmlNodePtr EntryFront = DocDocument::ChildElement(Entry, "front");
+        if (EntryFront != nullptr) {
+            bool SawEntryTitle = false;
+            bool SawEntryDate = false;
+            for (xmlNodePtr Child = EntryFront->children; Child != nullptr;
+                 Child = Child->next) {
+                if (!IsElementKind(Child)) {
+                    continue;
+                }
+                QString Name = TextFromXmlChars(Child->name);
+                if (Name == QLatin1String("title")) {
+                    if (SawEntryTitle) {
+                        CollectPreservedLiteralLines(Child, QString(),
+                                                     EntryLabel, Found);
+                    } else {
+                        SawEntryTitle = true;
+                    }
+                    continue;
+                }
+                if (Name == QLatin1String("date")) {
+                    if (SawEntryDate) {
+                        CollectPreservedLiteralLines(Child, QString(),
+                                                     EntryLabel, Found);
+                    } else {
+                        SawEntryDate = true;
+                    }
+                    continue;
+                }
+                if (Name == QLatin1String("seriesInfo") ||
+                    Name == QLatin1String("author")) {
+                    continue;
+                }
+                CollectPreservedLiteralLines(Child, QString(), EntryLabel,
+                                             Found);
+            }
+        }
+        bool SawStream = false;
+        for (xmlNodePtr Child = Entry->children; Child != nullptr;
+             Child = Child->next) {
+            if (!IsElementKind(Child)) {
+                continue;
+            }
+            QString Name = TextFromXmlChars(Child->name);
+            if (Name == QLatin1String("front")) {
+                continue;
+            }
+            if (Name == QLatin1String("stream") && !SawStream) {
+                SawStream = true;
+                continue;
+            }
+            CollectPreservedLiteralLines(Child, QString(), EntryLabel,
+                                         Found);
+        }
+    }
+}
+
 QStringList DocDocument::LongLiteralLines() const
 {
     QStringList Found;
@@ -3672,80 +4084,7 @@ QStringList DocDocument::LongLiteralLines() const
         }
     }
     for (xmlNodePtr Group : ReferenceGroupNodes()) {
-        QString GroupName = SectionTitle(Group);
-        QString GroupLabel = GroupName.trimmed().isEmpty()
-            ? QStringLiteral("a reference list")
-            : QStringLiteral("reference list \"%1\"").arg(GroupName.trimmed());
-        for (xmlNodePtr Child = Group->children; Child != nullptr;
-             Child = Child->next) {
-            if (!IsElementKind(Child)) {
-                continue;
-            }
-            if (NodeNameEquals(Child, "reference") ||
-                NodeNameEquals(Child, "name")) {
-                continue;
-            }
-            CollectPreservedLiteralLines(Child, QString(), GroupLabel, Found);
-        }
-        for (xmlNodePtr Entry : ReferenceEntries(Group)) {
-            QString EntryAnchor = NodeAttribute(Entry, "anchor").trimmed();
-            QString EntryLabel = EntryAnchor.isEmpty()
-                ? QStringLiteral("a reference")
-                : QStringLiteral("reference \"%1\"").arg(EntryAnchor);
-            xmlNodePtr EntryFront = ChildElement(Entry, "front");
-            if (EntryFront != nullptr) {
-                bool SawEntryTitle = false;
-                bool SawEntryDate = false;
-                for (xmlNodePtr Child = EntryFront->children; Child != nullptr;
-                     Child = Child->next) {
-                    if (!IsElementKind(Child)) {
-                        continue;
-                    }
-                    QString Name = TextFromXmlChars(Child->name);
-                    if (Name == QLatin1String("title")) {
-                        if (SawEntryTitle) {
-                            CollectPreservedLiteralLines(Child, QString(),
-                                                         EntryLabel, Found);
-                        } else {
-                            SawEntryTitle = true;
-                        }
-                        continue;
-                    }
-                    if (Name == QLatin1String("date")) {
-                        if (SawEntryDate) {
-                            CollectPreservedLiteralLines(Child, QString(),
-                                                         EntryLabel, Found);
-                        } else {
-                            SawEntryDate = true;
-                        }
-                        continue;
-                    }
-                    if (Name == QLatin1String("seriesInfo") ||
-                        Name == QLatin1String("author")) {
-                        continue;
-                    }
-                    CollectPreservedLiteralLines(Child, QString(), EntryLabel,
-                                                 Found);
-                }
-            }
-            bool SawStream = false;
-            for (xmlNodePtr Child = Entry->children; Child != nullptr;
-                 Child = Child->next) {
-                if (!IsElementKind(Child)) {
-                    continue;
-                }
-                QString Name = TextFromXmlChars(Child->name);
-                if (Name == QLatin1String("front")) {
-                    continue;
-                }
-                if (Name == QLatin1String("stream") && !SawStream) {
-                    SawStream = true;
-                    continue;
-                }
-                CollectPreservedLiteralLines(Child, QString(), EntryLabel,
-                                             Found);
-            }
-        }
+        CollectReferenceGroupLiteralLines(Group, Found);
     }
     xmlNodePtr Back = BackNode();
     if (Back != nullptr) {
@@ -3965,6 +4304,15 @@ static bool ReferenceGroupHasPreservedContent(xmlNodePtr Group)
                 continue;
             }
             if (Name == QLatin1String("name")) {
+                continue;
+            }
+            // A nested list is modeled by the editor, not
+            // preserved itself, but preserved content inside
+            // it still counts for the document as a whole.
+            if (Name == QLatin1String("references")) {
+                if (ReferenceGroupHasPreservedContent(Child)) {
+                    return true;
+                }
                 continue;
             }
             return true;
@@ -4969,6 +5317,87 @@ bool DocDocument::ReadXml(const QString& Path, QString& Error)
     return true;
 }
 
+/**
+ * @brief Builds one complete reference entry for the template prefill.
+ *
+ * The entry is built the way the reference form builds one: a
+ * <front> holding the title, the series info rows, the author,
+ * and the date, in that order. An empty year and month leave
+ * the date out, since a reference to a web page has no
+ * publication date.
+ * @param Anchor The entry anchor, such as RFC7991.
+ * @param Target The web address of the reference, or empty.
+ * @param Title The title of the referenced work.
+ * @param AuthorFullname The author full name, or empty.
+ * @param AuthorOrganization The author organization, or empty.
+ * @param AuthorEmail The author email, or empty.
+ * @param DateYear The publication year, or empty.
+ * @param DateMonth The publication month, or empty.
+ * @param SeriesInfo The series info rows, as name and value pairs.
+ * @return The new entry node (owned), or nullptr when it could
+ *         not be built.
+ */
+static xmlNodePtr NewPrefilledReferenceEntry(
+    const QString& Anchor, const QString& Target, const QString& Title,
+    const QString& AuthorFullname, const QString& AuthorOrganization,
+    const QString& AuthorEmail, const QString& DateYear,
+    const QString& DateMonth,
+    const QVector<QPair<QString, QString>>& SeriesInfo)
+{
+    xmlNodePtr Entry = xmlNewNode(nullptr,
+                                  reinterpret_cast<const xmlChar*>("reference"));
+    if (Entry == nullptr) {
+        return nullptr;
+    }
+    if (!Anchor.trimmed().isEmpty()) {
+        DocDocument::SetNodeAttribute(Entry, "anchor", Anchor.trimmed());
+    }
+    if (!Target.trimmed().isEmpty()) {
+        DocDocument::SetNodeAttribute(Entry, "target", Target.trimmed());
+    }
+    xmlNodePtr Front = xmlNewChild(Entry, nullptr,
+                                   reinterpret_cast<const xmlChar*>("front"),
+                                   nullptr);
+    if (Front == nullptr) {
+        xmlFreeNode(Entry);
+        return nullptr;
+    }
+    if (!Title.trimmed().isEmpty()) {
+        QByteArray TitleUtf8 = Utf8Bytes(Title.trimmed());
+        xmlNewTextChild(Front, nullptr,
+                        reinterpret_cast<const xmlChar*>("title"),
+                        reinterpret_cast<const xmlChar*>(TitleUtf8.constData()));
+    }
+    for (const QPair<QString, QString>& Row : SeriesInfo) {
+        xmlNodePtr Series = xmlNewChild(Front, nullptr,
+                                        reinterpret_cast<const xmlChar*>("seriesInfo"),
+                                        nullptr);
+        if (Series != nullptr) {
+            DocDocument::SetNodeAttribute(Series, "name", Row.first);
+            DocDocument::SetNodeAttribute(Series, "value", Row.second);
+        }
+    }
+    xmlNodePtr Author = DocDocument::AuthorNodeFromFullname(
+        AuthorFullname, AuthorOrganization, AuthorEmail);
+    if (Author != nullptr) {
+        xmlAddChild(Front, Author);
+    }
+    if (!DateYear.trimmed().isEmpty() || !DateMonth.trimmed().isEmpty()) {
+        xmlNodePtr Date = xmlNewChild(Front, nullptr,
+                                      reinterpret_cast<const xmlChar*>("date"),
+                                      nullptr);
+        if (Date != nullptr) {
+            if (!DateYear.trimmed().isEmpty()) {
+                DocDocument::SetNodeAttribute(Date, "year", DateYear.trimmed());
+            }
+            if (!DateMonth.trimmed().isEmpty()) {
+                DocDocument::SetNodeAttribute(Date, "month", DateMonth.trimmed());
+            }
+        }
+    }
+    return Entry;
+}
+
 DocDocument DocDocument::NewWithDefaults(const QString& DocName,
                                          const QString& Title,
                                          const QString& Fullname,
@@ -5096,7 +5525,75 @@ DocDocument DocDocument::NewWithDefaults(const QString& DocName,
         AddSection(QStringLiteral("Acknowledgements"),
                    QStringLiteral("Optional section. Thank the people who contributed to this document here, including contributors whose work is not covered by authorship. Delete this section if it is not needed."));
     }
-    xmlNewChild(Rfc, nullptr, reinterpret_cast<const xmlChar*>("back"), nullptr);
+    xmlNodePtr Back = xmlNewChild(Rfc, nullptr,
+                                  reinterpret_cast<const xmlChar*>("back"),
+                                  nullptr);
+    if (Back != nullptr) {
+        // The back matter is prefilled with the IETF form of the
+        // reference lists: one outer "References" list holding a
+        // "Normative References" list and an "Informative
+        // References" list. Each nested list starts with one
+        // entry the author can keep or remove: the normative list
+        // cites RFC 7991, the document that defines this format,
+        // and the informative list cites this editor's public
+        // repository, authored with the draft author's public
+        // details. The author adds entries and removes a list
+        // when it is not needed.
+        xmlNodePtr Outer = xmlNewChild(Back, nullptr,
+                                       reinterpret_cast<const xmlChar*>("references"),
+                                       nullptr);
+        if (Outer != nullptr) {
+            QByteArray OuterNameUtf8 = Utf8Bytes(QStringLiteral("References"));
+            xmlNewTextChild(Outer, nullptr,
+                            reinterpret_cast<const xmlChar*>("name"),
+                            reinterpret_cast<const xmlChar*>(OuterNameUtf8.constData()));
+            xmlNodePtr Normative = xmlNewChild(Outer, nullptr,
+                                               reinterpret_cast<const xmlChar*>("references"),
+                                               nullptr);
+            if (Normative != nullptr) {
+                QByteArray NormativeNameUtf8 =
+                    Utf8Bytes(QStringLiteral("Normative References"));
+                xmlNewTextChild(Normative, nullptr,
+                                reinterpret_cast<const xmlChar*>("name"),
+                                reinterpret_cast<const xmlChar*>(NormativeNameUtf8.constData()));
+                QVector<QPair<QString, QString>> Series;
+                Series.append(QPair<QString, QString>(
+                    QStringLiteral("RFC"), QStringLiteral("7991")));
+                Series.append(QPair<QString, QString>(
+                    QStringLiteral("DOI"), QStringLiteral("10.17487/RFC7991")));
+                xmlNodePtr Entry = NewPrefilledReferenceEntry(
+                    QStringLiteral("RFC7991"),
+                    QStringLiteral("https://www.rfc-editor.org/info/rfc7991"),
+                    QStringLiteral("The \"xml2rfc\" Version 3 Vocabulary"),
+                    QStringLiteral("Paul Hoffman"), QStringLiteral("ICANN"),
+                    QString(), QStringLiteral("2016"),
+                    QStringLiteral("December"), Series);
+                if (Entry != nullptr) {
+                    xmlAddChild(Normative, Entry);
+                }
+            }
+            xmlNodePtr Informative = xmlNewChild(Outer, nullptr,
+                                                 reinterpret_cast<const xmlChar*>("references"),
+                                                 nullptr);
+            if (Informative != nullptr) {
+                QByteArray InformativeNameUtf8 =
+                    Utf8Bytes(QStringLiteral("Informative References"));
+                xmlNewTextChild(Informative, nullptr,
+                                reinterpret_cast<const xmlChar*>("name"),
+                                reinterpret_cast<const xmlChar*>(InformativeNameUtf8.constData()));
+                xmlNodePtr Entry = NewPrefilledReferenceEntry(
+                    QStringLiteral("InternetDraftEditor"),
+                    QStringLiteral("https://github.com/RiverExplorer/InternetDraftEditor"),
+                    QStringLiteral("InternetDraftEditor"),
+                    Fullname, Organization, Email,
+                    QString(), QString(),
+                    QVector<QPair<QString, QString>>());
+                if (Entry != nullptr) {
+                    xmlAddChild(Informative, Entry);
+                }
+            }
+        }
+    }
     Document.ResetDocument(Parsed);
     Document.HadSkippedContent = false;
     return Document;

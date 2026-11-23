@@ -76,6 +76,36 @@ void CollectWarning(void* Context, const char* Message, ...)
 }
 
 /**
+ * @brief libxml2 structured error callback: formats one message
+ *        into the list, with its line number when there is one.
+ *
+ * The generic callback only gets the message text, so an error
+ * cannot be located in the file from it. The structured error
+ * carries the line of the element it belongs to, in the saved
+ * file. An error with no line keeps its message alone.
+ * @param Context The ErrorCollector.
+ * @param Error The structured error.
+ */
+void CollectStructuredError(void* Context, const xmlError* Error)
+{
+    if (Context == nullptr || Error == nullptr ||
+        Error->message == nullptr) {
+        return;
+    }
+    QString Text = QString::fromUtf8(Error->message).trimmed();
+    if (Text.isEmpty()) {
+        return;
+    }
+    if (Error->line > 0) {
+        Text = QStringLiteral("Line %1: %2").arg(Error->line).arg(Text);
+    }
+    if (Error->level == XML_ERR_WARNING) {
+        Text = QStringLiteral("Warning: ") + Text;
+    }
+    static_cast<ErrorCollector*>(Context)->Errors->append(Text);
+}
+
+/**
  * @brief Describes the last libxml2 error, with its line number.
  * @return The description, or an empty string when there is none.
  */
@@ -147,7 +177,15 @@ DocValidationResult ValidateRfcXml(const QString& XmlPath, const QString& Schema
     }
 
     // Validate. 0 means valid, 1 means invalid, -1 means the check
-    // itself failed.
+    // itself failed. The structured callback carries the line
+    // number; the generic one only gets the message text, so an
+    // error could not be located in the file. Grammar errors
+    // arrive on the context callback, but the ID/IDREF errors
+    // are raised through the global handler instead, so both
+    // are installed around the check and the global one is
+    // restored right after. Each error lands in exactly one
+    // place: the context callback takes precedence for its own
+    // errors, and the global handler only sees the rest.
     xmlRelaxNGValidCtxtPtr ValidContext = xmlRelaxNGNewValidCtxt(Schema);
     if (ValidContext == nullptr) {
         Result.Errors.append(QStringLiteral("The validator could not be started."));
@@ -155,9 +193,11 @@ DocValidationResult ValidateRfcXml(const QString& XmlPath, const QString& Schema
         xmlFreeDoc(Document);
         return Result;
     }
-    xmlRelaxNGSetValidErrors(ValidContext, CollectError, CollectWarning,
-                             &Collector);
+    xmlRelaxNGSetValidStructuredErrors(ValidContext,
+                                       CollectStructuredError, &Collector);
+    xmlSetStructuredErrorFunc(&Collector, CollectStructuredError);
     int Verdict = xmlRelaxNGValidateDoc(ValidContext, Document);
+    xmlSetStructuredErrorFunc(nullptr, nullptr);
     xmlRelaxNGFreeValidCtxt(ValidContext);
     xmlRelaxNGFree(Schema);
     xmlFreeDoc(Document);

@@ -109,6 +109,19 @@ class TextEditor : public QWidget
 
 public:
     /**
+     * @brief What the References menu asks the document to do.
+     *
+     * NewReferenceAction creates a reference entry for the anchor
+     * in the named list; InternalReferenceAction points the
+     * cross-reference at the given target element.
+     */
+    enum ReferenceAction
+    {
+        NewReferenceAction = 0,
+        InternalReferenceAction = 1
+    };
+
+    /**
      * @brief Creates the text editor.
      * @param Parent The parent widget, or nullptr.
      */
@@ -161,6 +174,46 @@ public:
      * @brief Clears both tabs, freeing the editor-owned node copies.
      */
     void Clear();
+
+    /**
+     * @brief Gives the editor the document to read references from.
+     *
+     * The pointer is borrowed, never owned, and only read: the
+     * References menu lists the document's entries and internal
+     * targets from it. Document writes go back through the
+     * MakeReferenceRequested signal. May be nullptr, in which
+     * case the References menu is not offered.
+     * @param Document The document, borrowed, or nullptr.
+     */
+    void SetDocument(const DocDocument* Document);
+
+    /**
+     * @brief Wraps the given range in a cross-reference to the anchor.
+     *
+     * The highlighted text stays as the cross-reference's
+     * content: <xref target="RFC4324">[iCal]</xref> shows as
+     * [iCal] and points at RFC4324. The range is passed in
+     * rather than read from the live cursor: the outline
+     * rebuild reloads the section body and drops the live
+     * selection, so a range read after the rebuild lands at
+     * the start of the section instead of the highlight. With
+     * no selection (both ends -1, or an empty range) a bare
+     * marker is dropped at the cursor instead. The References
+     * menu only offers itself with a selection, so the bare
+     * marker is a fallback only.
+     * @param Anchor The cross-reference target.
+     * @param SelectionStart The first character of the range, or -1.
+     * @param SelectionEnd The character after the range, or -1.
+     */
+    void InsertXrefMarker(const QString& Anchor, int SelectionStart,
+                          int SelectionEnd);
+
+    /**
+     * @brief The current selection range, or -1/-1 when there is none.
+     * @param Start Set to the first selected character, or -1.
+     * @param End Set to the character after the selection, or -1.
+     */
+    void SelectedRange(int& Start, int& End) const;
 
     /**
      * @brief Makes the option markers match the document and the
@@ -236,6 +289,22 @@ signals:
      */
     void TextChanged();
 
+    /**
+     * @brief Sent when the References menu asks for a document write.
+     *
+     * The editor shows the menu, the name prompt, and the internal
+     * target picker, but it never writes the document itself. The
+     * owner creates the entry or gives the target its anchor, then
+     * calls InsertXrefMarker with the anchor to cite.
+     * @param Action NewReferenceAction or InternalReferenceAction.
+     * @param Target The internal target element, for InternalReferenceAction.
+     * @param Anchor The reference anchor, for NewReferenceAction.
+     * @param ListName The nested list name, for NewReferenceAction.
+     */
+    void MakeReferenceRequested(int Action, xmlNodePtr Target,
+                                const QString& Anchor,
+                                const QString& ListName);
+
 private slots:
     /**
      * @brief Refreshes the XML tab and reports the change.
@@ -291,6 +360,18 @@ private:
      * @param Menu The menu being built.
      */
     void AddTagActions(QMenu* Menu);
+
+    /**
+     * @brief Adds the References submenu to a menu, when text is selected.
+     *
+     * New makes a reference entry in the picked list, Internal
+     * points at a section, figure, or table in this document,
+     * and Existing cites an entry already in the picked list.
+     * Nothing is added without a selection, without a document,
+     * or where the cursor touches sourcecode, a figure, or a table.
+     * @param Menu The menu being built.
+     */
+    void AddReferenceActions(QMenu* Menu);
 
     /**
      * @brief Adds the sourcecode options submenu when the click
@@ -782,6 +863,7 @@ private:
     bool _SettingParagraphs;
     int _SrcPlaceholderHintBlock;
     SpellChecker* _SpellChecker;
+    const DocDocument* _Document;
     SpellHighlighter* _SpellHighlighter;
 };
 

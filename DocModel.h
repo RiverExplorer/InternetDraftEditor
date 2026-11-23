@@ -440,6 +440,55 @@ public:
     QVector<xmlNodePtr> ReferenceGroupNodes() const;
 
     /**
+     * @brief The <references> list at a dotted path, borrowed, or nullptr.
+     *
+     * A path names a list by its position among its siblings at
+     * each level: "0" is the first top-level list, "0.1" the
+     * second nested list under it. An empty or invalid path
+     * returns nullptr.
+     * @param Path The dotted path.
+     * @return The list node, or nullptr.
+     */
+    xmlNodePtr ReferenceGroupAtPath(const QString& Path) const;
+
+    /**
+     * @brief Every reference list path, in document order.
+     *
+     * Top-level lists first, each followed by its nested lists
+     * depth-first, so every list the editor can edit is named.
+     * @return The dotted paths.
+     */
+    QStringList ReferenceGroupPaths() const;
+
+    /**
+     * @brief The <references> children of a list, borrowed, file order.
+     * @param Group The <references> node, borrowed.
+     * @return The nested lists.
+     */
+    static QVector<xmlNodePtr> NestedReferenceGroups(xmlNodePtr Group);
+
+    /**
+     * @brief True when a list holds nested lists.
+     *
+     * A list holds either nested lists or reference entries,
+     * never both, so a list with nested lists takes no entries.
+     * @param Group The <references> node, borrowed.
+     * @return True for a container list.
+     */
+    static bool ReferenceGroupHasNestedLists(xmlNodePtr Group);
+
+    /**
+     * @brief True when a list holds reference entries.
+     *
+     * A list holds either nested lists or reference entries,
+     * never both, so a list with entries takes no nested list.
+     * A <referencegroup> child counts as an entry here.
+     * @param Group The <references> node, borrowed.
+     * @return True for a leaf list.
+     */
+    static bool ReferenceGroupHasEntries(xmlNodePtr Group);
+
+    /**
      * @brief All child nodes of <back>, borrowed, file order.
      *
      * Elements and non-whitespace text, including comments and
@@ -465,6 +514,90 @@ public:
      * @return The label.
      */
     static QString ReferenceLabel(xmlNodePtr Entry);
+
+    /**
+     * @brief One internal target a cross-reference can point at.
+     *
+     * Title is the section, figure, or table title as the author
+     * sees it; Kind names which it is; Anchor is its anchor, which
+     * may be empty when the editor has not given it one yet; Node
+     * is the element, borrowed.
+     */
+    struct InternalTarget
+    {
+        QString Title;
+        QString Kind;
+        QString Anchor;
+        xmlNodePtr Node;
+    };
+
+    /**
+     * @brief The sections, figures, and tables a cross-reference can point at.
+     *
+     * Sections in outline order, then figures and tables in
+     * document order. Every target is listed whether or not it
+     * already has an anchor: one without an anchor gets one,
+     * derived from its title, when it is picked.
+     * @return The targets.
+     */
+    QVector<InternalTarget> InternalTargets() const;
+
+    /**
+     * @brief The <xi:include> children of a reference list, borrowed, file order.
+     * @param Group The <references> node, borrowed.
+     * @return The included references.
+     */
+    static QVector<xmlNodePtr> ReferenceIncludeNodes(xmlNodePtr Group);
+
+    /**
+     * @brief The <xi:include> nodes under this node, borrowed, file order.
+     * @param Root The tree to walk, borrowed.
+     * @return The included references.
+     */
+    static QVector<xmlNodePtr> DocumentIncludeNodes(xmlNodePtr Root);
+
+    /**
+     * @brief The anchor an included reference carries, from its href.
+     *
+     * A bibxml href for an RFC names the anchor: reference.RFC.4324.xml
+     * carries RFC4324. Any other href gives its file name without the
+     * extension, which is the best the editor can tell.
+     * @param Href The xi:include href.
+     * @return The anchor, or empty when the href names none.
+     */
+    static QString ReferenceAnchorFromIncludeHref(const QString& Href);
+
+    /**
+     * @brief The XInclude namespace on the root, creating it when missing.
+     *
+     * Reuses an existing namespace with the XInclude URI whatever its
+     * prefix; otherwise declares xmlns:xi for it.
+     * @param Rfc The <rfc> node, borrowed.
+     * @return The namespace, or nullptr when there is no root.
+     */
+    static xmlNsPtr EnsureXIncludeNamespace(xmlNodePtr Rfc);
+
+    /**
+     * @brief True when any element in the tree carries this anchor.
+     * @param Root The tree to walk, borrowed.
+     * @param Anchor The anchor to look for.
+     * @return True when the anchor is already used.
+     */
+    static bool DocumentHasAnchor(xmlNodePtr Root, const QString& Anchor);
+
+    /**
+     * @brief Renames the target on every cross-reference pointing at it.
+     *
+     * When a reference entry's anchor changes, the cross-references
+     * that cited it must follow: the old target is replaced with
+     * the new one wherever an <xref> carries it. Other reference
+     * tags are left alone.
+     * @param Root The tree to walk, borrowed.
+     * @param OldTarget The target to replace.
+     * @param NewTarget The target to put in its place.
+     */
+    static void RenameXrefTargets(xmlNodePtr Root, const QString& OldTarget,
+                                  const QString& NewTarget);
 
     /**
      * @brief The <author> children of a reference entry's <front>.

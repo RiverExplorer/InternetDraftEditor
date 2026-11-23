@@ -297,7 +297,8 @@ static bool ReferenceGroupHasPreservedContent(xmlNodePtr Group)
     if (NodeHasAttributesOtherThan(Group, QStringList{"anchor"})) {
         return true;
     }
-    if (NodeHasChildrenOtherThan(Group, QStringList{"name", "reference"})) {
+    if (NodeHasChildrenOtherThan(Group, QStringList{"name", "reference",
+                                                    "references"})) {
         return true;
     }
     for (xmlNodePtr Entry : DocDocument::ReferenceEntries(Group)) {
@@ -666,13 +667,14 @@ static void AppendReferenceEntry(xmlNodePtr Group, xmlNodePtr Entry)
 MainWindow::MainWindow(QWidget* Parent)
     : QMainWindow(Parent)
     , _Document()
+    , _BibCache(this)
     , _FilePath()
     , _Modified(false)
     , _SelectedKey()
     , _AuthorIndex(-1)
-    , _AuthorGroup(-1)
+    , _AuthorGroupPath()
     , _AuthorEntry(-1)
-    , _ReferenceGroupIndex(-1)
+    , _ReferenceGroupPath()
     , _ReferenceEntryIndex(-1)
     , _SectionPath()
     , _RunFailed(false)
@@ -718,6 +720,8 @@ MainWindow::MainWindow(QWidget* Parent)
     , _SectionPreservedLabel(nullptr)
     , _SectionRequiredLabel(nullptr)
     , _ReferenceGroupNameEdit(nullptr)
+    , _AddReferenceEntryButton(nullptr)
+    , _AddNestedListButton(nullptr)
     , _ReferenceGroupPreservedLabel(nullptr)
     , _ReferenceAnchorEdit(nullptr)
     , _ReferenceTargetEdit(nullptr)
@@ -818,15 +822,21 @@ MainWindow::MainWindow(QWidget* Parent)
     ValidateAction->setStatusTip(tr("Validate the saved file against the v3 schema."));
     connect(ValidateAction, &QAction::triggered, this, &MainWindow::OnValidate);
 
-    QAction* PathAction = _FileMenu->addAction(tr("Set xml2rfc Path..."));
-    PathAction->setStatusTip(tr("Set the xml2rfc program path."));
-    connect(PathAction, &QAction::triggered, this, &MainWindow::OnSetXml2rfcPath);
-
     _FileMenu->addSeparator();
 
     QAction* ExitAction = _FileMenu->addAction(tr("Exit"));
     ExitAction->setStatusTip(tr("Close the editor."));
     connect(ExitAction, &QAction::triggered, this, &QWidget::close);
+
+    QMenu* SettingsMenu = menuBar()->addMenu(tr("&Settings"));
+
+    QAction* PathAction = SettingsMenu->addAction(tr("Set xml2rfc Path..."));
+    PathAction->setStatusTip(tr("Set the xml2rfc program path."));
+    connect(PathAction, &QAction::triggered, this, &MainWindow::OnSetXml2rfcPath);
+
+    QAction* BibliographyAction = SettingsMenu->addAction(tr("Bibliography..."));
+    BibliographyAction->setStatusTip(tr("Manage the cached bibliography entries."));
+    connect(BibliographyAction, &QAction::triggered, this, &MainWindow::OnBibliography);
 
     QMenu* HelpMenu = menuBar()->addMenu(tr("&Help"));
 
@@ -1016,7 +1026,12 @@ MainWindow::MainWindow(QWidget* Parent)
     QWidget* AbstractPageWidget = new QWidget(this);
     _AbstractEdit = new TextEditor(AbstractPageWidget);
     _AbstractEdit->SetSpellChecker(_SpellChecker.get());
+    _AbstractEdit->SetDocument(&_Document);
     connect(_AbstractEdit, &TextEditor::TextChanged, this, &MainWindow::OnAbstractEdited);
+    connect(_AbstractEdit, &TextEditor::MakeReferenceRequested, this,
+            [this](int Action, xmlNodePtr Target, const QString& Anchor, const QString& ListName) {
+                HandleMakeReference(_AbstractEdit, Action, Target, Anchor, ListName);
+            });
     _AbstractPreservedLabel = new QLabel(AbstractPageWidget);
     _AbstractPreservedLabel->setWordWrap(true);
     QVBoxLayout* AbstractLayout = new QVBoxLayout(AbstractPageWidget);
@@ -1045,7 +1060,12 @@ MainWindow::MainWindow(QWidget* Parent)
     connect(_SectionTitleEdit, &QLineEdit::textEdited, this, &MainWindow::OnSectionTitleEdited);
     _SectionBodyEdit = new TextEditor(SectionPageWidget);
     _SectionBodyEdit->SetSpellChecker(_SpellChecker.get());
+    _SectionBodyEdit->SetDocument(&_Document);
     connect(_SectionBodyEdit, &TextEditor::TextChanged, this, &MainWindow::OnSectionBodyEdited);
+    connect(_SectionBodyEdit, &TextEditor::MakeReferenceRequested, this,
+            [this](int Action, xmlNodePtr Target, const QString& Anchor, const QString& ListName) {
+                HandleMakeReference(_SectionBodyEdit, Action, Target, Anchor, ListName);
+            });
     _SectionPreservedLabel = new QLabel(SectionPageWidget);
     _SectionPreservedLabel->setWordWrap(true);
     _SectionRequiredLabel = new QLabel(SectionPageWidget);
@@ -1084,6 +1104,11 @@ MainWindow::MainWindow(QWidget* Parent)
     QPushButton* AddEntryButton = new QPushButton(tr("Add Entry"), ReferenceGroupPageWidget);
     AddEntryButton->setToolTip(tr("Add a reference entry to this list."));
     connect(AddEntryButton, &QPushButton::clicked, this, &MainWindow::OnAddReferenceEntry);
+    _AddReferenceEntryButton = AddEntryButton;
+    QPushButton* AddNestedListButton = new QPushButton(tr("Add Nested List"), ReferenceGroupPageWidget);
+    AddNestedListButton->setToolTip(tr("Add a list inside this list, such as a normative list inside a references list."));
+    connect(AddNestedListButton, &QPushButton::clicked, this, &MainWindow::OnAddNestedReferenceGroup);
+    _AddNestedListButton = AddNestedListButton;
     QPushButton* RemoveGroupButton = new QPushButton(tr("Remove List"), ReferenceGroupPageWidget);
     RemoveGroupButton->setToolTip(tr("Remove this list and its entries."));
     connect(RemoveGroupButton, &QPushButton::clicked, this, &MainWindow::OnRemoveReferenceGroup);
@@ -1097,6 +1122,7 @@ MainWindow::MainWindow(QWidget* Parent)
     _ReferenceGroupPreservedLabel->setWordWrap(true);
     QHBoxLayout* GroupButtons = new QHBoxLayout();
     GroupButtons->addWidget(AddEntryButton);
+    GroupButtons->addWidget(AddNestedListButton);
     GroupButtons->addWidget(RemoveGroupButton);
     GroupButtons->addWidget(MoveGroupUpButton);
     GroupButtons->addWidget(MoveGroupDownButton);
@@ -1272,8 +1298,13 @@ MainWindow::MainWindow(QWidget* Parent)
             this, &MainWindow::OnSettingsNoteRemoveChanged);
     _SettingsNoteEdit = new TextEditor(_SettingsNoteGroup);
     _SettingsNoteEdit->SetSpellChecker(_SpellChecker.get());
+    _SettingsNoteEdit->SetDocument(&_Document);
     connect(_SettingsNoteEdit, &TextEditor::TextChanged,
             this, &MainWindow::OnSettingsNoteEdited);
+    connect(_SettingsNoteEdit, &TextEditor::MakeReferenceRequested, this,
+            [this](int Action, xmlNodePtr Target, const QString& Anchor, const QString& ListName) {
+                HandleMakeReference(_SettingsNoteEdit, Action, Target, Anchor, ListName);
+            });
     QPushButton* RemoveNoteButton = new QPushButton(tr("Remove Note"), _SettingsNoteGroup);
     RemoveNoteButton->setToolTip(tr("Remove this note from the draft."));
     connect(RemoveNoteButton, &QPushButton::clicked, this, &MainWindow::OnRemoveNote);
@@ -1950,7 +1981,7 @@ void MainWindow::OnRemoveAuthor()
     if (Author == nullptr) {
         return;
     }
-    if (_AuthorGroup < 0 && _Document.AuthorNodes().size() == 1) {
+    if (_AuthorGroupPath.isEmpty() && _Document.AuthorNodes().size() == 1) {
         QMessageBox::warning(this, tr("Remove Author"),
                              tr("A draft needs at least one author."));
         return;
@@ -1963,11 +1994,11 @@ void MainWindow::OnRemoveAuthor()
     if (Answer != QMessageBox::Yes) {
         return;
     }
-    if (_AuthorGroup < 0) {
+    if (_AuthorGroupPath.isEmpty()) {
         _Document.RemoveAuthorNode(_AuthorIndex);
         _SelectedKey = QStringLiteral("authors");
     } else {
-        xmlNodePtr Entry = FindReferenceEntry(_AuthorGroup, _AuthorEntry);
+        xmlNodePtr Entry = FindReferenceEntry(_AuthorGroupPath, _AuthorEntry);
         if (Entry == nullptr) {
             return;
         }
@@ -1978,7 +2009,7 @@ void MainWindow::OnRemoveAuthor()
         xmlNodePtr Removed = Authors[_AuthorIndex];
         xmlUnlinkNode(Removed);
         xmlFreeNode(Removed);
-        _SelectedKey = QStringLiteral("refentry:") + QString::number(_AuthorGroup) +
+        _SelectedKey = QStringLiteral("refentry:") + _AuthorGroupPath +
             QStringLiteral(".") + QString::number(_AuthorEntry);
     }
     SetModified(true);
@@ -2277,6 +2308,183 @@ void MainWindow::OnSetXml2rfcPath()
     statusBar()->showMessage(tr("xml2rfc path set to %1.").arg(Path));
 }
 
+void MainWindow::OnBibliography()
+{
+    QDialog Dialog(this);
+    Dialog.setWindowTitle(tr("Bibliography"));
+    Dialog.resize(680, 420);
+
+    QLabel* LocationLabel = new QLabel(tr("Cache location:"), &Dialog);
+    QLineEdit* LocationEdit = new QLineEdit(_BibCache.Location(), &Dialog);
+    LocationEdit->setReadOnly(true);
+    QPushButton* BrowseButton = new QPushButton(tr("Browse..."), &Dialog);
+    QHBoxLayout* LocationLayout = new QHBoxLayout();
+    LocationLayout->addWidget(LocationLabel);
+    LocationLayout->addWidget(LocationEdit, 1);
+    LocationLayout->addWidget(BrowseButton);
+
+    QTableWidget* Table = new QTableWidget(&Dialog);
+    Table->setColumnCount(4);
+    Table->setHorizontalHeaderLabels(QStringList()
+        << tr("Reference") << tr("Source") << tr("Fetched") << tr("Size"));
+    Table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    Table->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    Table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    Table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    Table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    Table->verticalHeader()->setVisible(false);
+
+    // Fills the table from the cache index. The address rides on
+    // the first column's item, so the buttons can find it again.
+    auto FillTable = [&]() {
+        Table->setRowCount(0);
+        QVector<BibCacheEntry> Entries = _BibCache.Entries();
+        for (const BibCacheEntry& Entry : Entries) {
+            int Row = Table->rowCount();
+            Table->insertRow(Row);
+            QString Reference = Entry.Anchor;
+            if (!Entry.Title.isEmpty()) {
+                Reference = tr("%1 (%2)").arg(Entry.Title, Entry.Anchor);
+            }
+            QTableWidgetItem* ReferenceItem =
+                new QTableWidgetItem(Reference);
+            ReferenceItem->setData(Qt::UserRole, Entry.Url);
+            ReferenceItem->setToolTip(Entry.Url);
+            Table->setItem(Row, 0, ReferenceItem);
+            Table->setItem(Row, 1, new QTableWidgetItem(Entry.Url));
+            Table->setItem(Row, 2, new QTableWidgetItem(Entry.Fetched));
+            Table->setItem(Row, 3, new QTableWidgetItem(
+                tr("%1 bytes").arg(QString::number(Entry.Size))));
+        }
+    };
+    FillTable();
+
+    QLabel* StatusLabel = new QLabel(&Dialog);
+    StatusLabel->setWordWrap(true);
+
+    QPushButton* RefreshButton = new QPushButton(tr("Refresh"), &Dialog);
+    RefreshButton->setToolTip(
+        tr("Fetch the selected entries again. Only matters for "
+           "Internet-Drafts; an RFC never changes."));
+    QPushButton* DeleteButton = new QPushButton(tr("Delete"), &Dialog);
+    DeleteButton->setToolTip(tr("Delete the selected entries."));
+    QPushButton* ClearButton = new QPushButton(tr("Clear All"), &Dialog);
+    ClearButton->setToolTip(tr("Delete every cached entry."));
+    QPushButton* CloseButton = new QPushButton(tr("Close"), &Dialog);
+    QHBoxLayout* ButtonLayout = new QHBoxLayout();
+    ButtonLayout->addWidget(RefreshButton);
+    ButtonLayout->addWidget(DeleteButton);
+    ButtonLayout->addWidget(ClearButton);
+    ButtonLayout->addStretch(1);
+    ButtonLayout->addWidget(CloseButton);
+
+    QVBoxLayout* Layout = new QVBoxLayout(&Dialog);
+    Layout->addLayout(LocationLayout);
+    Layout->addWidget(Table, 1);
+    Layout->addWidget(StatusLabel);
+    Layout->addLayout(ButtonLayout);
+
+    auto SelectedUrls = [&]() {
+        QStringList Urls;
+        for (QTableWidgetItem* Item : Table->selectedItems()) {
+            if (Item->column() != 0) {
+                continue;
+            }
+            Urls.append(Item->data(Qt::UserRole).toString());
+        }
+        return Urls;
+    };
+
+    connect(BrowseButton, &QPushButton::clicked, &Dialog, [&]() {
+        QString Current = _BibCache.Location();
+        QString NewPath = QFileDialog::getExistingDirectory(
+            &Dialog, tr("Bibliography cache"), Current);
+        if (NewPath.isEmpty() ||
+            QDir::cleanPath(NewPath) == QDir::cleanPath(Current)) {
+            return;
+        }
+        QMessageBox Box(&Dialog);
+        Box.setWindowTitle(tr("Move bibliography cache"));
+        Box.setText(tr("Move the cached entries to %1, or delete them?")
+            .arg(NewPath));
+        Box.setInformativeText(
+            tr("Copy keeps the cached entries at the new location. "
+               "Delete throws them away; they can be fetched again later."));
+        QPushButton* CopyButton =
+            Box.addButton(tr("Copy"), QMessageBox::AcceptRole);
+        Box.addButton(tr("Delete"), QMessageBox::DestructiveRole);
+        Box.setDefaultButton(CopyButton);
+        Box.exec();
+        if (Box.clickedButton() == nullptr) {
+            return;
+        }
+        bool CopyOld = (Box.clickedButton() == CopyButton);
+        if (!_BibCache.MoveLocation(NewPath, CopyOld)) {
+            QMessageBox::warning(
+                &Dialog, tr("Bibliography"),
+                tr("Could not move the cache: %1").arg(_BibCache.LastError()));
+            return;
+        }
+        LocationEdit->setText(_BibCache.Location());
+        FillTable();
+        StatusLabel->setText(CopyOld
+            ? tr("The cached entries moved to the new location.")
+            : tr("The cached entries were deleted."));
+    });
+
+    connect(RefreshButton, &QPushButton::clicked, &Dialog, [&]() {
+        QStringList Urls = SelectedUrls();
+        if (Urls.isEmpty()) {
+            return;
+        }
+        StatusLabel->setText(tr("Fetching the selected entries..."));
+        for (const QString& Url : Urls) {
+            _BibCache.RefreshEntry(Url);
+        }
+    });
+    connect(DeleteButton, &QPushButton::clicked, &Dialog, [&]() {
+        for (const QString& Url : SelectedUrls()) {
+            _BibCache.DeleteEntry(Url);
+        }
+        FillTable();
+    });
+    connect(ClearButton, &QPushButton::clicked, &Dialog, [&]() {
+        QMessageBox::StandardButton Answer = QMessageBox::question(
+            &Dialog, tr("Bibliography"),
+            tr("Delete every cached entry? "
+               "They can be fetched again later."),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (Answer != QMessageBox::Yes) {
+            return;
+        }
+        _BibCache.ClearAll();
+        FillTable();
+    });
+    connect(CloseButton, &QPushButton::clicked, &Dialog, &QDialog::accept);
+
+    // A finished download refreshes the list; a failed one is named.
+    connect(&_BibCache, &BibCache::FetchFinished, &Dialog, [&]() {
+        FillTable();
+        QMap<QString, QString> Failed = _BibCache.FailedFetches();
+        if (Failed.isEmpty()) {
+            StatusLabel->setText(tr("The selected entries are up to date."));
+        } else {
+            QStringList Notes;
+            for (auto It = Failed.constBegin(); It != Failed.constEnd();
+                 ++It) {
+                Notes.append(tr("Could not fetch %1: %2")
+                    .arg(It.key(), It.value()));
+            }
+            StatusLabel->setText(Notes.join(QStringLiteral("\n")));
+        }
+    });
+    connect(&_BibCache, &BibCache::EntriesChanged, &Dialog, [&]() {
+        FillTable();
+    });
+
+    Dialog.exec();
+}
+
 void MainWindow::OnLegend()
 {
     QMessageBox box(this);
@@ -2323,7 +2531,7 @@ void MainWindow::OnAbout()
            "Built %2 %3\n\n"
            "An editor for IETF Internet-Drafts in RFCXML (xml2rfc) format.\n\n"
            "Copyright (c) 2026 RiverExplorer LLC\n"
-           "RiverExplorer is a registered trademark of "
+           "RiverExplorer%4 is a registered trademark of "
            "Douglas Mark Royer.\n\n"
            "MIT License — free to use and modify, keep the copyright "
            "notice.\n\n"
@@ -2348,7 +2556,8 @@ void MainWindow::OnAbout()
            "OTHER DEALINGS IN THE SOFTWARE.")
             .arg(QCoreApplication::applicationVersion())
             .arg(QStringLiteral(__DATE__))
-            .arg(QStringLiteral(__TIME__)));
+            .arg(QStringLiteral(__TIME__))
+            .arg(QString(QChar(0x00AE))));
     box.addButton(QMessageBox::Ok);
     box.exec();
 }
@@ -2375,7 +2584,26 @@ void MainWindow::OnValidate()
         statusBar()->showMessage(tr("Save the draft first."));
         return;
     }
-    ValidateAndReport(_FilePath, true);
+    // Included references come from the bibliography cache: fetch
+    // what is missing first, then validate. The report leaves out
+    // the errors a resolved include explains.
+    QStringList Hrefs;
+    for (xmlNodePtr Include :
+         DocDocument::DocumentIncludeNodes(_Document.RfcNode())) {
+        QString Href = DocDocument::NodeAttribute(Include, "href");
+        if (!Href.isEmpty() && !Hrefs.contains(Href)) {
+            Hrefs.append(Href);
+        }
+    }
+    if (Hrefs.isEmpty()) {
+        ValidateAndReport(_FilePath, true);
+        return;
+    }
+    statusBar()->showMessage(tr("Fetching bibliography entries..."));
+    connect(&_BibCache, &BibCache::FetchFinished, this,
+            [this]() { ValidateAndReport(_FilePath, true); },
+            Qt::SingleShotConnection);
+    _BibCache.EnsureCached(Hrefs);
 }
 
 /**
@@ -2528,6 +2756,7 @@ DocValidationResult MainWindow::ValidateAndReport(const QString& Path, bool Alwa
     Result.Valid = false;
     Result.Checked = false;
     QString Schema = FindSchemaPath();
+    int ResolvedIncludes = 0;
     if (Schema.isEmpty()) {
         Result.Errors.append(
             tr("The v3 schema (schemas/v3.rng) was not found next to the program. "
@@ -2535,6 +2764,11 @@ DocValidationResult MainWindow::ValidateAndReport(const QString& Path, bool Alwa
         statusBar()->showMessage(tr("Validation skipped: the v3 schema was not found."));
     } else {
         Result = ValidateRfcXml(Path, Schema);
+        // The filter only runs when the open document is the file
+        // being checked: its include lines must match the file's.
+        if (Path == _FilePath && !_Modified) {
+            ResolvedIncludes = FilterIncludeErrors(Result);
+        }
         if (Result.Valid) {
             statusBar()->showMessage(
                 tr("Validated %1: the file matches the v3 schema.").arg(Path));
@@ -2548,6 +2782,13 @@ DocValidationResult MainWindow::ValidateAndReport(const QString& Path, bool Alwa
         if (!Schema.isEmpty()) {
             Report += tr("Schema: %1\n").arg(Schema);
         }
+        if (ResolvedIncludes == 1) {
+            Report += tr("Bibliography: 1 included reference resolved "
+                         "from the cache.\n");
+        } else if (ResolvedIncludes > 1) {
+            Report += tr("Bibliography: %1 included references resolved "
+                         "from the cache.\n").arg(ResolvedIncludes);
+        }
         Report += QStringLiteral("\n");
         if (Result.Valid) {
             Report += tr("The file matches the v3 schema.\n");
@@ -2560,6 +2801,81 @@ DocValidationResult MainWindow::ValidateAndReport(const QString& Path, bool Alwa
         _ValidateDialog->raise();
     }
     return Result;
+}
+
+int MainWindow::FilterIncludeErrors(DocValidationResult& Result)
+{
+    QVector<xmlNodePtr> Includes =
+        DocDocument::DocumentIncludeNodes(_Document.RfcNode());
+    if (Includes.isEmpty()) {
+        return 0;
+    }
+    // Which includes the cache resolved, and the anchor each carries.
+    QMap<QString, QString> Resolved;
+    QVector<int> ResolvedLines;
+    QStringList UnresolvedHrefs;
+    for (xmlNodePtr Include : Includes) {
+        QString Href = DocDocument::NodeAttribute(Include, "href");
+        if (Href.isEmpty()) {
+            continue;
+        }
+        if (_BibCache.IsCached(Href)) {
+            Resolved[Href] =
+                DocDocument::ReferenceAnchorFromIncludeHref(Href);
+            ResolvedLines.append(static_cast<int>(Include->line));
+        } else {
+            UnresolvedHrefs.append(Href);
+        }
+    }
+    if (!Resolved.isEmpty()) {
+        // The report lines carry "Line N: " (Bug 485), so an include
+        // error is matched to its include by line. When a line was
+        // not recorded, include errors are paired with includes in
+        // file order instead: validation reports them in that order.
+        QRegularExpression IncludeError(QStringLiteral(
+            "^Line (\\d+): Did not expect element include there$"));
+        QRegularExpression IdrefError(QStringLiteral(
+            "IDREF attribute target references an unknown ID \"([^\"]+)\""));
+        QStringList Kept;
+        int IncludeErrorIndex = 0;
+        for (const QString& Error : Result.Errors) {
+            bool Drop = false;
+            QRegularExpressionMatch IncludeMatch = IncludeError.match(Error);
+            if (IncludeMatch.hasMatch()) {
+                int Line = IncludeMatch.captured(1).toInt();
+                Drop = ResolvedLines.contains(Line);
+                if (!Drop && IncludeErrorIndex < Includes.size()) {
+                    QString Href = DocDocument::NodeAttribute(
+                        Includes[IncludeErrorIndex], "href");
+                    Drop = Resolved.contains(Href);
+                }
+                ++IncludeErrorIndex;
+            } else {
+                QRegularExpressionMatch IdrefMatch = IdrefError.match(Error);
+                if (IdrefMatch.hasMatch()) {
+                    Drop = Resolved.values().contains(
+                        IdrefMatch.captured(1));
+                }
+            }
+            if (!Drop) {
+                Kept.append(Error);
+            }
+        }
+        Result.Errors = Kept;
+        if (Result.Errors.isEmpty()) {
+            Result.Valid = true;
+        }
+    }
+    // A download that failed gets a plain note, so a reference that
+    // was not checked is never mistaken for a clean file.
+    for (const QString& Href : UnresolvedHrefs) {
+        QString Failure = _BibCache.FailedError(Href);
+        if (!Failure.isEmpty()) {
+            Result.Errors.append(
+                tr("Could not fetch %1: %2").arg(Href, Failure));
+        }
+    }
+    return Resolved.size();
 }
 
 void MainWindow::OnRunOutput()
@@ -2606,7 +2922,7 @@ void MainWindow::OnRunFailed(QProcess::ProcessError Error)
     _RunFailed = true;
     _RunCloseButton->setEnabled(true);
     AppendRunLog(tr("Could not start xml2rfc: %1\n"
-                    "Check the xml2rfc path (File > Set xml2rfc Path...).\n")
+                    "Check the xml2rfc path (Settings > Set xml2rfc Path...).\n")
         .arg(_RunProcess->errorString()));
     statusBar()->showMessage(tr("Could not start xml2rfc."));
 }
@@ -2937,35 +3253,7 @@ void MainWindow::RebuildOutline()
     References->setData(0, Qt::UserRole, KindReferences);
     QVector<xmlNodePtr> Groups = _Document.ReferenceGroupNodes();
     for (int g = 0; g < Groups.size(); ++g) {
-        xmlNodePtr Group = Groups[g];
-        QTreeWidgetItem* GroupItem = new QTreeWidgetItem(References);
-        QString GroupName = DocDocument::ChildText(Group, "name");
-        GroupItem->setText(0, GroupName.trimmed().isEmpty()
-            ? tr("(unnamed list)") : GroupName);
-        GroupItem->setData(0, Qt::UserRole, KindReferenceGroup);
-        GroupItem->setData(0, Qt::UserRole + 1, g);
-        QVector<xmlNodePtr> Entries = DocDocument::ReferenceEntries(Group);
-        for (int e = 0; e < Entries.size(); ++e) {
-            xmlNodePtr Entry = Entries[e];
-            QTreeWidgetItem* EntryItem = new QTreeWidgetItem(GroupItem);
-            QString Label = DocDocument::ReferenceLabel(Entry);
-            EntryItem->setText(0, Label.isEmpty() ? tr("(untitled)") : Label);
-            EntryItem->setData(0, Qt::UserRole, KindReferenceEntry);
-            EntryItem->setData(0, Qt::UserRole + 1, g);
-            EntryItem->setData(0, Qt::UserRole + 2, e);
-            QVector<xmlNodePtr> EntryAuthors =
-                DocDocument::ReferenceAuthors(Entry);
-            for (int a = 0; a < EntryAuthors.size(); ++a) {
-                QTreeWidgetItem* AuthorItem = new QTreeWidgetItem(EntryItem);
-                QString Name = DocDocument::AuthorAttribute(
-                    EntryAuthors[a], "fullname");
-                AuthorItem->setText(0, Name.trimmed().isEmpty() ? tr("(unnamed)") : Name);
-                AuthorItem->setData(0, Qt::UserRole, KindReferenceAuthor);
-                AuthorItem->setData(0, Qt::UserRole + 1, g);
-                AuthorItem->setData(0, Qt::UserRole + 2, e);
-                AuthorItem->setData(0, Qt::UserRole + 3, a);
-            }
-        }
+        AddReferenceGroupItem(References, Groups[g], QString::number(g));
     }
 
     _Outline->expandAll();
@@ -3014,6 +3302,77 @@ void MainWindow::AddSectionItem(QTreeWidgetItem* Parent, xmlNodePtr Section,
     for (int i = 0; i < Children.size(); ++i) {
         AddSectionItem(Item, Children[i],
                        Path + QStringLiteral(".") + QString::number(i));
+    }
+}
+
+/**
+ * @brief Adds one reference list, with its nested lists, entries,
+ *        and their authors, to the outline.
+ * @param Parent The outline item to add under.
+ * @param Group The <references> node to add (borrowed).
+ * @param Path The list's path (dot-separated indices).
+ */
+void MainWindow::AddReferenceGroupItem(QTreeWidgetItem* Parent, xmlNodePtr Group,
+                                       const QString& Path)
+{
+    QTreeWidgetItem* GroupItem = new QTreeWidgetItem(Parent);
+    QString GroupName = DocDocument::ChildText(Group, "name");
+    GroupItem->setText(0, GroupName.trimmed().isEmpty()
+        ? tr("(unnamed list)") : GroupName);
+    GroupItem->setData(0, Qt::UserRole, KindReferenceGroup);
+    GroupItem->setData(0, Qt::UserRole + 1, Path);
+    QVector<xmlNodePtr> Nested = DocDocument::NestedReferenceGroups(Group);
+    for (int n = 0; n < Nested.size(); ++n) {
+        AddReferenceGroupItem(GroupItem, Nested[n],
+                              Path + QStringLiteral(".") + QString::number(n));
+    }
+    QVector<xmlNodePtr> Entries = DocDocument::ReferenceEntries(Group);
+    for (int e = 0; e < Entries.size(); ++e) {
+        xmlNodePtr Entry = Entries[e];
+        QTreeWidgetItem* EntryItem = new QTreeWidgetItem(GroupItem);
+        QString Label = DocDocument::ReferenceLabel(Entry);
+        EntryItem->setText(0, Label.isEmpty() ? tr("(untitled)") : Label);
+        EntryItem->setData(0, Qt::UserRole, KindReferenceEntry);
+        EntryItem->setData(0, Qt::UserRole + 1, Path);
+        EntryItem->setData(0, Qt::UserRole + 2, e);
+        QVector<xmlNodePtr> EntryAuthors =
+            DocDocument::ReferenceAuthors(Entry);
+        for (int a = 0; a < EntryAuthors.size(); ++a) {
+            QTreeWidgetItem* AuthorItem = new QTreeWidgetItem(EntryItem);
+            QString Name = DocDocument::AuthorAttribute(
+                EntryAuthors[a], "fullname");
+            AuthorItem->setText(0, Name.trimmed().isEmpty() ? tr("(unnamed)") : Name);
+            AuthorItem->setData(0, Qt::UserRole, KindReferenceAuthor);
+            AuthorItem->setData(0, Qt::UserRole + 1, Path);
+            AuthorItem->setData(0, Qt::UserRole + 2, e);
+            AuthorItem->setData(0, Qt::UserRole + 3, a);
+        }
+    }
+    // Included references are entries too, fetched by xml2rfc
+    // rather than written in the file: they list under their
+    // group by the anchor their href carries, marked included
+    // so they are not mistaken for an editable entry.
+    QVector<xmlNodePtr> Includes = DocDocument::ReferenceIncludeNodes(Group);
+    for (int i = 0; i < Includes.size(); ++i) {
+        xmlNodePtr Include = Includes[i];
+        QTreeWidgetItem* IncludeItem = new QTreeWidgetItem(GroupItem);
+        QString Href = DocDocument::NodeAttribute(Include, "href");
+        QString Anchor = DocDocument::ReferenceAnchorFromIncludeHref(Href);
+        // A cached entry shows its real title; until it is fetched
+        // the anchor with "(included)" says what it is.
+        QString Title = _BibCache.CachedTitle(Href);
+        QString Label;
+        if (!Title.isEmpty() && !Anchor.isEmpty()) {
+            Label = tr("%1 (%2)").arg(Title, Anchor);
+        } else if (Anchor.isEmpty()) {
+            Label = Href.isEmpty() ? tr("(included reference)") : Href;
+        } else {
+            Label = tr("%1 (included)").arg(Anchor);
+        }
+        IncludeItem->setText(0, Label);
+        IncludeItem->setData(0, Qt::UserRole, KindReferenceInclude);
+        IncludeItem->setData(0, Qt::UserRole + 1, Path);
+        IncludeItem->setData(0, Qt::UserRole + 2, i);
     }
 }
 
@@ -3124,7 +3483,7 @@ void MainWindow::ShowDetailsFor(QTreeWidgetItem* Item)
         _Details->setCurrentIndex(DetailAuthors);
         break;
     case KindAuthor:
-        _AuthorGroup = -1;
+        _AuthorGroupPath.clear();
         _AuthorEntry = -1;
         _AuthorIndex = Item->data(0, Qt::UserRole + 1).toInt();
         FillAuthorForm();
@@ -3160,6 +3519,14 @@ void MainWindow::ShowDetailsFor(QTreeWidgetItem* Item)
     case KindReferences: {
         QString Text = tr("The lists of references: normative and informative, "
                           "for example. Add a list, then add entries to it.");
+        Text += QStringLiteral("\n\n") +
+            tr("Note to editor -") +
+            QStringLiteral("\n") +
+            tr("• Normative References: Standards or documents that must be "
+               "read and implemented to conform to your specification.") +
+            QStringLiteral("\n") +
+            tr("• Informative References: Background reading, examples, or "
+               "helpful context that are not required for implementation.");
         int BackItems = 0;
         for (xmlNodePtr Child : _Document.BackChildNodes()) {
             if (Child->type == XML_ELEMENT_NODE &&
@@ -3178,18 +3545,26 @@ void MainWindow::ShowDetailsFor(QTreeWidgetItem* Item)
         break;
     }
     case KindReferenceGroup:
-        _ReferenceGroupIndex = Item->data(0, Qt::UserRole + 1).toInt();
+        _ReferenceGroupPath = Item->data(0, Qt::UserRole + 1).toString();
         FillReferenceGroupForm();
         _Details->setCurrentIndex(DetailReferenceGroup);
         break;
     case KindReferenceEntry:
-        _ReferenceGroupIndex = Item->data(0, Qt::UserRole + 1).toInt();
+        _ReferenceGroupPath = Item->data(0, Qt::UserRole + 1).toString();
         _ReferenceEntryIndex = Item->data(0, Qt::UserRole + 2).toInt();
         FillReferenceEntryForm();
         _Details->setCurrentIndex(DetailReferenceEntry);
         break;
+    case KindReferenceInclude:
+        // An included reference has no entry form: show the
+        // list it lives in. The list page notes that the list
+        // holds details this version does not edit.
+        _ReferenceGroupPath = Item->data(0, Qt::UserRole + 1).toString();
+        FillReferenceGroupForm();
+        _Details->setCurrentIndex(DetailReferenceGroup);
+        break;
     case KindReferenceAuthor:
-        _AuthorGroup = Item->data(0, Qt::UserRole + 1).toInt();
+        _AuthorGroupPath = Item->data(0, Qt::UserRole + 1).toString();
         _AuthorEntry = Item->data(0, Qt::UserRole + 2).toInt();
         _AuthorIndex = Item->data(0, Qt::UserRole + 3).toInt();
         FillAuthorForm();
@@ -3395,14 +3770,14 @@ void MainWindow::FillAuthorForm()
 
 xmlNodePtr MainWindow::ShownAuthor()
 {
-    if (_AuthorGroup < 0) {
+    if (_AuthorGroupPath.isEmpty()) {
         QVector<xmlNodePtr> Authors = _Document.AuthorNodes();
         if (_AuthorIndex < 0 || _AuthorIndex >= Authors.size()) {
             return nullptr;
         }
         return Authors[_AuthorIndex];
     }
-    xmlNodePtr Entry = FindReferenceEntry(_AuthorGroup, _AuthorEntry);
+    xmlNodePtr Entry = FindReferenceEntry(_AuthorGroupPath, _AuthorEntry);
     if (Entry == nullptr) {
         return nullptr;
     }
@@ -3413,16 +3788,99 @@ xmlNodePtr MainWindow::ShownAuthor()
     return Authors[_AuthorIndex];
 }
 
-xmlNodePtr MainWindow::FindReferenceGroup(int Group)
+/**
+ * @brief Returns the sibling lists of the list at a path, and its index among them.
+ *
+ * Top-level lists are siblings under <back>; a nested list's
+ * siblings are the other nested lists under the same parent.
+ * @param Document The document.
+ * @param Path The dotted path of the list.
+ * @param Siblings The sibling lists, in file order.
+ * @param Index The list's index among its siblings.
+ * @return True when the path resolves to a list.
+ */
+static bool ReferenceGroupSiblings(DocDocument& Document, const QString& Path,
+                                   QVector<xmlNodePtr>& Siblings, int& Index)
 {
-    QVector<xmlNodePtr> Groups = _Document.ReferenceGroupNodes();
-    if (Group < 0 || Group >= Groups.size()) {
-        return nullptr;
+    if (Path.trimmed().isEmpty()) {
+        return false;
     }
-    return Groups[Group];
+    QStringList Parts = Path.split(QLatin1Char('.'));
+    bool Ok = false;
+    Index = Parts.last().toInt(&Ok);
+    if (!Ok || Index < 0) {
+        return false;
+    }
+    if (Parts.size() == 1) {
+        Siblings = Document.ReferenceGroupNodes();
+    } else {
+        QString ParentPath = Parts.mid(0, Parts.size() - 1).join(QLatin1Char('.'));
+        xmlNodePtr Parent = Document.ReferenceGroupAtPath(ParentPath);
+        if (Parent == nullptr) {
+            return false;
+        }
+        Siblings = DocDocument::NestedReferenceGroups(Parent);
+    }
+    if (Index >= Siblings.size()) {
+        return false;
+    }
+    return true;
 }
 
-xmlNodePtr MainWindow::FindReferenceEntry(int Group, int Entry)
+/**
+ * @brief Returns a list path with its last part replaced.
+ * @param Path The dotted path, such as "0.1".
+ * @param Index The new last part.
+ * @return The path with the last part replaced.
+ */
+static QString ReferenceGroupPathWithIndex(const QString& Path, int Index)
+{
+    QStringList Parts = Path.split(QLatin1Char('.'));
+    if (Parts.isEmpty()) {
+        return QString::number(Index);
+    }
+    Parts[Parts.size() - 1] = QString::number(Index);
+    return Parts.join(QLatin1Char('.'));
+}
+
+/**
+ * @brief Returns the display name of the list at a path, with its parents.
+ *
+ * A nested list shows under its parents, such as "References >
+ * Normative References", so a list of lists names each one
+ * unambiguously.
+ * @param Document The document.
+ * @param Path The dotted path of the list.
+ * @return The display name, or an empty string when the path is bad.
+ */
+static QString ReferenceGroupDisplayName(DocDocument& Document,
+                                         const QString& Path)
+{
+    if (Path.trimmed().isEmpty()) {
+        return QString();
+    }
+    QStringList Parts = Path.split(QLatin1Char('.'));
+    QStringList Names;
+    QString Prefix;
+    for (const QString& Part : Parts) {
+        Prefix = Prefix.isEmpty()
+            ? Part : Prefix + QStringLiteral(".") + Part;
+        xmlNodePtr Group = Document.ReferenceGroupAtPath(Prefix);
+        if (Group == nullptr) {
+            return QString();
+        }
+        QString Name = DocDocument::ChildText(Group, "name").trimmed();
+        Names.append(Name.isEmpty() ? QStringLiteral("(unnamed list)") : Name);
+    }
+    return Names.join(QStringLiteral(" > "));
+}
+
+xmlNodePtr MainWindow::FindReferenceGroup(const QString& Group)
+{
+    return _Document.ReferenceGroupAtPath(Group);
+}
+
+xmlNodePtr MainWindow::FindReferenceEntry(const QString& Group, int Entry)
 {
     xmlNodePtr List = FindReferenceGroup(Group);
     if (List == nullptr) {
@@ -3438,13 +3896,23 @@ xmlNodePtr MainWindow::FindReferenceEntry(int Group, int Entry)
 void MainWindow::FillReferenceGroupForm()
 {
     QSignalBlocker Blocker(_ReferenceGroupNameEdit);
-    xmlNodePtr Group = FindReferenceGroup(_ReferenceGroupIndex);
+    xmlNodePtr Group = FindReferenceGroup(_ReferenceGroupPath);
     if (Group == nullptr) {
         _ReferenceGroupNameEdit->clear();
+        _AddReferenceEntryButton->setEnabled(false);
+        _AddNestedListButton->setEnabled(false);
         _ReferenceGroupPreservedLabel->hide();
         return;
     }
     _ReferenceGroupNameEdit->setText(DocDocument::ChildText(Group, "name"));
+    // A list holds either nested lists or entries, never both:
+    // entries go only in a list with no nested lists, and a
+    // nested list goes only in a list with no entries. An empty
+    // list takes either, and the first child decides.
+    bool HasNested = DocDocument::ReferenceGroupHasNestedLists(Group);
+    bool HasEntries = DocDocument::ReferenceGroupHasEntries(Group);
+    _AddReferenceEntryButton->setEnabled(!HasNested);
+    _AddNestedListButton->setEnabled(!HasEntries);
     if (ReferenceGroupHasPreservedContent(Group)) {
         _ReferenceGroupPreservedLabel->setText(
             tr("This list holds details this version does not edit (a "
@@ -3467,7 +3935,7 @@ void MainWindow::FillReferenceEntryForm()
     QSignalBlocker BlockStream(_ReferenceStreamCombo);
     QSignalBlocker BlockSeries(_ReferenceSeriesTable);
     QSignalBlocker BlockMoveTo(_ReferenceMoveToCombo);
-    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupIndex, _ReferenceEntryIndex);
+    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupPath, _ReferenceEntryIndex);
     if (Entry == nullptr) {
         _ReferenceAnchorEdit->clear();
         _ReferenceTargetEdit->clear();
@@ -3514,13 +3982,19 @@ void MainWindow::FillReferenceEntryForm()
                 DocDocument::NodeAttribute(Series[i], "value")));
     }
     _ReferenceMoveToCombo->clear();
-    QVector<xmlNodePtr> Groups = _Document.ReferenceGroupNodes();
-    for (int g = 0; g < Groups.size(); ++g) {
-        QString Name = DocDocument::ChildText(Groups[g], "name").trimmed();
+    // Only a list that can hold entries is offered: a list with
+    // nested lists takes no entries. A nested list shows under
+    // its parents, so each list is named unambiguously.
+    for (const QString& Path : _Document.ReferenceGroupPaths()) {
+        xmlNodePtr List = _Document.ReferenceGroupAtPath(Path);
+        if (List == nullptr ||
+            DocDocument::ReferenceGroupHasNestedLists(List)) {
+            continue;
+        }
         _ReferenceMoveToCombo->addItem(
-            Name.isEmpty() ? tr("(unnamed list)") : Name, g);
+            ReferenceGroupDisplayName(_Document, Path), Path);
     }
-    int MoveIndex = _ReferenceMoveToCombo->findData(_ReferenceGroupIndex);
+    int MoveIndex = _ReferenceMoveToCombo->findData(_ReferenceGroupPath);
     _ReferenceMoveToCombo->setCurrentIndex(MoveIndex);
     if (ReferenceEntryHasPreservedContent(Entry)) {
         _ReferenceEntryPreservedLabel->setText(
@@ -3561,9 +4035,41 @@ void MainWindow::OnAddReferenceGroup()
     RebuildOutline();
 }
 
+void MainWindow::OnAddNestedReferenceGroup()
+{
+    xmlNodePtr Parent = FindReferenceGroup(_ReferenceGroupPath);
+    if (Parent == nullptr) {
+        return;
+    }
+    // A list with entries takes no nested list: the schema lets
+    // a list hold nested lists or entries, never both. The
+    // button is disabled for such a list; this is the same rule
+    // enforced here.
+    if (DocDocument::ReferenceGroupHasEntries(Parent)) {
+        return;
+    }
+    bool Ok = false;
+    QString Name = QInputDialog::getText(this, tr("Add Nested List"),
+                                         tr("List name:"), QLineEdit::Normal,
+                                         QString(), &Ok);
+    if (!Ok) {
+        return;
+    }
+    xmlNodePtr Group = xmlNewNode(nullptr, XmlChars("references"));
+    xmlAddChild(Parent, Group);
+    if (!Name.trimmed().isEmpty()) {
+        SetLeadingChildText(Group, "name", Name);
+    }
+    _SelectedKey = QStringLiteral("refgroup:") + _ReferenceGroupPath +
+        QStringLiteral(".") +
+        QString::number(DocDocument::NestedReferenceGroups(Parent).size() - 1);
+    SetModified(true);
+    RebuildOutline();
+}
+
 void MainWindow::OnRemoveReferenceGroup()
 {
-    xmlNodePtr Group = FindReferenceGroup(_ReferenceGroupIndex);
+    xmlNodePtr Group = FindReferenceGroup(_ReferenceGroupPath);
     if (Group == nullptr) {
         return;
     }
@@ -3586,41 +4092,49 @@ void MainWindow::OnRemoveReferenceGroup()
 
 void MainWindow::OnMoveReferenceGroupUp()
 {
-    if (_ReferenceGroupIndex <= 0) {
+    QVector<xmlNodePtr> Siblings;
+    int Index = -1;
+    if (!ReferenceGroupSiblings(_Document, _ReferenceGroupPath, Siblings,
+                                Index)) {
         return;
     }
-    QVector<xmlNodePtr> Groups = _Document.ReferenceGroupNodes();
-    if (_ReferenceGroupIndex >= Groups.size()) {
+    if (Index <= 0) {
         return;
     }
-    xmlNodePtr Moved = Groups[_ReferenceGroupIndex];
+    xmlNodePtr Moved = Siblings[Index];
     xmlUnlinkNode(Moved);
-    xmlAddPrevSibling(Groups[_ReferenceGroupIndex - 1], Moved);
-    --_ReferenceGroupIndex;
-    _SelectedKey = QStringLiteral("refgroup:") + QString::number(_ReferenceGroupIndex);
+    xmlAddPrevSibling(Siblings[Index - 1], Moved);
+    _ReferenceGroupPath =
+        ReferenceGroupPathWithIndex(_ReferenceGroupPath, Index - 1);
+    _SelectedKey = QStringLiteral("refgroup:") + _ReferenceGroupPath;
     SetModified(true);
     RebuildOutline();
 }
 
 void MainWindow::OnMoveReferenceGroupDown()
 {
-    QVector<xmlNodePtr> Groups = _Document.ReferenceGroupNodes();
-    if (_ReferenceGroupIndex < 0 ||
-        _ReferenceGroupIndex + 1 >= Groups.size()) {
+    QVector<xmlNodePtr> Siblings;
+    int Index = -1;
+    if (!ReferenceGroupSiblings(_Document, _ReferenceGroupPath, Siblings,
+                                Index)) {
         return;
     }
-    xmlNodePtr Moved = Groups[_ReferenceGroupIndex];
+    if (Index + 1 >= Siblings.size()) {
+        return;
+    }
+    xmlNodePtr Moved = Siblings[Index];
     xmlUnlinkNode(Moved);
-    xmlAddNextSibling(Groups[_ReferenceGroupIndex + 1], Moved);
-    ++_ReferenceGroupIndex;
-    _SelectedKey = QStringLiteral("refgroup:") + QString::number(_ReferenceGroupIndex);
+    xmlAddNextSibling(Siblings[Index + 1], Moved);
+    _ReferenceGroupPath =
+        ReferenceGroupPathWithIndex(_ReferenceGroupPath, Index + 1);
+    _SelectedKey = QStringLiteral("refgroup:") + _ReferenceGroupPath;
     SetModified(true);
     RebuildOutline();
 }
 
 void MainWindow::OnReferenceGroupNameEdited(const QString& Text)
 {
-    xmlNodePtr Group = FindReferenceGroup(_ReferenceGroupIndex);
+    xmlNodePtr Group = FindReferenceGroup(_ReferenceGroupPath);
     if (Group == nullptr) {
         return;
     }
@@ -3632,10 +4146,256 @@ void MainWindow::OnReferenceGroupNameEdited(const QString& Text)
     SetModified(true);
 }
 
+/**
+ * @brief A title turned into an anchor: lower case, words joined by dashes.
+ * @param Title The title.
+ * @return The anchor, or "section" when the title holds no letters or digits.
+ */
+static QString SlugAnchor(const QString& Title)
+{
+    QString Slug = Title.trimmed().toLower();
+    Slug.replace(QRegularExpression(QStringLiteral("[^a-z0-9]+")),
+                 QStringLiteral("-"));
+    while (Slug.startsWith(QLatin1Char('-'))) {
+        Slug.remove(0, 1);
+    }
+    while (Slug.endsWith(QLatin1Char('-'))) {
+        Slug.chop(1);
+    }
+    if (Slug.isEmpty()) {
+        Slug = QStringLiteral("section");
+    }
+    return Slug;
+}
+
+/**
+ * @brief The RFC number an anchor names, or empty.
+ * @param Anchor The anchor.
+ * @return The digits, or empty when the anchor is not an RFC number.
+ */
+static QString RfcNumberFromAnchor(const QString& Anchor)
+{
+    if (Anchor.length() <= 3 ||
+        !Anchor.startsWith(QStringLiteral("RFC"), Qt::CaseInsensitive)) {
+        return QString();
+    }
+    QString Digits = Anchor.mid(3);
+    for (QChar Ch : Digits) {
+        if (!Ch.isDigit()) {
+            return QString();
+        }
+    }
+    return Digits;
+}
+
+/**
+ * @brief True when any reference list already carries this anchor.
+ * @param Document The document.
+ * @param Anchor The anchor to look for.
+ * @return True when the anchor is already used.
+ */
+static bool ReferenceAnchorExists(const DocDocument& Document,
+                                  const QString& Anchor)
+{
+    for (const QString& Path : Document.ReferenceGroupPaths()) {
+        xmlNodePtr Group = Document.ReferenceGroupAtPath(Path);
+        if (Group == nullptr) {
+            continue;
+        }
+        for (xmlNodePtr Entry : DocDocument::ReferenceEntries(Group)) {
+            if (DocDocument::NodeAttribute(Entry, "anchor").trimmed() ==
+                Anchor) {
+                return true;
+            }
+        }
+        for (xmlNodePtr Include : DocDocument::ReferenceIncludeNodes(Group)) {
+            if (DocDocument::ReferenceAnchorFromIncludeHref(
+                    DocDocument::NodeAttribute(Include, "href")) == Anchor) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+xmlNodePtr MainWindow::EnsureReferenceList(const QString& ListName)
+{
+    // The menu names the list short ("Normative"); the IETF
+    // form names it in full ("Normative References"). Either
+    // spelling finds the list; a new one takes the full form.
+    // Matching only the short name never found the list: the
+    // entry went into a stray list just called "Normative".
+    QString FullName = ListName.endsWith(QStringLiteral(" References"))
+        ? ListName : ListName + QStringLiteral(" References");
+    for (const QString& Path : _Document.ReferenceGroupPaths()) {
+        if (Path.contains(QLatin1Char('.'))) {
+            continue;
+        }
+        xmlNodePtr Group = _Document.ReferenceGroupAtPath(Path);
+        if (Group == nullptr ||
+            DocDocument::ChildText(Group, "name") !=
+                QLatin1String("References")) {
+            continue;
+        }
+        if (DocDocument::ReferenceGroupHasNestedLists(Group)) {
+            for (xmlNodePtr Nested :
+                 DocDocument::NestedReferenceGroups(Group)) {
+                QString NestedName =
+                    DocDocument::ChildText(Nested, "name");
+                if (NestedName == ListName || NestedName == FullName) {
+                    return Nested;
+                }
+            }
+            xmlNodePtr Nested =
+                xmlNewNode(nullptr, XmlChars("references"));
+            SetLeadingChildText(Nested, "name", FullName);
+            xmlAddChild(Group, Nested);
+            return Nested;
+        }
+        // A flat list holds entries, not nested lists, so it
+        // cannot gain a nested list: it is the references list.
+        return Group;
+    }
+    // No "References" list at all: build the nested IETF form,
+    // both nested lists empty, and hand back the one asked for.
+    xmlNodePtr Back = _Document.BackNode();
+    if (Back == nullptr) {
+        xmlNodePtr Rfc = _Document.RfcNode();
+        if (Rfc == nullptr) {
+            return nullptr;
+        }
+        Back = DocDocument::NewChildElement(Rfc, "back");
+    }
+    xmlNodePtr Outer = xmlNewNode(nullptr, XmlChars("references"));
+    SetLeadingChildText(Outer, "name", QStringLiteral("References"));
+    xmlAddChild(Back, Outer);
+    xmlNodePtr Wanted = nullptr;
+    for (const QString& Name : {QStringLiteral("Normative References"),
+                                QStringLiteral("Informative References")}) {
+        xmlNodePtr Nested = xmlNewNode(nullptr, XmlChars("references"));
+        SetLeadingChildText(Nested, "name", Name);
+        xmlAddChild(Outer, Nested);
+        if (Name == FullName) {
+            Wanted = Nested;
+        }
+    }
+    return Wanted;
+}
+
+void MainWindow::HandleMakeReference(TextEditor* Editor, int Action,
+                                     xmlNodePtr Target,
+                                     const QString& Anchor,
+                                     const QString& ListName)
+{
+    if (Editor == nullptr) {
+        return;
+    }
+    // The outline rebuild below reloads the section body and
+    // drops the live selection, so the highlighted range is
+    // captured here, before anything that rebuilds. Without
+    // it the cross-reference landed at the start of the
+    // section as a bare marker instead of on the highlight.
+    int SelectionStart = -1;
+    int SelectionEnd = -1;
+    Editor->SelectedRange(SelectionStart, SelectionEnd);
+    if (Action == TextEditor::InternalReferenceAction) {
+        if (Target == nullptr) {
+            return;
+        }
+        QString TargetAnchor =
+            DocDocument::NodeAttribute(Target, "anchor").trimmed();
+        if (TargetAnchor.isEmpty()) {
+            // Sections carry no anchor until one is picked:
+            // derive one from the title, unique in the document.
+            QString Title = DocDocument::SectionTitle(Target);
+            if (Title.trimmed().isEmpty()) {
+                Title = DocDocument::ChildText(Target, "name");
+            }
+            TargetAnchor = SlugAnchor(Title);
+            QString Base = TargetAnchor;
+            int Suffix = 2;
+            while (DocDocument::DocumentHasAnchor(_Document.RfcNode(),
+                                                  TargetAnchor)) {
+                TargetAnchor = Base + QStringLiteral("-") +
+                    QString::number(Suffix++);
+            }
+            DocDocument::SetNodeAttribute(Target, "anchor", TargetAnchor);
+            SetModified(true);
+        }
+        Editor->InsertXrefMarker(TargetAnchor, SelectionStart, SelectionEnd);
+        return;
+    }
+    if (Action != TextEditor::NewReferenceAction ||
+        Anchor.trimmed().isEmpty() || ListName.isEmpty()) {
+        return;
+    }
+    QString Wanted = Anchor.trimmed();
+    xmlNodePtr Group = EnsureReferenceList(ListName);
+    if (Group == nullptr) {
+        return;
+    }
+    if (ReferenceAnchorExists(_Document, Wanted)) {
+        // The entry is already there: cite it instead of a duplicate.
+        Editor->InsertXrefMarker(Wanted, SelectionStart, SelectionEnd);
+        return;
+    }
+    QString RfcNumber = RfcNumberFromAnchor(Wanted);
+    if (!RfcNumber.isEmpty()) {
+        // xml2rfc pulls the full reference from its database; the
+        // editor only supplies the tag. The included file IS the
+        // whole <reference>, so nothing else is needed.
+        xmlNsPtr XiNs =
+            DocDocument::EnsureXIncludeNamespace(_Document.RfcNode());
+        if (XiNs == nullptr) {
+            return;
+        }
+        xmlNodePtr Include =
+            xmlNewChild(Group, XiNs, XmlChars("include"), nullptr);
+        DocDocument::SetNodeAttribute(
+            Include, "href",
+            QStringLiteral(
+                "https://bib.ietf.org/public/rfc/bibxml/reference.RFC.") +
+                RfcNumber + QStringLiteral(".xml"));
+    } else {
+        // A placeholder: the anchor, with the title and author
+        // prefilled to say what still needs providing. The author
+        // completes it in the entry form. The entry is valid as
+        // it stands; only the placeholder text says it is not
+        // done. The author carries only the fullname: no
+        // initials or surname are invented for a placeholder,
+        // since the form writes each author field on its own
+        // and derived values would linger after the real name
+        // is typed in.
+        xmlNodePtr Entry = xmlNewNode(nullptr, XmlChars("reference"));
+        DocDocument::SetNodeAttribute(Entry, "anchor", Wanted);
+        xmlNodePtr Front = ReferenceFrontNode(Entry, true);
+        if (Front != nullptr) {
+            SetLeadingChildText(Front, "title",
+                                QStringLiteral("Please Supply Title"));
+            xmlNodePtr Author = xmlNewNode(nullptr, XmlChars("author"));
+            DocDocument::SetNodeAttribute(
+                Author, "fullname",
+                QStringLiteral("Please supply Author"));
+            xmlAddChild(Front, Author);
+        }
+        AppendReferenceEntry(Group, Entry);
+    }
+    SetModified(true);
+    RebuildOutline();
+    Editor->InsertXrefMarker(Wanted, SelectionStart, SelectionEnd);
+}
+
 void MainWindow::OnAddReferenceEntry()
 {
-    xmlNodePtr Group = FindReferenceGroup(_ReferenceGroupIndex);
+    xmlNodePtr Group = FindReferenceGroup(_ReferenceGroupPath);
     if (Group == nullptr) {
+        return;
+    }
+    // A list with nested lists takes no entries: the schema lets
+    // a list hold nested lists or entries, never both. The
+    // button is disabled for such a list; this is the same rule
+    // enforced here.
+    if (DocDocument::ReferenceGroupHasNestedLists(Group)) {
         return;
     }
     // Ask for the anchor first: an entry with no anchor cannot save.
@@ -3654,7 +4414,7 @@ void MainWindow::OnAddReferenceEntry()
     xmlNodePtr Entry = xmlNewNode(nullptr, XmlChars("reference"));
     DocDocument::SetNodeAttribute(Entry, "anchor", Anchor);
     AppendReferenceEntry(Group, Entry);
-    _SelectedKey = QStringLiteral("refentry:") + QString::number(_ReferenceGroupIndex) +
+    _SelectedKey = QStringLiteral("refentry:") + _ReferenceGroupPath +
         QStringLiteral(".") +
         QString::number(DocDocument::ReferenceEntries(Group).size() - 1);
     SetModified(true);
@@ -3663,7 +4423,7 @@ void MainWindow::OnAddReferenceEntry()
 
 void MainWindow::OnRemoveReferenceEntry()
 {
-    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupIndex, _ReferenceEntryIndex);
+    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupPath, _ReferenceEntryIndex);
     if (Entry == nullptr) {
         return;
     }
@@ -3684,14 +4444,14 @@ void MainWindow::OnRemoveReferenceEntry()
     }
     xmlUnlinkNode(Entry);
     xmlFreeNode(Entry);
-    _SelectedKey = QStringLiteral("refgroup:") + QString::number(_ReferenceGroupIndex);
+    _SelectedKey = QStringLiteral("refgroup:") + _ReferenceGroupPath;
     SetModified(true);
     RebuildOutline();
 }
 
 void MainWindow::OnMoveReferenceEntryUp()
 {
-    xmlNodePtr Group = FindReferenceGroup(_ReferenceGroupIndex);
+    xmlNodePtr Group = FindReferenceGroup(_ReferenceGroupPath);
     if (Group == nullptr || _ReferenceEntryIndex <= 0) {
         return;
     }
@@ -3703,7 +4463,7 @@ void MainWindow::OnMoveReferenceEntryUp()
     xmlUnlinkNode(Moved);
     xmlAddPrevSibling(Entries[_ReferenceEntryIndex - 1], Moved);
     --_ReferenceEntryIndex;
-    _SelectedKey = QStringLiteral("refentry:") + QString::number(_ReferenceGroupIndex) +
+    _SelectedKey = QStringLiteral("refentry:") + _ReferenceGroupPath +
         QStringLiteral(".") + QString::number(_ReferenceEntryIndex);
     SetModified(true);
     RebuildOutline();
@@ -3711,7 +4471,7 @@ void MainWindow::OnMoveReferenceEntryUp()
 
 void MainWindow::OnMoveReferenceEntryDown()
 {
-    xmlNodePtr Group = FindReferenceGroup(_ReferenceGroupIndex);
+    xmlNodePtr Group = FindReferenceGroup(_ReferenceGroupPath);
     if (Group == nullptr || _ReferenceEntryIndex < 0) {
         return;
     }
@@ -3723,7 +4483,7 @@ void MainWindow::OnMoveReferenceEntryDown()
     xmlUnlinkNode(Moved);
     xmlAddNextSibling(Entries[_ReferenceEntryIndex + 1], Moved);
     ++_ReferenceEntryIndex;
-    _SelectedKey = QStringLiteral("refentry:") + QString::number(_ReferenceGroupIndex) +
+    _SelectedKey = QStringLiteral("refentry:") + _ReferenceGroupPath +
         QStringLiteral(".") + QString::number(_ReferenceEntryIndex);
     SetModified(true);
     RebuildOutline();
@@ -3731,11 +4491,22 @@ void MainWindow::OnMoveReferenceEntryDown()
 
 void MainWindow::OnReferenceEntryEdited()
 {
-    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupIndex, _ReferenceEntryIndex);
+    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupPath, _ReferenceEntryIndex);
     if (Entry == nullptr) {
         return;
     }
+    QString OldAnchor = DocDocument::NodeAttribute(Entry, "anchor");
+    QString NewAnchor = _ReferenceAnchorEdit->text();
     DocDocument::SetNodeAttribute(Entry, "anchor", _ReferenceAnchorEdit->text());
+    if (!OldAnchor.trimmed().isEmpty() && !NewAnchor.trimmed().isEmpty() &&
+        OldAnchor.trimmed() != NewAnchor.trimmed()) {
+        // The anchor names the reference: every cross-reference
+        // that cited the old anchor now cites the new one, so
+        // entering the data here updates the <xref> values too.
+        DocDocument::RenameXrefTargets(_Document.RfcNode(),
+                                       OldAnchor.trimmed(),
+                                       NewAnchor.trimmed());
+    }
     DocDocument::SetNodeAttribute(Entry, "target", _ReferenceTargetEdit->text());
     SetReferenceTitle(Entry, _ReferenceTitleEdit->text());
     SetReferenceDatePart(Entry, "day", _ReferenceDateDayEdit->text());
@@ -3751,7 +4522,7 @@ void MainWindow::OnReferenceEntryEdited()
 
 void MainWindow::OnReferenceStreamChanged()
 {
-    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupIndex, _ReferenceEntryIndex);
+    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupPath, _ReferenceEntryIndex);
     if (Entry == nullptr) {
         return;
     }
@@ -3761,22 +4532,21 @@ void MainWindow::OnReferenceStreamChanged()
 
 void MainWindow::OnReferenceMoveToGroupChanged()
 {
-    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupIndex, _ReferenceEntryIndex);
+    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupPath, _ReferenceEntryIndex);
     if (Entry == nullptr) {
         return;
     }
-    int Target = _ReferenceMoveToCombo->currentData().toInt();
-    QVector<xmlNodePtr> Groups = _Document.ReferenceGroupNodes();
-    if (Target == _ReferenceGroupIndex || Target < 0 ||
-        Target >= Groups.size()) {
+    QString Target = _ReferenceMoveToCombo->currentData().toString();
+    xmlNodePtr TargetGroup = FindReferenceGroup(Target);
+    if (TargetGroup == nullptr || Target == _ReferenceGroupPath) {
         return;
     }
     xmlUnlinkNode(Entry);
-    AppendReferenceEntry(Groups[Target], Entry);
-    _ReferenceGroupIndex = Target;
+    AppendReferenceEntry(TargetGroup, Entry);
+    _ReferenceGroupPath = Target;
     _ReferenceEntryIndex =
-        DocDocument::ReferenceEntries(Groups[Target]).size() - 1;
-    _SelectedKey = QStringLiteral("refentry:") + QString::number(_ReferenceGroupIndex) +
+        DocDocument::ReferenceEntries(TargetGroup).size() - 1;
+    _SelectedKey = QStringLiteral("refentry:") + _ReferenceGroupPath +
         QStringLiteral(".") + QString::number(_ReferenceEntryIndex);
     SetModified(true);
     RebuildOutline();
@@ -3784,7 +4554,7 @@ void MainWindow::OnReferenceMoveToGroupChanged()
 
 void MainWindow::OnAddSeriesInfo()
 {
-    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupIndex, _ReferenceEntryIndex);
+    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupPath, _ReferenceEntryIndex);
     if (Entry == nullptr) {
         return;
     }
@@ -3803,7 +4573,7 @@ void MainWindow::OnAddSeriesInfo()
 
 void MainWindow::OnRemoveSeriesInfo()
 {
-    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupIndex, _ReferenceEntryIndex);
+    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupPath, _ReferenceEntryIndex);
     if (Entry == nullptr) {
         return;
     }
@@ -3818,7 +4588,7 @@ void MainWindow::OnRemoveSeriesInfo()
 
 void MainWindow::OnSeriesInfoChanged()
 {
-    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupIndex, _ReferenceEntryIndex);
+    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupPath, _ReferenceEntryIndex);
     if (Entry == nullptr) {
         return;
     }
@@ -3843,7 +4613,7 @@ void MainWindow::OnSeriesInfoChanged()
 
 void MainWindow::OnAddReferenceAuthor()
 {
-    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupIndex, _ReferenceEntryIndex);
+    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupPath, _ReferenceEntryIndex);
     if (Entry == nullptr) {
         return;
     }
@@ -3873,7 +4643,7 @@ void MainWindow::OnAddReferenceAuthor()
     } else {
         xmlAddChild(Front, Author);
     }
-    _SelectedKey = QStringLiteral("refauthor:") + QString::number(_ReferenceGroupIndex) +
+    _SelectedKey = QStringLiteral("refauthor:") + _ReferenceGroupPath +
         QStringLiteral(".") + QString::number(_ReferenceEntryIndex) +
         QStringLiteral(".") +
         QString::number(DocDocument::ReferenceAuthors(Entry).size() - 1);
@@ -3959,6 +4729,9 @@ QString MainWindow::SelectionKey(QTreeWidgetItem* Item) const
         return QStringLiteral("refauthor:") + Item->data(0, Qt::UserRole + 1).toString() +
             QStringLiteral(".") + Item->data(0, Qt::UserRole + 2).toString() +
             QStringLiteral(".") + Item->data(0, Qt::UserRole + 3).toString();
+    case KindReferenceInclude:
+        return QStringLiteral("refinclude:") + Item->data(0, Qt::UserRole + 1).toString() +
+            QStringLiteral(".") + Item->data(0, Qt::UserRole + 2).toString();
     default:
         return QString();
     }
