@@ -16,9 +16,11 @@
 #include <QDesktopServices>
 #include <QDialog>
 #include <QDir>
+#include <QEventLoop>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFontDatabase>
 #include <QFontMetrics>
 #include <QFormLayout>
 #include <QGroupBox>
@@ -27,9 +29,13 @@
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QPlainTextEdit>
 #include <QProcess>
 #include <QPushButton>
@@ -44,6 +50,7 @@
 #include <QTableWidget>
 #include <QTextCursor>
 #include <QTextStream>
+#include <QTimer>
 #include <QTreeWidget>
 #include <QUrl>
 #include <QVBoxLayout>
@@ -676,6 +683,8 @@ MainWindow::MainWindow(QWidget* Parent)
     , _AuthorEntry(-1)
     , _ReferenceGroupPath()
     , _ReferenceEntryIndex(-1)
+    , _ReferenceAuthorIndex(-1)
+    , _ReferenceIncludeIndex(-1)
     , _SectionPath()
     , _RunFailed(false)
     , _FileMenu(nullptr)
@@ -723,6 +732,10 @@ MainWindow::MainWindow(QWidget* Parent)
     , _AddReferenceEntryButton(nullptr)
     , _AddNestedListButton(nullptr)
     , _ReferenceGroupPreservedLabel(nullptr)
+    , _ReferenceIncludeLabel(nullptr)
+    , _RemoveReferenceIncludeButton(nullptr)
+    , _ReferenceIncludeNormativeRadio(nullptr)
+    , _ReferenceIncludeInformativeRadio(nullptr)
     , _ReferenceAnchorEdit(nullptr)
     , _ReferenceTargetEdit(nullptr)
     , _ReferenceTitleEdit(nullptr)
@@ -732,6 +745,19 @@ MainWindow::MainWindow(QWidget* Parent)
     , _ReferenceStreamCombo(nullptr)
     , _ReferenceSeriesTable(nullptr)
     , _ReferenceMoveToCombo(nullptr)
+    , _ReferenceNormativeRadio(nullptr)
+    , _ReferenceInformativeRadio(nullptr)
+    , _ReferenceAuthorList(nullptr)
+    , _ReferenceAuthorFullnameEdit(nullptr)
+    , _ReferenceAuthorInitialsEdit(nullptr)
+    , _ReferenceAuthorSurnameEdit(nullptr)
+    , _ReferenceAuthorOrganizationEdit(nullptr)
+    , _ReferenceAuthorEmailEdit(nullptr)
+    , _ReferenceAuthorPhoneEdit(nullptr)
+    , _ReferenceAuthorUriEdit(nullptr)
+    , _ReferenceAuthorRadio(nullptr)
+    , _ReferenceEditorRadio(nullptr)
+    , _RemoveReferenceAuthorButton(nullptr)
     , _ReferenceEntryPreservedLabel(nullptr)
     , _SettingsTitleEdit(nullptr)
     , _SettingsTitleAbbrevEdit(nullptr)
@@ -838,6 +864,27 @@ MainWindow::MainWindow(QWidget* Parent)
     BibliographyAction->setStatusTip(tr("Manage the cached bibliography entries."));
     connect(BibliographyAction, &QAction::triggered, this, &MainWindow::OnBibliography);
 
+    QMenu* ViewPublishedMenu = menuBar()->addMenu(tr("&View Published"));
+
+    QAction* ViewRfcAction = ViewPublishedMenu->addAction(tr("&RFC..."));
+    ViewRfcAction->setStatusTip(
+        tr("View a published RFC as XML, HTML, text, or PDF."));
+    connect(ViewRfcAction, &QAction::triggered,
+            this, &MainWindow::OnViewPublishedRfc);
+
+    QAction* ViewIdAction = ViewPublishedMenu->addAction(tr("&ID..."));
+    ViewIdAction->setStatusTip(
+        tr("View a published Internet-Draft as XML, HTML, text, or PDF."));
+    connect(ViewIdAction, &QAction::triggered,
+            this, &MainWindow::OnViewPublishedId);
+
+    QAction* ViewIdDiffAction =
+        ViewPublishedMenu->addAction(tr("ID &Difference..."));
+    ViewIdDiffAction->setStatusTip(
+        tr("Show the differences between two versions of an Internet-Draft."));
+    connect(ViewIdDiffAction, &QAction::triggered,
+            this, &MainWindow::OnViewPublishedIdDiff);
+
     QMenu* HelpMenu = menuBar()->addMenu(tr("&Help"));
 
     QAction* LegendAction = HelpMenu->addAction(tr("&Legend"));
@@ -851,10 +898,37 @@ MainWindow::MainWindow(QWidget* Parent)
     connect(Xml2rfcLegendAction, &QAction::triggered,
             this, &MainWindow::OnXml2rfcLegend);
 
+    QAction* FeedbackAction = HelpMenu->addAction(tr("&Feedback"));
+    FeedbackAction->setStatusTip(
+        tr("Open the GitHub issues page in the default browser."));
+    connect(FeedbackAction, &QAction::triggered,
+            this, &MainWindow::OnFeedback);
+
     QAction* AboutAction = HelpMenu->addAction(tr("&About ProtocolDocEditor"));
     AboutAction->setStatusTip(
         tr("Show information about this editor, including the copyright and license."));
     connect(AboutAction, &QAction::triggered, this, &MainWindow::OnAbout);
+
+    // A one-time note, the first time the app starts, pointing at
+    // Help > Feedback (Bug 494). The single-shot timer waits until
+    // the window is showing before the box appears; the start
+    // wizard already ran before this window was made, so the two
+    // never overlap.
+    QTimer::singleShot(0, this, [this]() {
+        QSettings Settings;
+        if (Settings.value(
+                QStringLiteral("help/feedback-notice-shown"),
+                false).toBool()) {
+            return;
+        }
+        Settings.setValue(
+            QStringLiteral("help/feedback-notice-shown"), true);
+        QMessageBox::information(
+            this, tr("Feedback"),
+            tr("You can report issues and make suggestions from the "
+               "Help menu: Help > Feedback opens the GitHub issues "
+               "page in your default browser."));
+    });
 
     RebuildRecentMenu();
 
@@ -1027,6 +1101,7 @@ MainWindow::MainWindow(QWidget* Parent)
     _AbstractEdit = new TextEditor(AbstractPageWidget);
     _AbstractEdit->SetSpellChecker(_SpellChecker.get());
     _AbstractEdit->SetDocument(&_Document);
+    _AbstractEdit->SetBibCache(&_BibCache);
     connect(_AbstractEdit, &TextEditor::TextChanged, this, &MainWindow::OnAbstractEdited);
     connect(_AbstractEdit, &TextEditor::MakeReferenceRequested, this,
             [this](int Action, xmlNodePtr Target, const QString& Anchor, const QString& ListName) {
@@ -1061,6 +1136,7 @@ MainWindow::MainWindow(QWidget* Parent)
     _SectionBodyEdit = new TextEditor(SectionPageWidget);
     _SectionBodyEdit->SetSpellChecker(_SpellChecker.get());
     _SectionBodyEdit->SetDocument(&_Document);
+    _SectionBodyEdit->SetBibCache(&_BibCache);
     connect(_SectionBodyEdit, &TextEditor::TextChanged, this, &MainWindow::OnSectionBodyEdited);
     connect(_SectionBodyEdit, &TextEditor::MakeReferenceRequested, this,
             [this](int Action, xmlNodePtr Target, const QString& Anchor, const QString& ListName) {
@@ -1120,15 +1196,39 @@ MainWindow::MainWindow(QWidget* Parent)
     connect(MoveGroupDownButton, &QPushButton::clicked, this, &MainWindow::OnMoveReferenceGroupDown);
     _ReferenceGroupPreservedLabel = new QLabel(ReferenceGroupPageWidget);
     _ReferenceGroupPreservedLabel->setWordWrap(true);
+    _ReferenceIncludeLabel = new QLabel(ReferenceGroupPageWidget);
+    _ReferenceIncludeLabel->setWordWrap(true);
+    _RemoveReferenceIncludeButton = new QPushButton(tr("Remove Included Reference"), ReferenceGroupPageWidget);
+    _RemoveReferenceIncludeButton->setToolTip(tr("Remove the selected included reference from this list."));
+    connect(_RemoveReferenceIncludeButton, &QPushButton::clicked, this, &MainWindow::OnRemoveReferenceInclude);
+    // The section radios move the picked included reference into
+    // the Normative or Informative nested list, creating it when
+    // it is not there yet. They live in their own widget so they
+    // do not join any other radio pair on this page.
+    _ReferenceIncludeNormativeRadio = new QRadioButton(tr("Normative"), ReferenceGroupPageWidget);
+    _ReferenceIncludeNormativeRadio->setToolTip(tr("Move the selected included reference to the Normative References list."));
+    _ReferenceIncludeInformativeRadio = new QRadioButton(tr("Informative"), ReferenceGroupPageWidget);
+    _ReferenceIncludeInformativeRadio->setToolTip(tr("Move the selected included reference to the Informative References list."));
+    connect(_ReferenceIncludeNormativeRadio, &QRadioButton::toggled, this, &MainWindow::OnReferenceIncludeSectionChanged);
+    connect(_ReferenceIncludeInformativeRadio, &QRadioButton::toggled, this, &MainWindow::OnReferenceIncludeSectionChanged);
+    QWidget* ReferenceIncludeSectionWidget = new QWidget(ReferenceGroupPageWidget);
+    QHBoxLayout* ReferenceIncludeSectionLayout = new QHBoxLayout(ReferenceIncludeSectionWidget);
+    ReferenceIncludeSectionLayout->setContentsMargins(0, 0, 0, 0);
+    ReferenceIncludeSectionLayout->addWidget(_ReferenceIncludeNormativeRadio);
+    ReferenceIncludeSectionLayout->addWidget(_ReferenceIncludeInformativeRadio);
+    ReferenceIncludeSectionLayout->addStretch(1);
     QHBoxLayout* GroupButtons = new QHBoxLayout();
     GroupButtons->addWidget(AddEntryButton);
     GroupButtons->addWidget(AddNestedListButton);
     GroupButtons->addWidget(RemoveGroupButton);
+    GroupButtons->addWidget(_RemoveReferenceIncludeButton);
     GroupButtons->addWidget(MoveGroupUpButton);
     GroupButtons->addWidget(MoveGroupDownButton);
     GroupButtons->addStretch(1);
     QFormLayout* ReferenceGroupLayout = new QFormLayout(ReferenceGroupPageWidget);
+    ReferenceGroupLayout->addRow(tr("Section:"), ReferenceIncludeSectionWidget);
     ReferenceGroupLayout->addRow(tr("List name:"), _ReferenceGroupNameEdit);
+    ReferenceGroupLayout->addRow(tr("Included reference:"), _ReferenceIncludeLabel);
     ReferenceGroupLayout->addRow(GroupButtons);
     ReferenceGroupLayout->addRow(_ReferenceGroupPreservedLabel);
     _Details->addWidget(ReferenceGroupPageWidget);
@@ -1190,9 +1290,67 @@ MainWindow::MainWindow(QWidget* Parent)
     connect(_ReferenceMoveToCombo,
             static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged),
             this, &MainWindow::OnReferenceMoveToGroupChanged);
+    // The section radios move this entry into the Normative or
+    // Informative nested list under its outer list, creating
+    // that list when it is not there yet. They live in their own
+    // widget so they do not join the author-role radios below.
+    _ReferenceNormativeRadio = new QRadioButton(tr("Normative"), ReferenceEntryPageWidget);
+    _ReferenceNormativeRadio->setToolTip(tr("Move this entry to the Normative References list."));
+    _ReferenceInformativeRadio = new QRadioButton(tr("Informative"), ReferenceEntryPageWidget);
+    _ReferenceInformativeRadio->setToolTip(tr("Move this entry to the Informative References list."));
+    connect(_ReferenceNormativeRadio, &QRadioButton::toggled, this, &MainWindow::OnReferenceSectionChanged);
+    connect(_ReferenceInformativeRadio, &QRadioButton::toggled, this, &MainWindow::OnReferenceSectionChanged);
+    QWidget* ReferenceSectionWidget = new QWidget(ReferenceEntryPageWidget);
+    QHBoxLayout* ReferenceSectionLayout = new QHBoxLayout(ReferenceSectionWidget);
+    ReferenceSectionLayout->setContentsMargins(0, 0, 0, 0);
+    ReferenceSectionLayout->addWidget(_ReferenceNormativeRadio);
+    ReferenceSectionLayout->addWidget(_ReferenceInformativeRadio);
+    ReferenceSectionLayout->addStretch(1);
     QPushButton* AddReferenceAuthorButton = new QPushButton(tr("Add Author"), ReferenceEntryPageWidget);
     AddReferenceAuthorButton->setToolTip(tr("Add an author to this reference."));
     connect(AddReferenceAuthorButton, &QPushButton::clicked, this, &MainWindow::OnAddReferenceAuthor);
+    // The authors live on this page, not as outline items: a
+    // reference can have more than one, so they list here and
+    // the fields below edit the selected one.
+    _ReferenceAuthorList = new QListWidget(ReferenceEntryPageWidget);
+    _ReferenceAuthorList->setToolTip(tr("The authors of this reference."));
+    _ReferenceAuthorList->setMaximumHeight(96);
+    connect(_ReferenceAuthorList, &QListWidget::currentRowChanged,
+            this, &MainWindow::OnReferenceAuthorSelected);
+    _ReferenceAuthorFullnameEdit = new QLineEdit(ReferenceEntryPageWidget);
+    _ReferenceAuthorFullnameEdit->setToolTip(tr("The full name of the selected author."));
+    connect(_ReferenceAuthorFullnameEdit, &QLineEdit::textEdited, this, &MainWindow::OnReferenceAuthorEdited);
+    _ReferenceAuthorInitialsEdit = new QLineEdit(ReferenceEntryPageWidget);
+    _ReferenceAuthorInitialsEdit->setToolTip(tr("The initials of the selected author."));
+    connect(_ReferenceAuthorInitialsEdit, &QLineEdit::textEdited, this, &MainWindow::OnReferenceAuthorEdited);
+    _ReferenceAuthorSurnameEdit = new QLineEdit(ReferenceEntryPageWidget);
+    _ReferenceAuthorSurnameEdit->setToolTip(tr("The surname of the selected author."));
+    connect(_ReferenceAuthorSurnameEdit, &QLineEdit::textEdited, this, &MainWindow::OnReferenceAuthorEdited);
+    _ReferenceAuthorOrganizationEdit = new QLineEdit(ReferenceEntryPageWidget);
+    _ReferenceAuthorOrganizationEdit->setToolTip(tr("The organization of the selected author."));
+    connect(_ReferenceAuthorOrganizationEdit, &QLineEdit::textEdited, this, &MainWindow::OnReferenceAuthorEdited);
+    _ReferenceAuthorEmailEdit = new QLineEdit(ReferenceEntryPageWidget);
+    _ReferenceAuthorEmailEdit->setToolTip(tr("The email address of the selected author."));
+    connect(_ReferenceAuthorEmailEdit, &QLineEdit::textEdited, this, &MainWindow::OnReferenceAuthorEdited);
+    _ReferenceAuthorPhoneEdit = new QLineEdit(ReferenceEntryPageWidget);
+    _ReferenceAuthorPhoneEdit->setToolTip(tr("The phone number of the selected author."));
+    connect(_ReferenceAuthorPhoneEdit, &QLineEdit::textEdited, this, &MainWindow::OnReferenceAuthorEdited);
+    _ReferenceAuthorUriEdit = new QLineEdit(ReferenceEntryPageWidget);
+    _ReferenceAuthorUriEdit->setToolTip(tr("The web address of the selected author."));
+    connect(_ReferenceAuthorUriEdit, &QLineEdit::textEdited, this, &MainWindow::OnReferenceAuthorEdited);
+    _ReferenceAuthorRadio = new QRadioButton(tr("Author"), ReferenceEntryPageWidget);
+    _ReferenceEditorRadio = new QRadioButton(tr("Editor"), ReferenceEntryPageWidget);
+    connect(_ReferenceAuthorRadio, &QRadioButton::toggled, this, &MainWindow::OnReferenceAuthorRoleChanged);
+    connect(_ReferenceEditorRadio, &QRadioButton::toggled, this, &MainWindow::OnReferenceAuthorRoleChanged);
+    QWidget* ReferenceAuthorRoleWidget = new QWidget(ReferenceEntryPageWidget);
+    QHBoxLayout* ReferenceAuthorRoleLayout = new QHBoxLayout(ReferenceAuthorRoleWidget);
+    ReferenceAuthorRoleLayout->setContentsMargins(0, 0, 0, 0);
+    ReferenceAuthorRoleLayout->addWidget(_ReferenceAuthorRadio);
+    ReferenceAuthorRoleLayout->addWidget(_ReferenceEditorRadio);
+    ReferenceAuthorRoleLayout->addStretch(1);
+    _RemoveReferenceAuthorButton = new QPushButton(tr("Remove Author"), ReferenceEntryPageWidget);
+    _RemoveReferenceAuthorButton->setToolTip(tr("Remove the selected author from this reference."));
+    connect(_RemoveReferenceAuthorButton, &QPushButton::clicked, this, &MainWindow::OnRemoveReferenceAuthor);
     QPushButton* RemoveEntryButton = new QPushButton(tr("Remove Entry"), ReferenceEntryPageWidget);
     RemoveEntryButton->setToolTip(tr("Remove this reference entry."));
     connect(RemoveEntryButton, &QPushButton::clicked, this, &MainWindow::OnRemoveReferenceEntry);
@@ -1207,11 +1365,13 @@ MainWindow::MainWindow(QWidget* Parent)
     QLabel* EntryRequiredLabel = new QLabel(tr("* Required"), ReferenceEntryPageWidget);
     QHBoxLayout* EntryButtons = new QHBoxLayout();
     EntryButtons->addWidget(AddReferenceAuthorButton);
+    EntryButtons->addWidget(_RemoveReferenceAuthorButton);
     EntryButtons->addWidget(RemoveEntryButton);
     EntryButtons->addWidget(MoveEntryUpButton);
     EntryButtons->addWidget(MoveEntryDownButton);
     EntryButtons->addStretch(1);
     QFormLayout* ReferenceEntryLayout = new QFormLayout(ReferenceEntryPageWidget);
+    ReferenceEntryLayout->addRow(tr("Section:"), ReferenceSectionWidget);
     ReferenceEntryLayout->addRow(tr("Anchor *:"), _ReferenceAnchorEdit);
     ReferenceEntryLayout->addRow(tr("Target:"), _ReferenceTargetEdit);
     ReferenceEntryLayout->addRow(tr("Title:"), _ReferenceTitleEdit);
@@ -1221,6 +1381,15 @@ MainWindow::MainWindow(QWidget* Parent)
     ReferenceEntryLayout->addRow(tr("Stream:"), _ReferenceStreamCombo);
     ReferenceEntryLayout->addRow(tr("Series info:"), SeriesWidget);
     ReferenceEntryLayout->addRow(tr("Move to list:"), _ReferenceMoveToCombo);
+    ReferenceEntryLayout->addRow(tr("Authors:"), _ReferenceAuthorList);
+    ReferenceEntryLayout->addRow(tr("Author full name *:"), _ReferenceAuthorFullnameEdit);
+    ReferenceEntryLayout->addRow(tr("Author initials:"), _ReferenceAuthorInitialsEdit);
+    ReferenceEntryLayout->addRow(tr("Author surname:"), _ReferenceAuthorSurnameEdit);
+    ReferenceEntryLayout->addRow(tr("Author organization:"), _ReferenceAuthorOrganizationEdit);
+    ReferenceEntryLayout->addRow(tr("Author email:"), _ReferenceAuthorEmailEdit);
+    ReferenceEntryLayout->addRow(tr("Author phone:"), _ReferenceAuthorPhoneEdit);
+    ReferenceEntryLayout->addRow(tr("Author URI:"), _ReferenceAuthorUriEdit);
+    ReferenceEntryLayout->addRow(tr("Author role:"), ReferenceAuthorRoleWidget);
     ReferenceEntryLayout->addRow(EntryButtons);
     ReferenceEntryLayout->addRow(EntryRequiredLabel);
     ReferenceEntryLayout->addRow(_ReferenceEntryPreservedLabel);
@@ -1299,6 +1468,7 @@ MainWindow::MainWindow(QWidget* Parent)
     _SettingsNoteEdit = new TextEditor(_SettingsNoteGroup);
     _SettingsNoteEdit->SetSpellChecker(_SpellChecker.get());
     _SettingsNoteEdit->SetDocument(&_Document);
+    _SettingsNoteEdit->SetBibCache(&_BibCache);
     connect(_SettingsNoteEdit, &TextEditor::TextChanged,
             this, &MainWindow::OnSettingsNoteEdited);
     connect(_SettingsNoteEdit, &TextEditor::MakeReferenceRequested, this,
@@ -1513,10 +1683,39 @@ void MainWindow::OpenDraftFile(const QString& Path)
                                  Notes.join(QStringLiteral("\n\n")));
     }
     // A file edited by hand gets checked on the way in: it must be
-    // usable before it is edited further.
-    DocValidationResult Checked = ValidateAndReport(Path, false);
-    if (Checked.Valid) {
-        statusBar()->showMessage(tr("Opened %1 (valid).").arg(Path));
+    // usable before it is edited further. Included references come
+    // from the bibliography cache: fetch what is missing first,
+    // then validate, so a healthy file never shows the include
+    // error on load.
+    QStringList Hrefs;
+    for (xmlNodePtr Include :
+         DocDocument::DocumentIncludeNodes(_Document.RfcNode())) {
+        QString Href = DocDocument::NodeAttribute(Include, "href");
+        if (!Href.isEmpty() && !Hrefs.contains(Href)) {
+            Hrefs.append(Href);
+        }
+    }
+    if (Hrefs.isEmpty()) {
+        DocValidationResult Checked = ValidateAndReport(Path, false);
+        if (Checked.Valid) {
+            statusBar()->showMessage(tr("Opened %1 (valid).").arg(Path));
+        }
+    } else {
+        statusBar()->showMessage(tr("Fetching bibliography entries..."));
+        connect(&_BibCache, &BibCache::FetchFinished, this,
+                [this, Path]() {
+                    if (Path != _FilePath) {
+                        return;
+                    }
+                    DocValidationResult Checked =
+                        ValidateAndReport(Path, false);
+                    if (Checked.Valid) {
+                        statusBar()->showMessage(
+                            tr("Opened %1 (valid).").arg(Path));
+                    }
+                },
+                Qt::SingleShotConnection);
+        _BibCache.EnsureCached(Hrefs);
     }
     AddRecentFile(Path);
     RebuildRecentMenu();
@@ -2308,11 +2507,76 @@ void MainWindow::OnSetXml2rfcPath()
     statusBar()->showMessage(tr("xml2rfc path set to %1.").arg(Path));
 }
 
+/**
+ * @brief Collects the targets of every cross-reference in a tree.
+ * @param Node The node to walk (borrowed).
+ * @param Targets Receives the target attributes of the <xref> and
+ * <relref> elements, each once. These are the names this document
+ * actually cites: an anchor name belongs to the document that
+ * uses it, not to the cached file.
+ */
+static void CollectCitedTargets(xmlNodePtr Node, QStringList& Targets)
+{
+    if (Node == nullptr) {
+        return;
+    }
+    for (xmlNodePtr Child = Node->children; Child != nullptr;
+         Child = Child->next) {
+        if (Child->type == XML_ELEMENT_NODE && Child->name != nullptr) {
+            QString Name = QString::fromUtf8(
+                reinterpret_cast<const char*>(Child->name));
+            if (Name == QStringLiteral("xref") ||
+                Name == QStringLiteral("relref")) {
+                QString Target = DocDocument::NodeAttribute(Child, "target");
+                if (!Target.isEmpty() && !Targets.contains(Target)) {
+                    Targets.append(Target);
+                }
+            }
+        }
+        CollectCitedTargets(Child, Targets);
+    }
+}
+
+/**
+ * @brief Turns what the author typed in the Bibliography Add box
+ * into the address to fetch, or empty when it is neither.
+ * @param Text What was typed.
+ * @return The bibliography address: an RFC number (with or without
+ * the RFC prefix) becomes its bibxml address, a full http(s)
+ * address is used as typed, anything else is empty.
+ */
+static QString BibliographyAddressForAdd(const QString& Text)
+{
+    QString Typed = Text.trimmed();
+    if (Typed.isEmpty()) {
+        return QString();
+    }
+    if (Typed.startsWith(QStringLiteral("http://"), Qt::CaseInsensitive) ||
+        Typed.startsWith(QStringLiteral("https://"), Qt::CaseInsensitive)) {
+        return Typed;
+    }
+    QString Digits = Typed;
+    if (Digits.startsWith(QStringLiteral("RFC"), Qt::CaseInsensitive)) {
+        Digits = Digits.mid(3).trimmed();
+    }
+    if (Digits.isEmpty()) {
+        return QString();
+    }
+    for (QChar Ch : Digits) {
+        if (!Ch.isDigit()) {
+            return QString();
+        }
+    }
+    return QStringLiteral(
+        "https://bib.ietf.org/public/rfc/bibxml/reference.RFC.") +
+        Digits + QStringLiteral(".xml");
+}
+
 void MainWindow::OnBibliography()
 {
     QDialog Dialog(this);
     Dialog.setWindowTitle(tr("Bibliography"));
-    Dialog.resize(680, 420);
+    Dialog.resize(920, 460);
 
     QLabel* LocationLabel = new QLabel(tr("Cache location:"), &Dialog);
     QLineEdit* LocationEdit = new QLineEdit(_BibCache.Location(), &Dialog);
@@ -2324,20 +2588,53 @@ void MainWindow::OnBibliography()
     LocationLayout->addWidget(BrowseButton);
 
     QTableWidget* Table = new QTableWidget(&Dialog);
-    Table->setColumnCount(4);
+    Table->setColumnCount(5);
     Table->setHorizontalHeaderLabels(QStringList()
-        << tr("Reference") << tr("Source") << tr("Fetched") << tr("Size"));
+        << tr("Reference") << tr("Target") << tr("Source")
+        << tr("Fetched") << tr("Size"));
     Table->setSelectionBehavior(QAbstractItemView::SelectRows);
     Table->setSelectionMode(QAbstractItemView::ExtendedSelection);
     Table->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    Table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    // The Reference title wraps in its column and the Source address
+    // wraps too, so both stay readable instead of being cut off at the
+    // column edge; the short columns fit their content, and the
+    // Reference column takes whatever width is left. The Source
+    // column starts at 280 pixels wide and can be dragged wider.
+    Table->setWordWrap(true);
+    Table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    Table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    Table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Interactive);
     Table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    Table->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+    Table->setColumnWidth(2, 280);
     Table->verticalHeader()->setVisible(false);
+    Table->verticalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
 
     // Fills the table from the cache index. The address rides on
     // the first column's item, so the buttons can find it again.
+    // The Target column shows the name this document cites an
+    // entry by, which belongs to the document, not to the cached
+    // file: the entry only gets a target when the document both
+    // includes its address and cites one of the anchors it
+    // provides; otherwise the field stays blank.
     auto FillTable = [&]() {
         Table->setRowCount(0);
+        QStringList Cited;
+        CollectCitedTargets(_Document.RfcNode(), Cited);
+        QMap<QString, QStringList> Included;
+        for (xmlNodePtr Include :
+             DocDocument::DocumentIncludeNodes(_Document.RfcNode())) {
+            QString Href = DocDocument::NodeAttribute(Include, "href");
+            if (Href.isEmpty() || Included.contains(Href)) {
+                continue;
+            }
+            QStringList Provided = _BibCache.CachedAnchors(Href);
+            if (Provided.isEmpty()) {
+                Provided.append(
+                    DocDocument::ReferenceAnchorFromIncludeHref(Href));
+            }
+            Included.insert(Href, Provided);
+        }
         QVector<BibCacheEntry> Entries = _BibCache.Entries();
         for (const BibCacheEntry& Entry : Entries) {
             int Row = Table->rowCount();
@@ -2351,16 +2648,44 @@ void MainWindow::OnBibliography()
             ReferenceItem->setData(Qt::UserRole, Entry.Url);
             ReferenceItem->setToolTip(Entry.Url);
             Table->setItem(Row, 0, ReferenceItem);
-            Table->setItem(Row, 1, new QTableWidgetItem(Entry.Url));
-            Table->setItem(Row, 2, new QTableWidgetItem(Entry.Fetched));
-            Table->setItem(Row, 3, new QTableWidgetItem(
+            QString Target;
+            if (Included.contains(Entry.Url)) {
+                for (const QString& Anchor : Included.value(Entry.Url)) {
+                    if (!Anchor.isEmpty() && Cited.contains(Anchor)) {
+                        Target = Anchor;
+                        break;
+                    }
+                }
+            }
+            Table->setItem(Row, 1, new QTableWidgetItem(Target));
+            QTableWidgetItem* SourceItem = new QTableWidgetItem(Entry.Url);
+            SourceItem->setToolTip(Entry.Url);
+            Table->setItem(Row, 2, SourceItem);
+            Table->setItem(Row, 3, new QTableWidgetItem(Entry.Fetched));
+            Table->setItem(Row, 4, new QTableWidgetItem(
                 tr("%1 bytes").arg(QString::number(Entry.Size))));
         }
+        // Wrapped titles and addresses grow their rows to fit.
+        Table->resizeRowsToContents();
     };
     FillTable();
 
     QLabel* StatusLabel = new QLabel(&Dialog);
     StatusLabel->setWordWrap(true);
+
+    QLabel* AddLabel = new QLabel(tr("Add:"), &Dialog);
+    QLineEdit* AddEdit = new QLineEdit(&Dialog);
+    AddEdit->setPlaceholderText(
+        tr("RFC number, for example 2119, or a bibliography address"));
+    QPushButton* AddButton = new QPushButton(tr("Add"), &Dialog);
+    AddButton->setToolTip(
+        tr("Fetch the reference and add it to the cache. An RFC "
+           "number is looked up at bib.ietf.org; any other "
+           "bibliography address is fetched as typed."));
+    QHBoxLayout* AddLayout = new QHBoxLayout();
+    AddLayout->addWidget(AddLabel);
+    AddLayout->addWidget(AddEdit, 1);
+    AddLayout->addWidget(AddButton);
 
     QPushButton* RefreshButton = new QPushButton(tr("Refresh"), &Dialog);
     RefreshButton->setToolTip(
@@ -2381,6 +2706,7 @@ void MainWindow::OnBibliography()
     QVBoxLayout* Layout = new QVBoxLayout(&Dialog);
     Layout->addLayout(LocationLayout);
     Layout->addWidget(Table, 1);
+    Layout->addLayout(AddLayout);
     Layout->addWidget(StatusLabel);
     Layout->addLayout(ButtonLayout);
 
@@ -2394,6 +2720,26 @@ void MainWindow::OnBibliography()
         }
         return Urls;
     };
+
+    connect(AddEdit, &QLineEdit::returnPressed,
+            AddButton, &QPushButton::click);
+    connect(AddButton, &QPushButton::clicked, &Dialog, [&]() {
+        QString Address = BibliographyAddressForAdd(AddEdit->text());
+        if (Address.isEmpty()) {
+            StatusLabel->setText(
+                tr("Enter an RFC number (for example 2119) or a full "
+                   "bibliography address."));
+            return;
+        }
+        if (_BibCache.IsCached(Address)) {
+            StatusLabel->setText(
+                tr("%1 is already in the cache.").arg(Address));
+            return;
+        }
+        StatusLabel->setText(tr("Fetching %1...").arg(Address));
+        _BibCache.EnsureCached(QStringList(Address));
+        AddEdit->clear();
+    });
 
     connect(BrowseButton, &QPushButton::clicked, &Dialog, [&]() {
         QString Current = _BibCache.Location();
@@ -2485,6 +2831,807 @@ void MainWindow::OnBibliography()
     Dialog.exec();
 }
 
+// View Published (Bug 493): fetching a published RFC or
+// Internet-Draft from the web and opening it, or diffing two
+// draft versions. The bibliography cache is not used here: a
+// viewed document is a download to a temporary file, not a
+// cached bibliography entry.
+
+// How long one published-document download may run (15 seconds,
+// the same as a bibliography fetch).
+static const int PublishedFetchTimeoutMs = 15000;
+
+// The four formats a published document may be viewed in, in the
+// order they are offered. Not every format exists for every
+// document, so the dialog probes each address and offers only
+// the ones the server answers.
+struct PublishedFormat
+{
+    const char* Extension;
+    const char* Label;
+};
+static const PublishedFormat PublishedFormats[] = {
+    { "xml", "XML" },
+    { "html", "HTML" },
+    { "txt", "Text" },
+    { "pdf", "PDF" },
+};
+
+// Fetches one address, waiting for the download (or the timeout).
+// An empty result means the fetch failed; the reason is in Error.
+static QByteArray PublishedFetch(const QUrl& Url, QString* Error)
+{
+    QNetworkAccessManager Network;
+    QNetworkRequest Request(Url);
+    Request.setTransferTimeout(PublishedFetchTimeoutMs);
+    Request.setHeader(QNetworkRequest::UserAgentHeader,
+                      QStringLiteral("ProtocolDocEditor/1.1 "
+                                     "(view published)"));
+    QNetworkReply* Reply = Network.get(Request);
+    QEventLoop Loop;
+    QTimer Timer;
+    Timer.setSingleShot(true);
+    QObject::connect(&Timer, &QTimer::timeout, &Loop, &QEventLoop::quit);
+    QObject::connect(Reply, &QNetworkReply::finished,
+                     &Loop, &QEventLoop::quit);
+    Timer.start(PublishedFetchTimeoutMs);
+    Loop.exec();
+    QByteArray Data;
+    if (Reply->error() != QNetworkReply::NoError) {
+        if (Error != nullptr) {
+            *Error = Reply->errorString();
+        }
+    } else if (Reply->attribute(
+                   QNetworkRequest::HttpStatusCodeAttribute).toInt() != 200) {
+        if (Error != nullptr) {
+            *Error = QObject::tr("The server answered %1.")
+                .arg(Reply->attribute(
+                         QNetworkRequest::HttpStatusCodeAttribute).toInt());
+        }
+    } else {
+        Data = Reply->readAll();
+    }
+    Reply->deleteLater();
+    return Data;
+}
+
+// Asks the server whether an address exists, without downloading it.
+static bool PublishedExists(const QUrl& Url)
+{
+    QNetworkAccessManager Network;
+    QNetworkRequest Request(Url);
+    Request.setTransferTimeout(PublishedFetchTimeoutMs);
+    Request.setHeader(QNetworkRequest::UserAgentHeader,
+                      QStringLiteral("ProtocolDocEditor/1.1 "
+                                     "(view published)"));
+    QNetworkReply* Reply = Network.head(Request);
+    QEventLoop Loop;
+    QTimer Timer;
+    Timer.setSingleShot(true);
+    QObject::connect(&Timer, &QTimer::timeout, &Loop, &QEventLoop::quit);
+    QObject::connect(Reply, &QNetworkReply::finished,
+                     &Loop, &QEventLoop::quit);
+    Timer.start(PublishedFetchTimeoutMs);
+    Loop.exec();
+    bool Found = (Reply->error() == QNetworkReply::NoError) &&
+        (Reply->attribute(
+             QNetworkRequest::HttpStatusCodeAttribute).toInt() == 200);
+    Reply->deleteLater();
+    return Found;
+}
+
+// Downloads a published document to a temporary file and opens
+// it with the system viewer. Returns false, with the reason in
+// Error, when the download or the viewer fails.
+static bool PublishedOpen(const QUrl& Url, const QString& FileName,
+                          QString* Error)
+{
+    QString Folder = QStandardPaths::writableLocation(
+        QStandardPaths::TempLocation) +
+        QStringLiteral("/InternetDraftEditor");
+    if (!QDir().mkpath(Folder)) {
+        if (Error != nullptr) {
+            *Error = QObject::tr("Could not create the temporary folder.");
+        }
+        return false;
+    }
+    QString FetchError;
+    QByteArray Data = PublishedFetch(Url, &FetchError);
+    if (Data.isEmpty()) {
+        if (Error != nullptr) {
+            *Error = FetchError;
+        }
+        return false;
+    }
+    QString Path = QDir(Folder).filePath(FileName);
+    QFile File(Path);
+    if (!File.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+        File.write(Data) != Data.size()) {
+        if (Error != nullptr) {
+            *Error = QObject::tr("Could not write the downloaded file.");
+        }
+        return false;
+    }
+    File.close();
+    if (!QDesktopServices::openUrl(QUrl::fromLocalFile(Path))) {
+        if (Error != nullptr) {
+            *Error = QObject::tr(
+                "Could not open the file with the system viewer.");
+        }
+        return false;
+    }
+    return true;
+}
+
+// Keeps a version number as two digits: "0" and "1" become "00"
+// and "01", so the diff prefixes line up. Empty when the text
+// holds no number at all.
+static QString PublishedVersionNumber(const QString& Text)
+{
+    QString Digits;
+    for (QChar C : Text) {
+        if (C.isDigit()) {
+            Digits.append(C);
+        }
+    }
+    if (Digits.isEmpty()) {
+        return QString();
+    }
+    bool Ok = false;
+    int Number = Digits.toInt(&Ok);
+    if (!Ok) {
+        return QString();
+    }
+    return QStringLiteral("%1").arg(Number, 2, 10, QLatin1Char('0'));
+}
+
+// Builds the address of one format of an RFC. The number is the
+// digits of what was typed, so "RFC 2119" and "2119" both work;
+// an empty address means no number was typed.
+typedef QString (*PublishedUrlBuilder)(const QString& Name,
+                                       const QString& Version,
+                                       const QString& Extension);
+
+static QString PublishedRfcUrl(const QString& RawName, const QString&,
+                               const QString& Extension)
+{
+    QString Digits;
+    for (QChar C : RawName) {
+        if (C.isDigit()) {
+            Digits.append(C);
+        }
+    }
+    bool Ok = false;
+    int Number = Digits.toInt(&Ok);
+    if (!Ok || Number <= 0) {
+        return QString();
+    }
+    return QStringLiteral("https://www.rfc-editor.org/rfc/rfc%1.%2")
+        .arg(Number).arg(Extension);
+}
+
+// Builds the address of one format of an Internet-Draft. The
+// title takes a "draft-" prefix when it has none, and a version
+// typed into the title is dropped, since the version has its
+// own box. An empty address means no title or version was typed.
+static QString PublishedIdUrl(const QString& RawName, const QString& Version,
+                              const QString& Extension)
+{
+    QString Name = RawName.trimmed();
+    if (Name.isEmpty()) {
+        return QString();
+    }
+    QString CleanVersion = PublishedVersionNumber(Version);
+    if (CleanVersion.isEmpty()) {
+        return QString();
+    }
+    if (!Name.startsWith(QStringLiteral("draft-"))) {
+        Name.prepend(QStringLiteral("draft-"));
+    }
+    if (Name.endsWith(QStringLiteral("-") + CleanVersion)) {
+        Name.chop(CleanVersion.size() + 1);
+    }
+    return QStringLiteral("https://www.ietf.org/archive/id/%1-%2.%3")
+        .arg(Name, CleanVersion, Extension);
+}
+
+// One dialog serves both the RFC and the Internet-Draft viewer:
+// a name (and, for a draft, a version), a Check that probes
+// which formats the server actually has, and a View that
+// downloads the picked format and opens it with the system
+// viewer. Formats that do not exist are never offered.
+static void ShowPublishedViewerDialog(
+    QWidget* Parent, const QString& Title, const QString& NameLabel,
+    const QString& NamePlaceholder, bool HasVersion,
+    PublishedUrlBuilder UrlFor, const QString& SettingsPrefix)
+{
+    QDialog Dialog(Parent);
+    Dialog.setWindowTitle(Title);
+
+    QLineEdit* NameEdit = new QLineEdit(&Dialog);
+    NameEdit->setPlaceholderText(NamePlaceholder);
+    QFormLayout* FormLayout = new QFormLayout();
+    FormLayout->addRow(NameLabel, NameEdit);
+    QLineEdit* VersionEdit = nullptr;
+    if (HasVersion) {
+        VersionEdit = new QLineEdit(&Dialog);
+        VersionEdit->setPlaceholderText(QObject::tr("00"));
+        FormLayout->addRow(QObject::tr("Version:"), VersionEdit);
+    }
+
+    // The last values typed here are remembered, so the dialog
+    // opens where it was left.
+    QSettings Remembered;
+    QString LastFormat =
+        Remembered.value(SettingsPrefix + QStringLiteral("/format"))
+            .toString();
+    NameEdit->setText(
+        Remembered.value(SettingsPrefix + QStringLiteral("/name"))
+            .toString());
+    if (HasVersion) {
+        VersionEdit->setText(
+            Remembered.value(SettingsPrefix + QStringLiteral("/version"))
+                .toString());
+    }
+
+    QRadioButton* FormatButtons[4];
+    QVBoxLayout* FormatLayout = new QVBoxLayout();
+    for (int I = 0; I < 4; ++I) {
+        FormatButtons[I] = new QRadioButton(
+            QString::fromLatin1(PublishedFormats[I].Label), &Dialog);
+        FormatButtons[I]->setEnabled(false);
+        FormatLayout->addWidget(FormatButtons[I]);
+    }
+
+    QLabel* StatusLabel = new QLabel(&Dialog);
+    StatusLabel->setWordWrap(true);
+
+    QPushButton* CheckButton =
+        new QPushButton(QObject::tr("Check"), &Dialog);
+    CheckButton->setToolTip(QObject::tr(
+        "Find which formats exist for this document."));
+    QPushButton* ViewButton = new QPushButton(QObject::tr("View"), &Dialog);
+    ViewButton->setToolTip(QObject::tr(
+        "Download the picked format and open it with the system viewer."));
+    ViewButton->setEnabled(false);
+    QPushButton* ClearButton =
+        new QPushButton(QObject::tr("Clear"), &Dialog);
+    ClearButton->setToolTip(QObject::tr(
+        "Empty this dialog and forget the last values typed here."));
+    QPushButton* CloseButton =
+        new QPushButton(QObject::tr("Close"), &Dialog);
+    QHBoxLayout* ButtonLayout = new QHBoxLayout();
+    ButtonLayout->addWidget(CheckButton);
+    ButtonLayout->addWidget(ViewButton);
+    ButtonLayout->addStretch(1);
+    ButtonLayout->addWidget(ClearButton);
+    ButtonLayout->addWidget(CloseButton);
+
+    QVBoxLayout* Layout = new QVBoxLayout(&Dialog);
+    Layout->addLayout(FormLayout);
+    Layout->addWidget(new QLabel(QObject::tr("Format:"), &Dialog));
+    Layout->addLayout(FormatLayout);
+    Layout->addWidget(StatusLabel);
+    Layout->addLayout(ButtonLayout);
+
+    auto CheckFormats = [&]() {
+        QString Name = NameEdit->text();
+        QString Version = HasVersion ? VersionEdit->text() : QString();
+        if (HasVersion && PublishedVersionNumber(Version).isEmpty()) {
+            StatusLabel->setText(QObject::tr("Enter a version number."));
+            return;
+        }
+        QString Probe = UrlFor(Name, Version, QStringLiteral("txt"));
+        if (Probe.isEmpty()) {
+            StatusLabel->setText(HasVersion
+                ? QObject::tr("Enter a draft title and a version number.")
+                : QObject::tr("Enter an RFC number."));
+            return;
+        }
+        StatusLabel->setText(
+            QObject::tr("Checking which formats exist..."));
+        QCoreApplication::processEvents();
+        int Found = 0;
+        int First = -1;
+        for (int I = 0; I < 4; ++I) {
+            QString Url = UrlFor(
+                Name, Version,
+                QString::fromLatin1(PublishedFormats[I].Extension));
+            bool Exists = !Url.isEmpty() &&
+                PublishedExists(QUrl(Url));
+            FormatButtons[I]->setEnabled(Exists);
+            if (Exists) {
+                ++Found;
+                if (First < 0) {
+                    First = I;
+                }
+            } else {
+                FormatButtons[I]->setChecked(false);
+            }
+        }
+        if (Found == 0) {
+            StatusLabel->setText(QObject::tr(
+                "No published copy of %1 was found.")
+                .arg(Name.trimmed()));
+            ViewButton->setEnabled(false);
+            return;
+        }
+        // The last format picked is checked again when it exists;
+        // otherwise the first format found is checked.
+        int RememberedFormat = -1;
+        for (int I = 0; I < 4; ++I) {
+            if (FormatButtons[I]->isEnabled() &&
+                QString::fromLatin1(PublishedFormats[I].Extension) ==
+                    LastFormat) {
+                RememberedFormat = I;
+                break;
+            }
+        }
+        FormatButtons[RememberedFormat >= 0 ? RememberedFormat : First]
+            ->setChecked(true);
+        ViewButton->setEnabled(true);
+        StatusLabel->setText(Found == 1
+            ? QObject::tr("One format found. Pick it and press View.")
+            : QObject::tr("%1 formats found. Pick one and press View.")
+                .arg(Found));
+    };
+
+    QObject::connect(CheckButton, &QPushButton::clicked,
+                     &Dialog, CheckFormats);
+    QObject::connect(NameEdit, &QLineEdit::returnPressed,
+                     CheckButton, &QPushButton::click);
+    if (HasVersion) {
+        QObject::connect(VersionEdit, &QLineEdit::returnPressed,
+                         CheckButton, &QPushButton::click);
+    }
+    QObject::connect(ViewButton, &QPushButton::clicked, &Dialog, [&]() {
+        QString Name = NameEdit->text();
+        QString Version = HasVersion ? VersionEdit->text() : QString();
+        int Picked = -1;
+        for (int I = 0; I < 4; ++I) {
+            if (FormatButtons[I]->isChecked()) {
+                Picked = I;
+                break;
+            }
+        }
+        if (Picked < 0) {
+            StatusLabel->setText(QObject::tr("Pick a format first."));
+            return;
+        }
+        QString Extension =
+            QString::fromLatin1(PublishedFormats[Picked].Extension);
+        QString Url = UrlFor(Name, Version, Extension);
+        QString FileName = QUrl(Url).fileName();
+        StatusLabel->setText(QObject::tr("Downloading %1...")
+            .arg(FileName));
+        QCoreApplication::processEvents();
+        QString Error;
+        if (!PublishedOpen(QUrl(Url), FileName, &Error)) {
+            StatusLabel->setText(QObject::tr("Could not view %1: %2")
+                .arg(FileName, Error));
+            return;
+        }
+        StatusLabel->setText(QObject::tr("Opened %1 with the system viewer.")
+            .arg(FileName));
+    });
+    QObject::connect(ClearButton, &QPushButton::clicked, &Dialog, [&]() {
+        NameEdit->clear();
+        if (HasVersion) {
+            VersionEdit->clear();
+        }
+        for (int I = 0; I < 4; ++I) {
+            FormatButtons[I]->setChecked(false);
+            FormatButtons[I]->setEnabled(false);
+        }
+        ViewButton->setEnabled(false);
+        StatusLabel->clear();
+        QSettings Forgotten;
+        Forgotten.remove(SettingsPrefix + QStringLiteral("/name"));
+        Forgotten.remove(SettingsPrefix + QStringLiteral("/version"));
+        Forgotten.remove(SettingsPrefix + QStringLiteral("/format"));
+    });
+    QObject::connect(CloseButton, &QPushButton::clicked,
+                     &Dialog, &QDialog::accept);
+
+    // Draft titles are wide, so the Internet-Draft dialog is
+    // wider than the RFC one.
+    if (HasVersion) {
+        Dialog.resize(680, Dialog.sizeHint().height());
+    }
+
+    Dialog.exec();
+
+    // Remember what was typed and picked, so the dialog opens
+    // where it was left. An empty box forgets its value.
+    auto Remember = [&](const QString& Key, const QString& Value) {
+        if (Value.isEmpty()) {
+            Remembered.remove(SettingsPrefix + Key);
+        } else {
+            Remembered.setValue(SettingsPrefix + Key, Value);
+        }
+    };
+    Remember(QStringLiteral("/name"), NameEdit->text());
+    if (HasVersion) {
+        Remember(QStringLiteral("/version"), VersionEdit->text());
+    }
+    QString PickedFormat;
+    for (int I = 0; I < 4; ++I) {
+        if (FormatButtons[I]->isChecked()) {
+            PickedFormat =
+                QString::fromLatin1(PublishedFormats[I].Extension);
+            break;
+        }
+    }
+    Remember(QStringLiteral("/format"), PickedFormat);
+}
+
+void MainWindow::OnViewPublishedRfc()
+{
+    ShowPublishedViewerDialog(this, tr("View Published RFC"),
+                              tr("RFC number:"), tr("2119"),
+                              false, PublishedRfcUrl,
+                              QStringLiteral("viewpublished/rfc"));
+}
+
+void MainWindow::OnViewPublishedId()
+{
+    ShowPublishedViewerDialog(this, tr("View Published Internet-Draft"),
+                              tr("Title:"),
+                              tr("draft-ietf-6man-rfc4291bis"),
+                              true, PublishedIdUrl,
+                              QStringLiteral("viewpublished/id"));
+}
+
+// One step of the Myers diff: a line the two versions share, a
+// line only the older version has, or a line only the newer one
+// has.
+struct PublishedDiffOp
+{
+    enum Kind
+    {
+        Same,
+        OldOnly,
+        NewOnly
+    };
+    Kind _Kind;
+    QString _Line;
+};
+
+// Myers' O(ND) line diff, transcribed from a prototype proven
+// against 300 random cases and two real draft versions (1625
+// against 1681 lines in 0.08 seconds). The trace keeps the V
+// array from before each step, so the walk back can rebuild the
+// edit script.
+static QVector<PublishedDiffOp> PublishedDiffOps(
+    const QStringList& OldLines, const QStringList& NewLines)
+{
+    int N = OldLines.size();
+    int M = NewLines.size();
+    QMap<int, int> V;
+    V.insert(1, 0);
+    QVector<QMap<int, int>> Trace;
+    int Found = -1;
+    for (int D = 0; D <= N + M; ++D) {
+        Trace.append(V);
+        for (int K = -D; K <= D; K += 2) {
+            int X = 0;
+            if (K == -D ||
+                (K != D && V.value(K - 1, 0) < V.value(K + 1, 0))) {
+                X = V.value(K + 1, 0);
+            } else {
+                X = V.value(K - 1, 0) + 1;
+            }
+            int Y = X - K;
+            while (X < N && Y < M && OldLines.at(X) == NewLines.at(Y)) {
+                ++X;
+                ++Y;
+            }
+            V.insert(K, X);
+            if (X >= N && Y >= M) {
+                Found = D;
+                break;
+            }
+        }
+        if (Found >= 0) {
+            break;
+        }
+    }
+    QVector<PublishedDiffOp> Ops;
+    int X = N;
+    int Y = M;
+    for (int D = Found; D > 0; --D) {
+        const QMap<int, int>& Before = Trace.at(D);
+        int K = X - Y;
+        int PrevK = 0;
+        if (K == -D ||
+            (K != D && Before.value(K - 1, 0) < Before.value(K + 1, 0))) {
+            PrevK = K + 1;
+        } else {
+            PrevK = K - 1;
+        }
+        int PrevX = Before.value(PrevK, 0);
+        int PrevY = PrevX - PrevK;
+        while (X > PrevX && Y > PrevY) {
+            PublishedDiffOp Op;
+            Op._Kind = PublishedDiffOp::Same;
+            Op._Line = OldLines.at(X - 1);
+            Ops.append(Op);
+            --X;
+            --Y;
+        }
+        if (X == PrevX) {
+            PublishedDiffOp Op;
+            Op._Kind = PublishedDiffOp::NewOnly;
+            Op._Line = NewLines.at(Y - 1);
+            Ops.append(Op);
+            --Y;
+        } else {
+            PublishedDiffOp Op;
+            Op._Kind = PublishedDiffOp::OldOnly;
+            Op._Line = OldLines.at(X - 1);
+            Ops.append(Op);
+            --X;
+        }
+    }
+    while (X > 0 && Y > 0) {
+        PublishedDiffOp Op;
+        Op._Kind = PublishedDiffOp::Same;
+        Op._Line = OldLines.at(X - 1);
+        Ops.append(Op);
+        --X;
+        --Y;
+    }
+    return Ops;
+}
+
+// The diff text: three characters before each line — three
+// spaces where the line is the same in both versions, the older
+// version's number where the line is only in the older version,
+// the newer version's number where it is only in the newer one.
+// The ops arrive in reverse, so they are read back to front.
+static QStringList PublishedDiffText(const QStringList& OldLines,
+                                     const QStringList& NewLines,
+                                     const QString& OldVersion,
+                                     const QString& NewVersion,
+                                     int* OldOnlyCount, int* NewOnlyCount)
+{
+    QVector<PublishedDiffOp> Ops = PublishedDiffOps(OldLines, NewLines);
+    QStringList Lines;
+    int OldOnly = 0;
+    int NewOnly = 0;
+    for (int I = Ops.size() - 1; I >= 0; --I) {
+        const PublishedDiffOp& Op = Ops.at(I);
+        if (Op._Kind == PublishedDiffOp::Same) {
+            Lines.append(QStringLiteral("   ") + Op._Line);
+        } else if (Op._Kind == PublishedDiffOp::OldOnly) {
+            Lines.append(OldVersion + QStringLiteral(" ") + Op._Line);
+            ++OldOnly;
+        } else {
+            Lines.append(NewVersion + QStringLiteral(" ") + Op._Line);
+            ++NewOnly;
+        }
+    }
+    if (OldOnlyCount != nullptr) {
+        *OldOnlyCount = OldOnly;
+    }
+    if (NewOnlyCount != nullptr) {
+        *NewOnlyCount = NewOnly;
+    }
+    return Lines;
+}
+
+void MainWindow::OnViewPublishedIdDiff()
+{
+    QDialog Dialog(this);
+    Dialog.setWindowTitle(tr("Compare Internet-Draft Versions"));
+
+    QLineEdit* TitleEdit = new QLineEdit(&Dialog);
+    TitleEdit->setPlaceholderText(tr("draft-ietf-6man-rfc4291bis"));
+    QLineEdit* OldEdit = new QLineEdit(&Dialog);
+    OldEdit->setPlaceholderText(tr("00"));
+    QLineEdit* NewEdit = new QLineEdit(&Dialog);
+    NewEdit->setPlaceholderText(tr("01"));
+    QFormLayout* FormLayout = new QFormLayout();
+    FormLayout->addRow(tr("Title:"), TitleEdit);
+    FormLayout->addRow(tr("Older version:"), OldEdit);
+    FormLayout->addRow(tr("Newer version:"), NewEdit);
+
+    // The last values typed here are remembered, so the dialog
+    // opens where it was left.
+    QSettings Remembered;
+    TitleEdit->setText(Remembered.value(
+        QStringLiteral("viewpublished/diff/name")).toString());
+    OldEdit->setText(Remembered.value(
+        QStringLiteral("viewpublished/diff/old")).toString());
+    NewEdit->setText(Remembered.value(
+        QStringLiteral("viewpublished/diff/new")).toString());
+
+    QLabel* StatusLabel = new QLabel(&Dialog);
+    StatusLabel->setWordWrap(true);
+
+    QPushButton* CompareButton = new QPushButton(tr("Compare"), &Dialog);
+    QPushButton* ClearButton = new QPushButton(tr("Clear"), &Dialog);
+    ClearButton->setToolTip(tr(
+        "Empty this dialog and forget the last values typed here."));
+    QPushButton* CloseButton = new QPushButton(tr("Close"), &Dialog);
+    QHBoxLayout* ButtonLayout = new QHBoxLayout();
+    ButtonLayout->addWidget(CompareButton);
+    ButtonLayout->addStretch(1);
+    ButtonLayout->addWidget(ClearButton);
+    ButtonLayout->addWidget(CloseButton);
+
+    QVBoxLayout* Layout = new QVBoxLayout(&Dialog);
+    Layout->addLayout(FormLayout);
+    Layout->addWidget(StatusLabel);
+    Layout->addLayout(ButtonLayout);
+
+    connect(CompareButton, &QPushButton::clicked, &Dialog, [&]() {
+        QString OldVersion = PublishedVersionNumber(OldEdit->text());
+        QString NewVersion = PublishedVersionNumber(NewEdit->text());
+        if (TitleEdit->text().trimmed().isEmpty() ||
+            OldVersion.isEmpty() || NewVersion.isEmpty()) {
+            StatusLabel->setText(
+                tr("Enter a draft title and two version numbers."));
+            return;
+        }
+        if (OldVersion == NewVersion) {
+            StatusLabel->setText(
+                tr("The two versions are the same; there is nothing "
+                   "to compare."));
+            return;
+        }
+        // The older version is the smaller number, whichever box
+        // it was typed in.
+        if (OldVersion > NewVersion) {
+            OldVersion.swap(NewVersion);
+        }
+        QString Name = TitleEdit->text().trimmed();
+        if (!Name.startsWith(QStringLiteral("draft-"))) {
+            Name.prepend(QStringLiteral("draft-"));
+        }
+        QString OldUrl = QStringLiteral(
+            "https://www.ietf.org/archive/id/%1-%2.txt")
+            .arg(Name, OldVersion);
+        QString NewUrl = QStringLiteral(
+            "https://www.ietf.org/archive/id/%1-%2.txt")
+            .arg(Name, NewVersion);
+        StatusLabel->setText(
+            tr("Fetching version %1...").arg(OldVersion));
+        QCoreApplication::processEvents();
+        QString Error;
+        QByteArray OldData = PublishedFetch(QUrl(OldUrl), &Error);
+        if (OldData.isEmpty()) {
+            StatusLabel->setText(
+                tr("Could not fetch version %1: %2")
+                .arg(OldVersion, Error));
+            return;
+        }
+        StatusLabel->setText(
+            tr("Fetching version %1...").arg(NewVersion));
+        QCoreApplication::processEvents();
+        QByteArray NewData = PublishedFetch(QUrl(NewUrl), &Error);
+        if (NewData.isEmpty()) {
+            StatusLabel->setText(
+                tr("Could not fetch version %1: %2")
+                .arg(NewVersion, Error));
+            return;
+        }
+        StatusLabel->setText(tr("Comparing..."));
+        QCoreApplication::processEvents();
+        QString OldText = QString::fromUtf8(OldData);
+        QString NewText = QString::fromUtf8(NewData);
+        OldText.replace(QStringLiteral("\r\n"), QStringLiteral("\n"));
+        NewText.replace(QStringLiteral("\r\n"), QStringLiteral("\n"));
+        OldText.replace(QLatin1Char('\r'), QLatin1Char('\n'));
+        NewText.replace(QLatin1Char('\r'), QLatin1Char('\n'));
+        int OldOnly = 0;
+        int NewOnly = 0;
+        QStringList Lines = PublishedDiffText(
+            OldText.split(QLatin1Char('\n')),
+            NewText.split(QLatin1Char('\n')),
+            OldVersion, NewVersion, &OldOnly, &NewOnly);
+
+        QDialog Result(&Dialog);
+        Result.setWindowTitle(tr("Differences: %1-%2 vs %1-%3")
+            .arg(Name, OldVersion, NewVersion));
+        Result.resize(900, 600);
+        QLabel* SummaryLabel = new QLabel(
+            tr("%1 line(s) only in version %2, %3 line(s) only in "
+               "version %4. A line with three spaces is the same in "
+               "both versions.")
+            .arg(OldOnly).arg(OldVersion).arg(NewOnly).arg(NewVersion),
+            &Result);
+        SummaryLabel->setWordWrap(true);
+        QPlainTextEdit* TextEdit = new QPlainTextEdit(&Result);
+        TextEdit->setReadOnly(true);
+        TextEdit->setFont(
+            QFontDatabase::systemFont(QFontDatabase::FixedFont));
+        TextEdit->setPlainText(Lines.join(QLatin1Char('\n')));
+        QLabel* SaveStatusLabel = new QLabel(&Result);
+        SaveStatusLabel->setWordWrap(true);
+        QPushButton* SaveAsButton =
+            new QPushButton(tr("Save As..."), &Result);
+        SaveAsButton->setToolTip(
+            tr("Save these differences to a text file."));
+        QPushButton* ResultCloseButton =
+            new QPushButton(tr("Close"), &Result);
+        connect(ResultCloseButton, &QPushButton::clicked,
+                &Result, &QDialog::accept);
+        connect(SaveAsButton, &QPushButton::clicked, &Result, [&]() {
+            QString DefaultName = Name + QStringLiteral("-") +
+                OldVersion + QStringLiteral("-") + NewVersion +
+                QStringLiteral(".txt");
+            QString DefaultPath = QDir(QStandardPaths::writableLocation(
+                QStandardPaths::DocumentsLocation))
+                .filePath(DefaultName);
+            QString Path = QFileDialog::getSaveFileName(
+                &Result, tr("Save differences"), DefaultPath,
+                tr("Text files (*.txt)"));
+            if (Path.isEmpty()) {
+                return;
+            }
+            QFile File(Path);
+            if (!File.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                SaveStatusLabel->setText(
+                    tr("Could not write %1.").arg(Path));
+                return;
+            }
+            QByteArray Data = TextEdit->toPlainText().toUtf8();
+            if (File.write(Data) != Data.size()) {
+                SaveStatusLabel->setText(
+                    tr("Could not write %1.").arg(Path));
+                File.close();
+                return;
+            }
+            File.close();
+            SaveStatusLabel->setText(tr("Saved to %1.").arg(Path));
+        });
+        QHBoxLayout* ResultButtonLayout = new QHBoxLayout();
+        ResultButtonLayout->addStretch(1);
+        ResultButtonLayout->addWidget(SaveAsButton);
+        ResultButtonLayout->addWidget(ResultCloseButton);
+        QVBoxLayout* ResultLayout = new QVBoxLayout(&Result);
+        ResultLayout->addWidget(SummaryLabel);
+        ResultLayout->addWidget(TextEdit, 1);
+        ResultLayout->addWidget(SaveStatusLabel);
+        ResultLayout->addLayout(ResultButtonLayout);
+        StatusLabel->setText(tr("Done."));
+        Result.exec();
+    });
+    connect(ClearButton, &QPushButton::clicked, &Dialog, [&]() {
+        TitleEdit->clear();
+        OldEdit->clear();
+        NewEdit->clear();
+        StatusLabel->clear();
+        QSettings Forgotten;
+        Forgotten.remove(QStringLiteral("viewpublished/diff/name"));
+        Forgotten.remove(QStringLiteral("viewpublished/diff/old"));
+        Forgotten.remove(QStringLiteral("viewpublished/diff/new"));
+    });
+    connect(CloseButton, &QPushButton::clicked, &Dialog, &QDialog::accept);
+
+    // Draft titles are wide, so this dialog is wider than the
+    // RFC one.
+    Dialog.resize(680, Dialog.sizeHint().height());
+
+    Dialog.exec();
+
+    // Remember what was typed, so the dialog opens where it was
+    // left. An empty box forgets its value.
+    auto Remember = [&](const QString& Key, const QString& Value) {
+        if (Value.isEmpty()) {
+            Remembered.remove(
+                QStringLiteral("viewpublished/diff") + Key);
+        } else {
+            Remembered.setValue(
+                QStringLiteral("viewpublished/diff") + Key, Value);
+        }
+    };
+    Remember(QStringLiteral("/name"), TitleEdit->text());
+    Remember(QStringLiteral("/old"), OldEdit->text());
+    Remember(QStringLiteral("/new"), NewEdit->text());
+}
+
 void MainWindow::OnLegend()
 {
     QMessageBox box(this);
@@ -2560,6 +3707,12 @@ void MainWindow::OnAbout()
             .arg(QString(QChar(0x00AE))));
     box.addButton(QMessageBox::Ok);
     box.exec();
+}
+
+void MainWindow::OnFeedback()
+{
+    QDesktopServices::openUrl(QUrl(QStringLiteral(
+        "https://github.com/RiverExplorer/InternetDraftEditor/issues")));
 }
 
 void MainWindow::OnValidate()
@@ -2768,6 +3921,7 @@ DocValidationResult MainWindow::ValidateAndReport(const QString& Path, bool Alwa
         // being checked: its include lines must match the file's.
         if (Path == _FilePath && !_Modified) {
             ResolvedIncludes = FilterIncludeErrors(Result);
+            ReportAnchorCollisions(Result);
         }
         if (Result.Valid) {
             statusBar()->showMessage(
@@ -2820,8 +3974,13 @@ int MainWindow::FilterIncludeErrors(DocValidationResult& Result)
             continue;
         }
         if (_BibCache.IsCached(Href)) {
-            Resolved[Href] =
-                DocDocument::ReferenceAnchorFromIncludeHref(Href);
+            // The anchor comes from the cached file itself: a
+            // BCP include is BCP14, not BCP.14 from the file
+            // name. The derived anchor is only the fallback.
+            QString CachedAnchor = _BibCache.CachedAnchor(Href);
+            Resolved[Href] = CachedAnchor.isEmpty()
+                ? DocDocument::ReferenceAnchorFromIncludeHref(Href)
+                : CachedAnchor;
             ResolvedLines.append(static_cast<int>(Include->line));
         } else {
             UnresolvedHrefs.append(Href);
@@ -2876,6 +4035,28 @@ int MainWindow::FilterIncludeErrors(DocValidationResult& Result)
         }
     }
     return Resolved.size();
+}
+
+void MainWindow::ReportAnchorCollisions(DocValidationResult& Result)
+{
+    QMap<QString, QStringList> Provided = ProvidedAnchorProviders();
+    QStringList Collisions;
+    for (auto It = Provided.constBegin(); It != Provided.constEnd(); ++It) {
+        if (It.value().size() < 2) {
+            continue;
+        }
+        if (It.value().size() == 2) {
+            Collisions.append(tr("%1 and %2 both provide the reference \"%3\". Remove one of them.")
+                .arg(It.value().first(), It.value().last(), It.key()));
+        } else {
+            Collisions.append(tr("%1 all provide the reference \"%2\". Remove all but one of them.")
+                .arg(It.value().join(QStringLiteral(", ")), It.key()));
+        }
+    }
+    if (!Collisions.isEmpty()) {
+        Result.Errors.append(Collisions);
+        Result.Valid = false;
+    }
 }
 
 void MainWindow::OnRunOutput()
@@ -3330,23 +4511,16 @@ void MainWindow::AddReferenceGroupItem(QTreeWidgetItem* Parent, xmlNodePtr Group
     for (int e = 0; e < Entries.size(); ++e) {
         xmlNodePtr Entry = Entries[e];
         QTreeWidgetItem* EntryItem = new QTreeWidgetItem(GroupItem);
-        QString Label = DocDocument::ReferenceLabel(Entry);
+        // The label leads with the words that cite the entry, so
+        // the author can match what they tagged to the entry it
+        // points at; an entry nothing cites keeps its plain label.
+        QString Label = CitedLabelPrefix(
+            DocDocument::NodeAttribute(Entry, "anchor")) +
+            DocDocument::ReferenceLabel(Entry);
         EntryItem->setText(0, Label.isEmpty() ? tr("(untitled)") : Label);
         EntryItem->setData(0, Qt::UserRole, KindReferenceEntry);
         EntryItem->setData(0, Qt::UserRole + 1, Path);
         EntryItem->setData(0, Qt::UserRole + 2, e);
-        QVector<xmlNodePtr> EntryAuthors =
-            DocDocument::ReferenceAuthors(Entry);
-        for (int a = 0; a < EntryAuthors.size(); ++a) {
-            QTreeWidgetItem* AuthorItem = new QTreeWidgetItem(EntryItem);
-            QString Name = DocDocument::AuthorAttribute(
-                EntryAuthors[a], "fullname");
-            AuthorItem->setText(0, Name.trimmed().isEmpty() ? tr("(unnamed)") : Name);
-            AuthorItem->setData(0, Qt::UserRole, KindReferenceAuthor);
-            AuthorItem->setData(0, Qt::UserRole + 1, Path);
-            AuthorItem->setData(0, Qt::UserRole + 2, e);
-            AuthorItem->setData(0, Qt::UserRole + 3, a);
-        }
     }
     // Included references are entries too, fetched by xml2rfc
     // rather than written in the file: they list under their
@@ -3356,20 +4530,7 @@ void MainWindow::AddReferenceGroupItem(QTreeWidgetItem* Parent, xmlNodePtr Group
     for (int i = 0; i < Includes.size(); ++i) {
         xmlNodePtr Include = Includes[i];
         QTreeWidgetItem* IncludeItem = new QTreeWidgetItem(GroupItem);
-        QString Href = DocDocument::NodeAttribute(Include, "href");
-        QString Anchor = DocDocument::ReferenceAnchorFromIncludeHref(Href);
-        // A cached entry shows its real title; until it is fetched
-        // the anchor with "(included)" says what it is.
-        QString Title = _BibCache.CachedTitle(Href);
-        QString Label;
-        if (!Title.isEmpty() && !Anchor.isEmpty()) {
-            Label = tr("%1 (%2)").arg(Title, Anchor);
-        } else if (Anchor.isEmpty()) {
-            Label = Href.isEmpty() ? tr("(included reference)") : Href;
-        } else {
-            Label = tr("%1 (included)").arg(Anchor);
-        }
-        IncludeItem->setText(0, Label);
+        IncludeItem->setText(0, IncludeLabel(Include));
         IncludeItem->setData(0, Qt::UserRole, KindReferenceInclude);
         IncludeItem->setData(0, Qt::UserRole + 1, Path);
         IncludeItem->setData(0, Qt::UserRole + 2, i);
@@ -3546,6 +4707,7 @@ void MainWindow::ShowDetailsFor(QTreeWidgetItem* Item)
     }
     case KindReferenceGroup:
         _ReferenceGroupPath = Item->data(0, Qt::UserRole + 1).toString();
+        _ReferenceIncludeIndex = -1;
         FillReferenceGroupForm();
         _Details->setCurrentIndex(DetailReferenceGroup);
         break;
@@ -3558,8 +4720,10 @@ void MainWindow::ShowDetailsFor(QTreeWidgetItem* Item)
     case KindReferenceInclude:
         // An included reference has no entry form: show the
         // list it lives in. The list page notes that the list
-        // holds details this version does not edit.
+        // holds details this version does not edit, and offers
+        // the remove for the selected include.
         _ReferenceGroupPath = Item->data(0, Qt::UserRole + 1).toString();
+        _ReferenceIncludeIndex = Item->data(0, Qt::UserRole + 2).toInt();
         FillReferenceGroupForm();
         _Details->setCurrentIndex(DetailReferenceGroup);
         break;
@@ -3893,14 +5057,90 @@ xmlNodePtr MainWindow::FindReferenceEntry(const QString& Group, int Entry)
     return Entries[Entry];
 }
 
+QString MainWindow::CitedLabelPrefix(const QString& Anchor)
+{
+    QStringList Cited = DocDocument::CitedTextsForAnchor(_Document.RfcNode(), Anchor);
+    if (Cited.isEmpty()) {
+        return QString();
+    }
+    QStringList Shown = Cited.mid(0, 3);
+    QString Head = Shown.join(QStringLiteral(", "));
+    if (Cited.size() > 3) {
+        Head += QStringLiteral(", ...");
+    }
+    return Head + QStringLiteral(" - ");
+}
+
+QString MainWindow::IncludeAnchor(xmlNodePtr Include)
+{
+    if (Include == nullptr) {
+        return QString();
+    }
+    QString Href = DocDocument::NodeAttribute(Include, "href");
+    // The cached file carries the real anchor (BCP14, not
+    // BCP.14 from the file name); the derived anchor is only
+    // the fallback until it is fetched.
+    QString CachedAnchor = _BibCache.CachedAnchor(Href);
+    return CachedAnchor.isEmpty()
+        ? DocDocument::ReferenceAnchorFromIncludeHref(Href)
+        : CachedAnchor;
+}
+
+QString MainWindow::IncludeLabel(xmlNodePtr Include)
+{
+    if (Include == nullptr) {
+        return QString();
+    }
+    QString Href = DocDocument::NodeAttribute(Include, "href");
+    QString Anchor = IncludeAnchor(Include);
+    // A cached entry shows its real title; until it is fetched
+    // the anchor with "(included)" says what it is. The anchor
+    // leads, as on a manual entry, so the name stays visible when
+    // the title is longer than the outline is wide.
+    QString Title = _BibCache.CachedTitle(Href);
+    QString Label;
+    if (!Title.isEmpty() && !Anchor.isEmpty()) {
+        Label = tr("%1 - %2").arg(Anchor, Title);
+    } else if (Anchor.isEmpty()) {
+        Label = Href.isEmpty() ? tr("(included reference)") : Href;
+    } else {
+        Label = tr("%1 (included)").arg(Anchor);
+    }
+    return CitedLabelPrefix(Anchor) + Label;
+}
+
+bool MainWindow::ReferenceAnchorUnused(const QString& Anchor)
+{
+    int Count = DocDocument::CitationCountForAnchor(_Document.RfcNode(), Anchor);
+    if (Count <= 0) {
+        return true;
+    }
+    QStringList Cited = DocDocument::CitedTextsForAnchor(_Document.RfcNode(), Anchor);
+    QString Detail = Cited.isEmpty()
+        ? QString()
+        : tr(" It is cited as \"%1\".").arg(Cited.first());
+    QMessageBox::warning(this, tr("Reference in use"),
+        tr("This reference is cited by %1 cross-reference(s).%2 Remove the cross-references first.")
+            .arg(Count).arg(Detail));
+    return false;
+}
+
 void MainWindow::FillReferenceGroupForm()
 {
     QSignalBlocker Blocker(_ReferenceGroupNameEdit);
+    QSignalBlocker BlockSectionNormative(_ReferenceIncludeNormativeRadio);
+    QSignalBlocker BlockSectionInformative(_ReferenceIncludeInformativeRadio);
     xmlNodePtr Group = FindReferenceGroup(_ReferenceGroupPath);
     if (Group == nullptr) {
         _ReferenceGroupNameEdit->clear();
         _AddReferenceEntryButton->setEnabled(false);
         _AddNestedListButton->setEnabled(false);
+        _ReferenceIncludeLabel->clear();
+        _RemoveReferenceIncludeButton->setEnabled(false);
+        _ReferenceIncludeNormativeRadio->setEnabled(false);
+        _ReferenceIncludeNormativeRadio->setChecked(false);
+        _ReferenceIncludeInformativeRadio->setEnabled(false);
+        _ReferenceIncludeInformativeRadio->setChecked(false);
         _ReferenceGroupPreservedLabel->hide();
         return;
     }
@@ -3913,6 +5153,34 @@ void MainWindow::FillReferenceGroupForm()
     bool HasEntries = DocDocument::ReferenceGroupHasEntries(Group);
     _AddReferenceEntryButton->setEnabled(!HasNested);
     _AddNestedListButton->setEnabled(!HasEntries);
+    // The remove for an included reference acts on the include
+    // the author picked in the outline; with the list itself
+    // picked there is no include to remove.
+    QVector<xmlNodePtr> Includes = DocDocument::ReferenceIncludeNodes(Group);
+    xmlNodePtr Include = nullptr;
+    if (_ReferenceIncludeIndex >= 0 &&
+        _ReferenceIncludeIndex < Includes.size()) {
+        Include = Includes[_ReferenceIncludeIndex];
+    }
+    if (Include == nullptr) {
+        _ReferenceIncludeLabel->clear();
+        _RemoveReferenceIncludeButton->setEnabled(false);
+    } else {
+        _ReferenceIncludeLabel->setText(IncludeLabel(Include));
+        _RemoveReferenceIncludeButton->setEnabled(true);
+    }
+    // The section radios move the picked included reference; with
+    // no include picked they have nothing to move. The checked
+    // one names the list the include already sits in, if any.
+    _ReferenceIncludeNormativeRadio->setEnabled(Include != nullptr);
+    _ReferenceIncludeInformativeRadio->setEnabled(Include != nullptr);
+    QString Section = DocDocument::ChildText(Group, "name");
+    _ReferenceIncludeNormativeRadio->setChecked(
+        Include != nullptr &&
+        Section == QStringLiteral("Normative References"));
+    _ReferenceIncludeInformativeRadio->setChecked(
+        Include != nullptr &&
+        Section == QStringLiteral("Informative References"));
     if (ReferenceGroupHasPreservedContent(Group)) {
         _ReferenceGroupPreservedLabel->setText(
             tr("This list holds details this version does not edit (a "
@@ -3935,6 +5203,9 @@ void MainWindow::FillReferenceEntryForm()
     QSignalBlocker BlockStream(_ReferenceStreamCombo);
     QSignalBlocker BlockSeries(_ReferenceSeriesTable);
     QSignalBlocker BlockMoveTo(_ReferenceMoveToCombo);
+    QSignalBlocker BlockSectionNormative(_ReferenceNormativeRadio);
+    QSignalBlocker BlockSectionInformative(_ReferenceInformativeRadio);
+    QSignalBlocker BlockAuthorList(_ReferenceAuthorList);
     xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupPath, _ReferenceEntryIndex);
     if (Entry == nullptr) {
         _ReferenceAnchorEdit->clear();
@@ -3946,9 +5217,25 @@ void MainWindow::FillReferenceEntryForm()
         _ReferenceStreamCombo->setCurrentIndex(0);
         _ReferenceSeriesTable->setRowCount(0);
         _ReferenceMoveToCombo->clear();
+        _ReferenceNormativeRadio->setChecked(false);
+        _ReferenceInformativeRadio->setChecked(false);
+        _ReferenceAuthorList->clear();
+        _ReferenceAuthorIndex = -1;
+        FillReferenceAuthorFields();
         _ReferenceEntryPreservedLabel->hide();
         return;
     }
+    // The checked section radio names the list this entry sits
+    // in, if it is a section list; an entry in a flat list has
+    // neither checked.
+    xmlNodePtr ParentGroup = FindReferenceGroup(_ReferenceGroupPath);
+    QString Section = ParentGroup == nullptr
+        ? QString()
+        : DocDocument::ChildText(ParentGroup, "name");
+    _ReferenceNormativeRadio->setChecked(
+        Section == QStringLiteral("Normative References"));
+    _ReferenceInformativeRadio->setChecked(
+        Section == QStringLiteral("Informative References"));
     _ReferenceAnchorEdit->setText(DocDocument::NodeAttribute(Entry, "anchor"));
     _ReferenceTargetEdit->setText(DocDocument::NodeAttribute(Entry, "target"));
     xmlNodePtr Front = DocDocument::ChildElement(Entry, "front");
@@ -3996,6 +5283,26 @@ void MainWindow::FillReferenceEntryForm()
     }
     int MoveIndex = _ReferenceMoveToCombo->findData(_ReferenceGroupPath);
     _ReferenceMoveToCombo->setCurrentIndex(MoveIndex);
+    // The authors list on this page: the authors no longer have
+    // outline items of their own, so they are picked here.
+    QVector<xmlNodePtr> Authors = DocDocument::ReferenceAuthors(Entry);
+    _ReferenceAuthorList->clear();
+    for (xmlNodePtr Author : Authors) {
+        QString Name = DocDocument::AuthorAttribute(Author, "fullname");
+        _ReferenceAuthorList->addItem(
+            Name.trimmed().isEmpty() ? tr("(unnamed)") : Name);
+    }
+    if (Authors.isEmpty()) {
+        _ReferenceAuthorIndex = -1;
+    } else {
+        if (_ReferenceAuthorIndex < 0) {
+            _ReferenceAuthorIndex = 0;
+        } else if (_ReferenceAuthorIndex >= Authors.size()) {
+            _ReferenceAuthorIndex = Authors.size() - 1;
+        }
+    }
+    _ReferenceAuthorList->setCurrentRow(_ReferenceAuthorIndex);
+    FillReferenceAuthorFields();
     if (ReferenceEntryHasPreservedContent(Entry)) {
         _ReferenceEntryPreservedLabel->setText(
             tr("This reference holds details this version does not edit "
@@ -4005,6 +5312,73 @@ void MainWindow::FillReferenceEntryForm()
     } else {
         _ReferenceEntryPreservedLabel->hide();
     }
+}
+
+xmlNodePtr MainWindow::ShownReferenceAuthor()
+{
+    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupPath, _ReferenceEntryIndex);
+    if (Entry == nullptr) {
+        return nullptr;
+    }
+    QVector<xmlNodePtr> Authors = DocDocument::ReferenceAuthors(Entry);
+    if (_ReferenceAuthorIndex < 0 || _ReferenceAuthorIndex >= Authors.size()) {
+        return nullptr;
+    }
+    return Authors[_ReferenceAuthorIndex];
+}
+
+void MainWindow::FillReferenceAuthorFields()
+{
+    QSignalBlocker BlockFullname(_ReferenceAuthorFullnameEdit);
+    QSignalBlocker BlockInitials(_ReferenceAuthorInitialsEdit);
+    QSignalBlocker BlockSurname(_ReferenceAuthorSurnameEdit);
+    QSignalBlocker BlockOrganization(_ReferenceAuthorOrganizationEdit);
+    QSignalBlocker BlockEmail(_ReferenceAuthorEmailEdit);
+    QSignalBlocker BlockPhone(_ReferenceAuthorPhoneEdit);
+    QSignalBlocker BlockUri(_ReferenceAuthorUriEdit);
+    QSignalBlocker BlockAuthorRadio(_ReferenceAuthorRadio);
+    QSignalBlocker BlockEditorRadio(_ReferenceEditorRadio);
+    xmlNodePtr Author = ShownReferenceAuthor();
+    bool HasAuthor = Author != nullptr;
+    _ReferenceAuthorFullnameEdit->setEnabled(HasAuthor);
+    _ReferenceAuthorInitialsEdit->setEnabled(HasAuthor);
+    _ReferenceAuthorSurnameEdit->setEnabled(HasAuthor);
+    _ReferenceAuthorOrganizationEdit->setEnabled(HasAuthor);
+    _ReferenceAuthorEmailEdit->setEnabled(HasAuthor);
+    _ReferenceAuthorPhoneEdit->setEnabled(HasAuthor);
+    _ReferenceAuthorUriEdit->setEnabled(HasAuthor);
+    _ReferenceAuthorRadio->setEnabled(HasAuthor);
+    _ReferenceEditorRadio->setEnabled(HasAuthor);
+    _RemoveReferenceAuthorButton->setEnabled(HasAuthor);
+    if (!HasAuthor) {
+        _ReferenceAuthorFullnameEdit->clear();
+        _ReferenceAuthorInitialsEdit->clear();
+        _ReferenceAuthorSurnameEdit->clear();
+        _ReferenceAuthorOrganizationEdit->clear();
+        _ReferenceAuthorEmailEdit->clear();
+        _ReferenceAuthorPhoneEdit->clear();
+        _ReferenceAuthorUriEdit->clear();
+        _ReferenceAuthorRadio->setChecked(true);
+        return;
+    }
+    _ReferenceAuthorFullnameEdit->setText(
+        DocDocument::AuthorAttribute(Author, "fullname"));
+    _ReferenceAuthorInitialsEdit->setText(
+        DocDocument::AuthorAttribute(Author, "initials"));
+    _ReferenceAuthorSurnameEdit->setText(
+        DocDocument::AuthorAttribute(Author, "surname"));
+    _ReferenceAuthorOrganizationEdit->setText(
+        DocDocument::AuthorOrganization(Author));
+    _ReferenceAuthorEmailEdit->setText(
+        DocDocument::AuthorContactField(Author, "email"));
+    _ReferenceAuthorPhoneEdit->setText(
+        DocDocument::AuthorContactField(Author, "phone"));
+    _ReferenceAuthorUriEdit->setText(
+        DocDocument::AuthorContactField(Author, "uri"));
+    bool IsEditor = DocDocument::AuthorAttribute(Author, "role") ==
+        QStringLiteral("editor");
+    _ReferenceAuthorRadio->setChecked(!IsEditor);
+    _ReferenceEditorRadio->setChecked(IsEditor);
 }
 
 void MainWindow::OnAddReferenceGroup()
@@ -4191,30 +5565,75 @@ static QString RfcNumberFromAnchor(const QString& Anchor)
 /**
  * @brief True when any reference list already carries this anchor.
  * @param Document The document.
+ * @param Cache The bibliography cache, for the anchor a cached
+ * include carries (BCP14, not BCP.14 from the file name).
  * @param Anchor The anchor to look for.
  * @return True when the anchor is already used.
  */
-static bool ReferenceAnchorExists(const DocDocument& Document,
-                                  const QString& Anchor)
+QMap<QString, QStringList> MainWindow::ProvidedAnchorProviders() const
 {
-    for (const QString& Path : Document.ReferenceGroupPaths()) {
-        xmlNodePtr Group = Document.ReferenceGroupAtPath(Path);
+    QMap<QString, QStringList> Provided;
+    for (const QString& Path : _Document.ReferenceGroupPaths()) {
+        xmlNodePtr Group = _Document.ReferenceGroupAtPath(Path);
         if (Group == nullptr) {
             continue;
         }
         for (xmlNodePtr Entry : DocDocument::ReferenceEntries(Group)) {
-            if (DocDocument::NodeAttribute(Entry, "anchor").trimmed() ==
-                Anchor) {
-                return true;
+            QString Anchor =
+                DocDocument::NodeAttribute(Entry, "anchor").trimmed();
+            if (Anchor.isEmpty()) {
+                continue;
+            }
+            QString Label = tr("the reference \"%1\"").arg(Anchor);
+            if (!Provided[Anchor].contains(Label)) {
+                Provided[Anchor].append(Label);
             }
         }
         for (xmlNodePtr Include : DocDocument::ReferenceIncludeNodes(Group)) {
-            if (DocDocument::ReferenceAnchorFromIncludeHref(
-                    DocDocument::NodeAttribute(Include, "href")) == Anchor) {
-                return true;
+            QString Href = DocDocument::NodeAttribute(Include, "href");
+            QStringList Anchors = _BibCache.CachedAnchors(Href);
+            if (Anchors.isEmpty()) {
+                QString Anchor = _BibCache.CachedAnchor(Href);
+                Anchors.append(Anchor.isEmpty()
+                    ? DocDocument::ReferenceAnchorFromIncludeHref(Href)
+                    : Anchor);
+            }
+            // The provider is the include itself, named by its
+            // own anchor: the first anchor its file provides.
+            QString Label = Anchors.isEmpty()
+                ? QString()
+                : tr("the included reference \"%1\"").arg(Anchors.first());
+            for (const QString& Anchor : Anchors) {
+                QString Wanted = Anchor.trimmed();
+                if (Wanted.isEmpty() || Label.isEmpty()) {
+                    continue;
+                }
+                if (!Provided[Wanted].contains(Label)) {
+                    Provided[Wanted].append(Label);
+                }
             }
         }
     }
+    return Provided;
+}
+
+bool MainWindow::FindProvidedAnchorClash(const QStringList& NewAnchors,
+                                         QString& Clash, QString& Provider)
+{
+    QMap<QString, QStringList> Provided = ProvidedAnchorProviders();
+    for (const QString& Anchor : NewAnchors) {
+        QString Wanted = Anchor.trimmed();
+        if (Wanted.isEmpty()) {
+            continue;
+        }
+        if (Provided.contains(Wanted)) {
+            Clash = Wanted;
+            Provider = Provided.value(Wanted).first();
+            return true;
+        }
+    }
+    Clash.clear();
+    Provider.clear();
     return false;
 }
 
@@ -4334,29 +5753,43 @@ void MainWindow::HandleMakeReference(TextEditor* Editor, int Action,
     if (Group == nullptr) {
         return;
     }
-    if (ReferenceAnchorExists(_Document, Wanted)) {
-        // The entry is already there: cite it instead of a duplicate.
-        Editor->InsertXrefMarker(Wanted, SelectionStart, SelectionEnd);
-        return;
-    }
     QString RfcNumber = RfcNumberFromAnchor(Wanted);
     if (!RfcNumber.isEmpty()) {
-        // xml2rfc pulls the full reference from its database; the
-        // editor only supplies the tag. The included file IS the
-        // whole <reference>, so nothing else is needed.
-        xmlNsPtr XiNs =
-            DocDocument::EnsureXIncludeNamespace(_Document.RfcNode());
-        if (XiNs == nullptr) {
-            return;
-        }
-        xmlNodePtr Include =
-            xmlNewChild(Group, XiNs, XmlChars("include"), nullptr);
-        DocDocument::SetNodeAttribute(
-            Include, "href",
-            QStringLiteral(
-                "https://bib.ietf.org/public/rfc/bibxml/reference.RFC.") +
-                RfcNumber + QStringLiteral(".xml"));
-    } else {
+        // An RFC include: fetch its file first, so the anchors
+        // it provides are known before it is added. A group
+        // already in the document may provide this anchor
+        // inside itself (BCP14 provides RFC2119), and adding
+        // the include as well would carry the anchor twice.
+        // The finish runs once, on the fetch; the selection was
+        // captured above, so a moved cursor cannot misplace
+        // the cross-reference.
+        QString Href = QStringLiteral(
+            "https://bib.ietf.org/public/rfc/bibxml/reference.RFC.") +
+            RfcNumber + QStringLiteral(".xml");
+        statusBar()->showMessage(tr("Fetching bibliography entry..."));
+        connect(&_BibCache, &BibCache::FetchFinished, this,
+            [this, Editor, Group, Wanted, Href, SelectionStart, SelectionEnd]() {
+                FinishNewReference(Editor, Group, Wanted, Href,
+                                   SelectionStart, SelectionEnd);
+            },
+            Qt::SingleShotConnection);
+        _BibCache.EnsureCached(QStringList(Href));
+        return;
+    }
+    // A placeholder (the anchor is not an RFC): the anchor is
+    // all it provides, so the check runs against the document
+    // as it stands.
+    QString Clash;
+    QString Provider;
+    if (FindProvidedAnchorClash(QStringList(Wanted), Clash, Provider)) {
+        // The entry is already there: cite it instead of a duplicate.
+        statusBar()->showMessage(
+            tr("%1 already provides %2: citing the existing reference.")
+                .arg(Provider, Clash));
+        Editor->InsertXrefMarker(Clash, SelectionStart, SelectionEnd);
+        return;
+    }
+    {
         // A placeholder: the anchor, with the title and author
         // prefilled to say what still needs providing. The author
         // completes it in the entry form. The entry is valid as
@@ -4382,6 +5815,64 @@ void MainWindow::HandleMakeReference(TextEditor* Editor, int Action,
     }
     SetModified(true);
     RebuildOutline();
+    Editor->InsertXrefMarker(Wanted, SelectionStart, SelectionEnd);
+}
+
+void MainWindow::FinishNewReference(TextEditor* Editor, xmlNodePtr Group,
+                                    const QString& Wanted, const QString& Href,
+                                    int SelectionStart, int SelectionEnd)
+{
+    if (Editor == nullptr) {
+        return;
+    }
+    // The fetch took time: the author may have opened another
+    // document since. The group only counts when it still
+    // belongs to the open document.
+    bool GroupLive = false;
+    for (const QString& Path : _Document.ReferenceGroupPaths()) {
+        if (_Document.ReferenceGroupAtPath(Path) == Group) {
+            GroupLive = true;
+            break;
+        }
+    }
+    if (!GroupLive) {
+        return;
+    }
+    QStringList Provided = _BibCache.CachedAnchors(Href);
+    if (Provided.isEmpty()) {
+        // The fetch failed, or the file carries nothing usable:
+        // fall back to the wanted anchor alone, so the direct
+        // check still runs. The failed download is reported at
+        // validation time.
+        Provided.append(Wanted);
+    }
+    QString Clash;
+    QString Provider;
+    if (FindProvidedAnchorClash(Provided, Clash, Provider)) {
+        // The anchor is already provided (a group carries it
+        // inside itself, for example): cite it instead of
+        // adding a second copy, and say why.
+        statusBar()->showMessage(
+            tr("%1 already provides %2: citing the existing reference.")
+                .arg(Provider, Clash));
+        Editor->InsertXrefMarker(Clash, SelectionStart, SelectionEnd);
+        return;
+    }
+    // xml2rfc pulls the full reference from its database; the
+    // editor only supplies the tag. The included file IS the
+    // whole <reference>, so nothing else is needed.
+    xmlNsPtr XiNs =
+        DocDocument::EnsureXIncludeNamespace(_Document.RfcNode());
+    if (XiNs == nullptr) {
+        return;
+    }
+    xmlNodePtr Include =
+        xmlNewChild(Group, XiNs, XmlChars("include"), nullptr);
+    DocDocument::SetNodeAttribute(Include, "href", Href);
+    SetModified(true);
+    RebuildOutline();
+    statusBar()->showMessage(
+        tr("Added the included reference %1.").arg(Wanted));
     Editor->InsertXrefMarker(Wanted, SelectionStart, SelectionEnd);
 }
 
@@ -4427,6 +5918,11 @@ void MainWindow::OnRemoveReferenceEntry()
     if (Entry == nullptr) {
         return;
     }
+    // A cited reference is not removed: the citations would be
+    // left pointing at an anchor that no longer exists.
+    if (!ReferenceAnchorUnused(DocDocument::NodeAttribute(Entry, "anchor"))) {
+        return;
+    }
     QString Label = DocDocument::NodeAttribute(Entry, "anchor");
     if (Label.trimmed().isEmpty()) {
         xmlNodePtr Front = DocDocument::ChildElement(Entry, "front");
@@ -4449,6 +5945,42 @@ void MainWindow::OnRemoveReferenceEntry()
     RebuildOutline();
 }
 
+void MainWindow::OnRemoveReferenceInclude()
+{
+    xmlNodePtr Group = FindReferenceGroup(_ReferenceGroupPath);
+    if (Group == nullptr) {
+        return;
+    }
+    QVector<xmlNodePtr> Includes = DocDocument::ReferenceIncludeNodes(Group);
+    if (_ReferenceIncludeIndex < 0 ||
+        _ReferenceIncludeIndex >= Includes.size()) {
+        return;
+    }
+    xmlNodePtr Include = Includes[_ReferenceIncludeIndex];
+    QString Anchor = IncludeAnchor(Include);
+    // As with a manual entry, a cited include is not removed:
+    // the citations would be left pointing at an anchor that
+    // no longer exists.
+    if (!ReferenceAnchorUnused(Anchor)) {
+        return;
+    }
+    QMessageBox::StandardButton Answer = QMessageBox::question(
+        this, tr("Remove Included Reference"),
+        Anchor.trimmed().isEmpty()
+            ? tr("Remove this included reference?")
+            : tr("Remove the included reference \"%1\"?").arg(Anchor),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (Answer != QMessageBox::Yes) {
+        return;
+    }
+    xmlUnlinkNode(Include);
+    xmlFreeNode(Include);
+    _ReferenceIncludeIndex = -1;
+    _SelectedKey = QStringLiteral("refgroup:") + _ReferenceGroupPath;
+    SetModified(true);
+    RebuildOutline();
+}
+
 void MainWindow::OnMoveReferenceEntryUp()
 {
     xmlNodePtr Group = FindReferenceGroup(_ReferenceGroupPath);
@@ -4465,6 +5997,136 @@ void MainWindow::OnMoveReferenceEntryUp()
     --_ReferenceEntryIndex;
     _SelectedKey = QStringLiteral("refentry:") + _ReferenceGroupPath +
         QStringLiteral(".") + QString::number(_ReferenceEntryIndex);
+    SetModified(true);
+    RebuildOutline();
+}
+
+void MainWindow::OnReferenceSectionChanged()
+{
+    // Only the check moves the entry; the matching uncheck of
+    // the other radio, and the fill with the form blocked, do
+    // not. With neither checked there is nothing to move to.
+    if (!_ReferenceNormativeRadio->isChecked() &&
+        !_ReferenceInformativeRadio->isChecked()) {
+        return;
+    }
+    xmlNodePtr Entry = FindReferenceEntry(_ReferenceGroupPath, _ReferenceEntryIndex);
+    if (Entry == nullptr) {
+        return;
+    }
+    MoveReferenceToSection(Entry, _ReferenceNormativeRadio->isChecked());
+}
+
+void MainWindow::OnReferenceIncludeSectionChanged()
+{
+    if (!_ReferenceIncludeNormativeRadio->isChecked() &&
+        !_ReferenceIncludeInformativeRadio->isChecked()) {
+        return;
+    }
+    xmlNodePtr Group = FindReferenceGroup(_ReferenceGroupPath);
+    if (Group == nullptr) {
+        return;
+    }
+    QVector<xmlNodePtr> Includes = DocDocument::ReferenceIncludeNodes(Group);
+    if (_ReferenceIncludeIndex < 0 ||
+        _ReferenceIncludeIndex >= Includes.size()) {
+        return;
+    }
+    MoveReferenceToSection(Includes[_ReferenceIncludeIndex],
+                           _ReferenceIncludeNormativeRadio->isChecked());
+}
+
+/**
+ * @brief Moves a reference entry or an included reference into
+ *        the Normative or Informative nested list under its
+ *        current outer list, creating that list when needed.
+ *
+ * The outer list is the topmost <references> ancestor, so an
+ * entry already in a section moves between sections, and an
+ * entry in a flat list moves under that list. Normative stays
+ * ahead of Informative, as in the IETF form.
+ *
+ * A list holds nested lists or entries, never both, so moving
+ * the first entry leaves the outer list mixed until the last
+ * direct entry moves: the file is schema-valid again once every
+ * entry has a section.
+ * @param Item The entry or include node to move (borrowed).
+ * @param Normative True for the Normative section, false for
+ *        the Informative section.
+ */
+void MainWindow::MoveReferenceToSection(xmlNodePtr Item, bool Normative)
+{
+    if (Item == nullptr || Item->parent == nullptr ||
+        !DocDocument::NodeNameEquals(Item->parent, "references")) {
+        return;
+    }
+    xmlNodePtr Outer = Item->parent;
+    while (Outer->parent != nullptr &&
+           DocDocument::NodeNameEquals(Outer->parent, "references")) {
+        Outer = Outer->parent;
+    }
+    QString SectionName = Normative
+        ? QStringLiteral("Normative References")
+        : QStringLiteral("Informative References");
+    xmlNodePtr Target = nullptr;
+    xmlNodePtr Informative = nullptr;
+    for (xmlNodePtr Child = Outer->children; Child != nullptr;
+         Child = Child->next) {
+        if (Child->type != XML_ELEMENT_NODE ||
+            !DocDocument::NodeNameEquals(Child, "references")) {
+            continue;
+        }
+        QString Name = DocDocument::ChildText(Child, "name");
+        if (Name == SectionName) {
+            Target = Child;
+        }
+        if (Name == QStringLiteral("Informative References")) {
+            Informative = Child;
+        }
+    }
+    if (Target == nullptr) {
+        Target = xmlNewNode(nullptr, XmlChars("references"));
+        SetLeadingChildText(Target, "name", SectionName);
+        if (Normative && Informative != nullptr) {
+            xmlAddPrevSibling(Informative, Target);
+        } else {
+            xmlAddChild(Outer, Target);
+        }
+    }
+    if (Item->parent == Target) {
+        return;
+    }
+    bool IsEntry = DocDocument::NodeNameEquals(Item, "reference");
+    xmlUnlinkNode(Item);
+    if (IsEntry) {
+        AppendReferenceEntry(Target, Item);
+    } else {
+        xmlAddChild(Target, Item);
+    }
+    // The moved item has a new home: point the selection at it
+    // so the form stays on it after the outline rebuilds.
+    QString TargetPath;
+    for (const QString& Path : _Document.ReferenceGroupPaths()) {
+        if (_Document.ReferenceGroupAtPath(Path) == Target) {
+            TargetPath = Path;
+            break;
+        }
+    }
+    if (!TargetPath.isEmpty()) {
+        if (IsEntry) {
+            _ReferenceGroupPath = TargetPath;
+            _ReferenceEntryIndex =
+                DocDocument::ReferenceEntries(Target).size() - 1;
+            _SelectedKey = QStringLiteral("refentry:") + _ReferenceGroupPath +
+                QStringLiteral(".") + QString::number(_ReferenceEntryIndex);
+        } else {
+            _ReferenceGroupPath = TargetPath;
+            _ReferenceIncludeIndex =
+                DocDocument::ReferenceIncludeNodes(Target).size() - 1;
+            _SelectedKey = QStringLiteral("refinclude:") + _ReferenceGroupPath +
+                QStringLiteral(".") + QString::number(_ReferenceIncludeIndex);
+        }
+    }
     SetModified(true);
     RebuildOutline();
 }
@@ -4643,12 +6305,84 @@ void MainWindow::OnAddReferenceAuthor()
     } else {
         xmlAddChild(Front, Author);
     }
-    _SelectedKey = QStringLiteral("refauthor:") + _ReferenceGroupPath +
-        QStringLiteral(".") + QString::number(_ReferenceEntryIndex) +
-        QStringLiteral(".") +
-        QString::number(DocDocument::ReferenceAuthors(Entry).size() - 1);
+    // Select the new author in the list on the entry form: the
+    // authors no longer have outline items of their own.
+    _ReferenceAuthorIndex = DocDocument::ReferenceAuthors(Entry).size() - 1;
+    _SelectedKey = QStringLiteral("refentry:") + _ReferenceGroupPath +
+        QStringLiteral(".") + QString::number(_ReferenceEntryIndex);
     SetModified(true);
     RebuildOutline();
+}
+
+void MainWindow::OnRemoveReferenceAuthor()
+{
+    xmlNodePtr Author = ShownReferenceAuthor();
+    if (Author == nullptr) {
+        return;
+    }
+    QString Name = DocDocument::AuthorAttribute(Author, "fullname");
+    QMessageBox::StandardButton Answer = QMessageBox::question(
+        this, tr("Remove Author"),
+        tr("Remove the author \"%1\"?").arg(Name),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (Answer != QMessageBox::Yes) {
+        return;
+    }
+    xmlUnlinkNode(Author);
+    xmlFreeNode(Author);
+    if (_ReferenceAuthorIndex > 0) {
+        --_ReferenceAuthorIndex;
+    }
+    SetModified(true);
+    RebuildOutline();
+}
+
+void MainWindow::OnReferenceAuthorSelected()
+{
+    _ReferenceAuthorIndex = _ReferenceAuthorList->currentRow();
+    FillReferenceAuthorFields();
+}
+
+void MainWindow::OnReferenceAuthorEdited()
+{
+    xmlNodePtr Author = ShownReferenceAuthor();
+    if (Author == nullptr) {
+        return;
+    }
+    DocDocument::SetAuthorAttribute(
+        Author, "fullname", _ReferenceAuthorFullnameEdit->text());
+    DocDocument::SetAuthorAttribute(
+        Author, "initials", _ReferenceAuthorInitialsEdit->text());
+    DocDocument::SetAuthorAttribute(
+        Author, "surname", _ReferenceAuthorSurnameEdit->text());
+    DocDocument::SetAuthorOrganization(
+        Author, _ReferenceAuthorOrganizationEdit->text());
+    DocDocument::SetAuthorContactField(
+        Author, "email", _ReferenceAuthorEmailEdit->text());
+    DocDocument::SetAuthorContactField(
+        Author, "phone", _ReferenceAuthorPhoneEdit->text());
+    DocDocument::SetAuthorContactField(
+        Author, "uri", _ReferenceAuthorUriEdit->text());
+    // Keep the list row showing the name being typed.
+    QListWidgetItem* Item = _ReferenceAuthorList->currentItem();
+    if (Item != nullptr) {
+        QString Fullname = DocDocument::AuthorAttribute(Author, "fullname");
+        Item->setText(Fullname.trimmed().isEmpty()
+            ? tr("(unnamed)") : Fullname);
+    }
+    SetModified(true);
+}
+
+void MainWindow::OnReferenceAuthorRoleChanged()
+{
+    xmlNodePtr Author = ShownReferenceAuthor();
+    if (Author == nullptr) {
+        return;
+    }
+    DocDocument::SetAuthorAttribute(
+        Author, "role",
+        _ReferenceEditorRadio->isChecked() ? QStringLiteral("editor") : QString());
+    SetModified(true);
 }
 
 void MainWindow::FillSectionForm()

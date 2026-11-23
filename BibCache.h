@@ -35,6 +35,9 @@ struct BibCacheEntry
     QString Title;   ///< The reference title, when the file carries one.
     QString Fetched; ///< When it was fetched, ISO date.
     qint64 Size = 0; ///< The cached file size in bytes.
+    /// The anchors the file provides: its own anchor first, then
+    /// the anchors of the references inside it when it is a group.
+    QStringList Anchors;
 };
 
 /**
@@ -59,8 +62,11 @@ public:
     /**
      * @brief The default cache folder.
      *
-     * The shared CoOp folder beside the schemas and dictionaries:
-     * %APPDATA%\RiverExplorer\CoOp\Bibliography on Windows.
+     * The InternetDraftEditor folder under the RiverExplorer
+     * configuration folder:
+     * %APPDATA%\RiverExplorer\InternetDraftEditor\Bibliography
+     * on Windows. (Before 2026-11-23 the default was the CoOp
+     * app's folder; a cache never moved is carried over once.)
      * @return The default folder path.
      */
     static QString DefaultLocation();
@@ -90,6 +96,28 @@ public:
      * @return The title, or empty.
      */
     QString CachedTitle(const QString& Url) const;
+
+    /**
+     * @brief The anchor the cached file carries, or empty when it is not cached.
+     *
+     * The anchor comes from the fetched file itself, not the
+     * file name: a BCP include is BCP14, not BCP.14.
+     * @param Url The address.
+     * @return The anchor, or empty.
+     */
+    QString CachedAnchor(const QString& Url) const;
+
+    /**
+     * @brief The anchors the cached file provides, or empty when it is not cached.
+     *
+     * The file's own anchor first, then the anchors of the
+     * references inside it when it is a group: BCP14 provides
+     * BCP14 and RFC2119, so a document holding both would carry
+     * the RFC2119 anchor twice after expansion.
+     * @param Url The address.
+     * @return The provided anchors, or empty.
+     */
+    QStringList CachedAnchors(const QString& Url) const;
 
     /**
      * @brief Fetches the addresses that are not cached yet.
@@ -173,7 +201,7 @@ private:
     void OnReplyFinished(QNetworkReply* Reply, const QString& Url,
                          const QString& FileName);
     bool ParseReferenceFile(const QString& Path, QString& Anchor,
-                            QString& Title) const;
+                            QString& Title, QStringList& Anchors) const;
 
     QNetworkAccessManager* _Network;
     QString _Location;

@@ -365,10 +365,13 @@ the text of the document goes.
 
 ## Help menu (Bug 323)
 
-- The Help menu holds Legend and About ProtocolDocEditor. Legend
+- The Help menu holds Legend, Feedback, and About ProtocolDocEditor. Legend
   lists what the text editor's special characters mean: the Line
   Break and Vertical Space markers, the Index Entry marker, the
-  soft line break, and list markers. About shows the version, a
+  soft line break, and list markers. Feedback opens the GitHub
+  issues page (https://github.com/RiverExplorer/InternetDraftEditor/issues)
+  in the default browser. The first time the app starts, a
+  one-time note points at Help > Feedback. About shows the version, a
   one-line description, the copyright, and the MIT license text,
   in the same shape as the CoOp editor's About box.
 
@@ -564,8 +567,12 @@ the text of the document goes.
 ## References (Bugs 404-411)
 
 - The outline grows under Back: References holds one node per
-  list (by name), each list holds its entries (anchor and title),
-  and each entry holds its authors. A file with a single
+  list (by name), each list holds its entries, and each entry's
+  label leads with the words that cite it (the text the author
+  tagged when they marked it as a reference, up to three), then
+  the anchor and title; an entry nothing cites keeps its plain
+  label. The authors no longer list under an entry: they edit
+  on the entry form. A file with a single
   "References" list loads as one editable list. A new draft
   starts with the IETF form of the lists: one outer
   "References" list holding a "Normative References" list and
@@ -576,7 +583,9 @@ the text of the document goes.
   Either list, and either entry, can be removed when not needed.
 - A list page edits the list name and offers Add Entry, Add
   Nested List, Remove List (which removes its entries too), and
-  Up and Down to reorder the lists among their siblings.
+  Up and Down to reorder the lists among their siblings. When
+  an included reference is picked in the outline, the list page
+  names it and offers Remove Included Reference for it.
 - A nested list shows under its parent list in the outline, and
   edits on the same list and entry pages as a top-level list.
   A list holds either nested lists or entries, never both, so
@@ -599,16 +608,28 @@ the text of the document goes.
   range), the stream pulldown (blank, IETF, IAB, IRTF,
   independent, editorial), a series info table (series name and
   value, with Add and Remove), a pulldown to move the entry to
-  another list, and Add Author, Remove Entry, Up, and Down.
-- A reference author edits on the same author page as a draft
-  author: full name, initials, surname, organization, email,
-  phone, URI, postal address, and role. A reference author can
-  always be removed; a draft still needs at least one author.
+  another list, the authors, and Add Author, Remove Author,
+  Remove Entry, Up, and Down.
+- A reference's authors edit on the entry form itself: a list of
+  the authors (a reference can have more than one) with the full
+  name, initials, surname, organization, email, phone, URI, and
+  role of the selected one. The postal address a reference
+  author carries in the file is kept on save but not edited on
+  the entry form. A draft author still edits on the author page,
+  with the postal address; a draft still needs at least one
+  author. A reference author can always be removed.
 - Saving requires every entry to have an anchor, and anchors
   must be unique among the reference lists and entries. The
   check covers only reference anchors, since the editor does
   not edit section anchors; a clash with one of those is left
-  to schema validation. The check walks nested lists too.
+  to schema validation. The check walks nested lists too, and
+  sees inside a group include: an anchor carried twice (a group
+  include providing the same anchor as another reference, BCP14
+  providing RFC2119 alongside the RFC2119 include) is reported
+  at validation, naming both references, and one must be
+  removed. Neither a manual entry nor an include is removed
+  while a cross-reference still cites it: the editor says how
+  many citations stand.
 - Kept, not edited yet: reference groups, display names, the
   notes after an entry's front matter (annotation, refcontent,
   and the like), the quoting and derived-anchor attributes,
@@ -622,14 +643,22 @@ the text of the document goes.
   the body, right-click, References. New > Normative or
   Informative creates the entry in that list and cites it;
   Internal picks a section, figure, or table by title and
-  cites it; Existing cites an entry already in the picked
+  cites it — a section shows its outline number in front of
+  its title, as in the outline ("1.2 Terminology (Section)");
+  Existing cites an entry already in the picked
   list. The highlighted text stays as the cross-reference's
   content: <xref target="RFC4324">[iCal]</xref> shows as
   [iCal] and points at RFC4324. The anchor carries no
   brackets (iCal); the citation shows as [iCal] in the
   rendered output. The tag menu's Cross-Reference, External
   Link, and Relative Reference already wrap a selection the
-  same way. An RFC number (RFC4324, with or without spaces
+  same way. After a reference goes in, the caret sits just
+  after it in plain text, so typing continues after the link
+  instead of joining it; the same holds for a link wrapped
+  from the tag menu. The caret keeps that behaviour whenever
+  it lands just after a link — clicking at the end of the line
+  or pressing End, for example — while a caret inside a link
+  still extends the link text when you type there. An RFC number (RFC4324, with or without spaces
   or brackets) is written as an xi:include under the picked
   list, with xmlns:xi declared on the root when missing:
   xml2rfc pulls the full reference from its database, so no
@@ -643,26 +672,70 @@ the text of the document goes.
   author enters the data in the references section, the
   editor updates the <xref> values: changing a reference
   entry's anchor renames the target on every <xref> that
-  cited it. When the anchor already exists, the existing
-  entry is cited instead of a duplicate. A file with no back
+  cited it. When the anchor is already provided, by a manual
+  entry, by an include, or inside a group include (BCP14
+  provides RFC2119), the existing reference is cited instead
+  of a duplicate; an RFC include is fetched first so the
+  anchors it provides are known before it is added. A file with no back
   matter gains the nested IETF form (outer References with
   both nested lists, empty). A section, figure, or table
   with no anchor gets one derived from its title when
   picked. The Existing branches list included references
   too, by the anchor their href carries. A file with
-  xi:include entries passes File > Validate once the
-  includes are resolved: the editor fetches each bibxml file
-  over HTTPS into the bibliography cache (Settings >
-  Bibliography...) and leaves out the errors a resolved
+  xi:include entries passes File > Validate and the check on
+  opening once the includes are resolved: the editor fetches
+  each bibxml file over HTTPS into the bibliography cache
+  (Settings > Bibliography...) when the file is opened or
+  validated, and leaves out the errors a resolved
   include explains, so the report stays about the file
   itself and its line numbers match the file. An include
   that could not be fetched keeps its errors, with a plain
   note saying so. The file itself keeps the xi:include.
   Included references list in the outline under their list;
-  a cached one shows its real title ("Calendar Access
-  Protocol (RFC4324)"), an unfetched one the anchor with
-  "(included)". Clicking one shows the list, since an
-  included reference has no entry form.
+  a cached one shows its anchor first, then its real title
+  ("RFC4324 - Calendar Access Protocol (CAP)"), an unfetched
+  one the anchor with "(included)". Clicking one shows the list, since an
+  included reference has no entry form; the list page offers
+  Remove Included Reference for the selected include. The top
+  of the entry page, and the top of the list page for a picked
+  include, carries Normative and Informative radios: picking
+  one moves that reference into the Normative References or
+  Informative References list under its outer list, creating
+  that list when it is not there yet. A list holds nested lists
+  or entries, never both, so moving the first entry leaves the
+  outer list mixed until the last direct entry moves; the file
+  is schema-valid again once every entry has a section.
+  Settings > Bibliography... manages the cache: the table lists
+  every cached entry with its title and anchor, the target name
+  this document cites it by (blank when the document does not
+  cite it — the name belongs to the document, not the cache),
+  the address it was fetched from, when, and its size. Refresh
+  fetches the selected entries again, Delete removes them,
+  Clear All empties the cache. Add fetches a new entry: type an
+  RFC number (2119, or RFC 2119) and it is looked up at
+  bib.ietf.org, or type a full bibliography address. The cache
+  lives under %APPDATA%\RiverExplorer\InternetDraftEditor\
+  Bibliography; a cache from the old CoOp folder is carried
+  over the first time the editor runs. Browse moves it (Copy
+  carries the entries over, Delete throws them away).
+  View Published... looks up published documents instead of
+  the draft: RFC asks for the number and offers the XML,
+  HTML, text, and PDF formats that actually exist for that
+  RFC (an old RFC has no XML or PDF); ID asks for the title
+  and the version separately and offers the formats that
+  exist for that draft. Check finds the formats; View
+  downloads the picked one to a temporary file and opens it
+  with the system viewer. ID Difference asks for the draft
+  name and two versions, fetches the two text files, and
+  shows the differences in a window: three spaces before a
+  line that is the same in both versions, the older version's
+  number before a line only the older version has, the newer
+  version's number before a line only the newer version has.
+  All three dialogs remember the last values typed and the
+  last format picked; Clear empties the dialog and forgets
+  them. The Internet-Draft dialogs are wider, since draft
+  titles are often wide. The differences window has Save As, defaulting to
+  title-old-new.txt in the Documents folder.
 
 ## Front Matter (Bugs 332-359)
 

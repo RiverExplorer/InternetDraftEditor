@@ -2515,12 +2515,22 @@ static bool TreeHasAnchor(xmlNodePtr Node, const QString& Anchor)
  * @brief Adds the section targets under these sections, outline order.
  * @param Sections The sections to list, borrowed.
  * @param Targets The targets to add to.
+ * @param Prefix The outline number of the parent section, empty
+ *        at the top level.
  */
 static void CollectSectionTargets(const QVector<xmlNodePtr>& Sections,
-                                  QVector<DocDocument::InternalTarget>& Targets)
+                                  QVector<DocDocument::InternalTarget>& Targets,
+                                  const QString& Prefix)
 {
-    for (xmlNodePtr Section : Sections) {
+    for (int i = 0; i < Sections.size(); ++i) {
+        xmlNodePtr Section = Sections[i];
         DocDocument::InternalTarget Target;
+        // The number is the outline number: each part one higher
+        // than the zero-based position, matching the numbers
+        // xml2rfc prints (1, 1.2). It is display only.
+        Target.Number = Prefix.isEmpty()
+            ? QString::number(i + 1)
+            : Prefix + QStringLiteral(".") + QString::number(i + 1);
         Target.Title = DocDocument::SectionTitle(Section);
         if (Target.Title.trimmed().isEmpty()) {
             Target.Title = QStringLiteral("(unnamed section)");
@@ -2529,7 +2539,8 @@ static void CollectSectionTargets(const QVector<xmlNodePtr>& Sections,
         Target.Anchor = DocDocument::NodeAttribute(Section, "anchor");
         Target.Node = Section;
         Targets.append(Target);
-        CollectSectionTargets(DocDocument::ChildSectionNodes(Section), Targets);
+        CollectSectionTargets(DocDocument::ChildSectionNodes(Section), Targets,
+                             Target.Number);
     }
 }
 
@@ -2572,7 +2583,7 @@ static void CollectFigureTableTargets(xmlNodePtr Node,
 QVector<DocDocument::InternalTarget> DocDocument::InternalTargets() const
 {
     QVector<InternalTarget> Targets;
-    CollectSectionTargets(TopSectionNodes(), Targets);
+    CollectSectionTargets(TopSectionNodes(), Targets, QString());
     CollectFigureTableTargets(RfcNode(), Targets);
     return Targets;
 }
@@ -2718,6 +2729,76 @@ void DocDocument::RenameXrefTargets(xmlNodePtr Root, const QString& OldTarget,
         return;
     }
     RenameXrefTargetsInTree(Root, OldTarget, NewTarget);
+}
+
+/**
+ * @brief Collects the texts of the cross-references to an anchor.
+ * @param Node The tree to walk, borrowed.
+ * @param Anchor The anchor the xrefs point at.
+ * @param Texts The texts found so far, distinct, in document order.
+ */
+static void CollectCitedTexts(xmlNodePtr Node, const QString& Anchor,
+                              QStringList& Texts)
+{
+    if (Node == nullptr) {
+        return;
+    }
+    if (IsElementKind(Node) &&
+        TextFromXmlChars(Node->name) == QLatin1String("xref") &&
+        DocDocument::NodeAttribute(Node, "target").trimmed() == Anchor) {
+        QString Text = DocDocument::NodeText(Node).trimmed();
+        if (!Text.isEmpty() && !Texts.contains(Text)) {
+            Texts.append(Text);
+        }
+    }
+    for (xmlNodePtr Child = Node->children; Child != nullptr;
+         Child = Child->next) {
+        CollectCitedTexts(Child, Anchor, Texts);
+    }
+}
+
+QStringList DocDocument::CitedTextsForAnchor(xmlNodePtr Root,
+                                             const QString& Anchor)
+{
+    QStringList Texts;
+    if (Root == nullptr || Anchor.trimmed().isEmpty()) {
+        return Texts;
+    }
+    CollectCitedTexts(Root, Anchor.trimmed(), Texts);
+    return Texts;
+}
+
+/**
+ * @brief Counts the cross-references to an anchor under a node.
+ * @param Node The tree to walk, borrowed.
+ * @param Anchor The anchor the citations point at.
+ * @return The number of citations under this node.
+ */
+static int CountCitationsInTree(xmlNodePtr Node, const QString& Anchor)
+{
+    if (Node == nullptr) {
+        return 0;
+    }
+    int Count = 0;
+    if (IsElementKind(Node) &&
+        (TextFromXmlChars(Node->name) == QLatin1String("xref") ||
+         TextFromXmlChars(Node->name) == QLatin1String("relref")) &&
+        DocDocument::NodeAttribute(Node, "target").trimmed() == Anchor) {
+        ++Count;
+    }
+    for (xmlNodePtr Child = Node->children; Child != nullptr;
+         Child = Child->next) {
+        Count += CountCitationsInTree(Child, Anchor);
+    }
+    return Count;
+}
+
+int DocDocument::CitationCountForAnchor(xmlNodePtr Root, const QString& Anchor)
+{
+    if (Root == nullptr || Anchor.trimmed().isEmpty()) {
+        return 0;
+    }
+    return CountCitationsInTree(Root, Anchor.trimmed());
 }
 
 QVector<xmlNodePtr> DocDocument::ReferenceAuthors(xmlNodePtr Entry)

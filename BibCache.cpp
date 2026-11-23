@@ -39,6 +39,29 @@ BibCache::BibCache(QObject* Parent)
     , _Location(Location())
     , _Pending(0)
 {
+    // The default moved out of the CoOp app's folder (2026-11-23):
+    // a cache the author never moved still lives at the old
+    // default, so carry it over once instead of leaving it behind
+    // to re-fetch. Only when no location was ever picked (the
+    // default is never written to settings, only a picked folder
+    // is), the new folder is still empty, and the old folder holds
+    // an index: then the move reuses MoveLocation, which copies
+    // the files and leaves the old folder empty.
+    QSettings Settings;
+    if (!Settings.contains(QString::fromLatin1(CacheLocationKey))) {
+        QString OldDefault = QDir(QStandardPaths::writableLocation(
+            QStandardPaths::GenericConfigLocation)).filePath(
+                QStringLiteral("RiverExplorer/CoOp/Bibliography"));
+        QString NewDefault = DefaultLocation();
+        if (QDir::cleanPath(_Location) == QDir::cleanPath(NewDefault)
+            && !QFile::exists(QDir(NewDefault).filePath(
+                    QString::fromLatin1(IndexFileName)))
+            && QFile::exists(QDir(OldDefault).filePath(
+                    QString::fromLatin1(IndexFileName)))) {
+            _Location = OldDefault;
+            MoveLocation(NewDefault, true);
+        }
+    }
     EnsureLocation();
     LoadIndex();
 }
@@ -48,7 +71,7 @@ QString BibCache::DefaultLocation()
     QString Config = QStandardPaths::writableLocation(
         QStandardPaths::GenericConfigLocation);
     return QDir(Config).filePath(
-        QStringLiteral("RiverExplorer/CoOp/Bibliography"));
+        QStringLiteral("RiverExplorer/InternetDraftEditor/Bibliography"));
 }
 
 QString BibCache::Location() const
@@ -75,7 +98,8 @@ bool BibCache::IsCached(const QString& Url) const
         }
         QString Anchor;
         QString Title;
-        return ParseReferenceFile(Path, Anchor, Title);
+        QStringList Anchors;
+        return ParseReferenceFile(Path, Anchor, Title, Anchors);
     }
     return false;
 }
@@ -88,6 +112,26 @@ QString BibCache::CachedTitle(const QString& Url) const
         }
     }
     return QString();
+}
+
+QString BibCache::CachedAnchor(const QString& Url) const
+{
+    for (const BibCacheEntry& Entry : _Entries) {
+        if (Entry.Url == Url) {
+            return Entry.Anchor;
+        }
+    }
+    return QString();
+}
+
+QStringList BibCache::CachedAnchors(const QString& Url) const
+{
+    for (const BibCacheEntry& Entry : _Entries) {
+        if (Entry.Url == Url) {
+            return Entry.Anchors;
+        }
+    }
+    return QStringList();
 }
 
 void BibCache::EnsureCached(const QStringList& Urls)
@@ -259,6 +303,10 @@ void BibCache::LoadIndex()
         Entry.Anchor = Row.value(QStringLiteral("anchor")).toString();
         Entry.Title = Row.value(QStringLiteral("title")).toString();
         Entry.Fetched = Row.value(QStringLiteral("fetched")).toString();
+        for (const QJsonValue& AnchorValue :
+             Row.value(QStringLiteral("anchors")).toArray()) {
+            Entry.Anchors.append(AnchorValue.toString());
+        }
         if (Entry.Url.isEmpty() || Entry.File.isEmpty()) {
             continue;
         }
@@ -273,7 +321,25 @@ void BibCache::LoadIndex()
             Pruned = true;
         }
     }
-    if (Pruned) {
+    // An entry written by an older index has no anchors list:
+    // read it from the file itself, so the clash check works
+    // without re-fetching.
+    bool Refilled = false;
+    for (BibCacheEntry& Entry : _Entries) {
+        if (!Entry.Anchors.isEmpty()) {
+            continue;
+        }
+        QString Anchor;
+        QString Title;
+        QStringList Anchors;
+        if (ParseReferenceFile(
+                QDir(_Location).filePath(Entry.File),
+                Anchor, Title, Anchors)) {
+            Entry.Anchors = Anchors;
+            Refilled = true;
+        }
+    }
+    if (Pruned || Refilled) {
         SaveIndex();
     }
 }
@@ -288,6 +354,8 @@ bool BibCache::SaveIndex()
         Row[QStringLiteral("anchor")] = Entry.Anchor;
         Row[QStringLiteral("title")] = Entry.Title;
         Row[QStringLiteral("fetched")] = Entry.Fetched;
+        Row[QStringLiteral("anchors")] =
+            QJsonArray::fromStringList(Entry.Anchors);
         Rows.append(Row);
     }
     QJsonObject Root;
@@ -416,7 +484,8 @@ void BibCache::OnReplyFinished(QNetworkReply* Reply, const QString& Url,
         } else {
             QString Anchor;
             QString Title;
-            if (!ParseReferenceFile(Path, Anchor, Title)) {
+            QStringList Anchors;
+            if (!ParseReferenceFile(Path, Anchor, Title, Anchors)) {
                 _Failed[Url] = tr("The downloaded file is not a reference.");
                 QFile::remove(Path);
             } else {
@@ -432,6 +501,7 @@ void BibCache::OnReplyFinished(QNetworkReply* Reply, const QString& Url,
                     Entry.File = FileName;
                     Entry.Anchor = Anchor;
                     Entry.Title = Title;
+                    Entry.Anchors = Anchors;
                     Entry.Fetched =
                         QDate::currentDate().toString(Qt::ISODate);
                     Entry.Size = QFileInfo(Path).size();
@@ -444,6 +514,7 @@ void BibCache::OnReplyFinished(QNetworkReply* Reply, const QString& Url,
                     Entry.File = FileName;
                     Entry.Anchor = Anchor;
                     Entry.Title = Title;
+                    Entry.Anchors = Anchors;
                     Entry.Fetched =
                         QDate::currentDate().toString(Qt::ISODate);
                     Entry.Size = QFileInfo(Path).size();
@@ -462,16 +533,18 @@ void BibCache::OnReplyFinished(QNetworkReply* Reply, const QString& Url,
 }
 
 bool BibCache::ParseReferenceFile(const QString& Path, QString& Anchor,
-                                  QString& Title) const
+                                  QString& Title, QStringList& Anchors) const
 {
     Anchor.clear();
     Title.clear();
+    Anchors.clear();
     QFile File(Path);
     if (!File.open(QIODevice::ReadOnly | QIODevice::Text)) {
         return false;
     }
     QXmlStreamReader Reader(&File);
     bool SawRoot = false;
+    bool IsGroup = false;
     while (!Reader.atEnd()) {
         Reader.readNext();
         if (!Reader.isStartElement()) {
@@ -488,11 +561,21 @@ bool BibCache::ParseReferenceFile(const QString& Path, QString& Anchor,
             if (Anchor.isEmpty()) {
                 return false;
             }
+            Anchors.append(Anchor);
             SawRoot = true;
-            if (Root == QStringLiteral("referencegroup")) {
-                return !Reader.hasError();
+            IsGroup = Root == QStringLiteral("referencegroup");
+        } else if (IsGroup &&
+                   (Reader.name() == QStringLiteral("reference") ||
+                    Reader.name() == QStringLiteral("referencegroup"))) {
+            // A group provides its own anchor and the anchors of
+            // the references inside it: BCP14 provides BCP14 and
+            // RFC2119. They are all needed to spot a clash.
+            QString Inner = Reader.attributes()
+                .value(QStringLiteral("anchor")).toString();
+            if (!Inner.isEmpty() && !Anchors.contains(Inner)) {
+                Anchors.append(Inner);
             }
-        } else if (Reader.name() == QStringLiteral("title")) {
+        } else if (!IsGroup && Reader.name() == QStringLiteral("title")) {
             Title = Reader.readElementText().trimmed();
             return !Reader.hasError();
         }

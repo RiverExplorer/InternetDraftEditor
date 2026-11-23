@@ -5,6 +5,7 @@
 
 #include "TextEditor.h"
 
+#include "BibCache.h"
 #include "SpellChecker.h"
 #include "SpellHighlighter.h"
 
@@ -5942,6 +5943,38 @@ static DocTagStack StackAtPosition(QTextDocument* Document, int Pos)
 }
 
 /**
+ * @brief Whether the two stacks hold the same link tag.
+ *
+ * Two adjacent links can share a tag name (two xrefs side by
+ * side), so the name alone does not say the caret is inside
+ * one link: the entries must match, attributes and all.
+ * @param Before The stack before the caret.
+ * @param After The stack after the caret.
+ * @param Name The link tag name.
+ * @return True when both stacks hold that tag with the same entry.
+ */
+static bool SameLink(const DocTagStack& Before, const DocTagStack& After,
+                     const QString& Name)
+{
+    const DocTagEntry* BeforeEntry = nullptr;
+    const DocTagEntry* AfterEntry = nullptr;
+    for (const DocTagEntry& Entry : Before) {
+        if (Entry.Name == Name) {
+            BeforeEntry = &Entry;
+            break;
+        }
+    }
+    for (const DocTagEntry& Entry : After) {
+        if (Entry.Name == Name) {
+            AfterEntry = &Entry;
+            break;
+        }
+    }
+    return BeforeEntry != nullptr && AfterEntry != nullptr &&
+        *BeforeEntry == *AfterEntry;
+}
+
+/**
  * @brief Returns the marker at a position, if the character is one.
  * @param Document The document.
  * @param Pos The character position.
@@ -5982,6 +6015,7 @@ TextEditor::TextEditor(QWidget* Parent)
     , _SrcPlaceholderHintBlock(-1)
     , _SpellChecker(nullptr)
     , _Document(nullptr)
+    , _BibCache(nullptr)
     , _SpellHighlighter(nullptr)
 {
     _TextEdit = new DocTextEdit(this);
@@ -6093,6 +6127,8 @@ TextEditor::TextEditor(QWidget* Parent)
             this, &TextEditor::OnShowMarkersToggled);
     connect(_TextEdit, &QTextEdit::cursorPositionChanged,
             this, &TextEditor::UpdateBlockButtons);
+    connect(_TextEdit, &QTextEdit::cursorPositionChanged,
+            this, &TextEditor::OnCaretMoved);
     QHBoxLayout* ButtonRow = new QHBoxLayout();
     ButtonRow->addWidget(_BulletedButton);
     ButtonRow->addWidget(_NumberedButton);
@@ -7729,9 +7765,13 @@ static xmlNodePtr FindReferenceList(const DocDocument* Document,
  * entries by the anchor their href carries. Entries with no
  * anchor cannot be cited and are left out.
  * @param Group The <references> node, borrowed.
+ * @param Cache The bibliography cache, borrowed, or nullptr:
+ * an included reference's anchor comes from its cached file
+ * when it is cached, and from the file name otherwise.
  * @return The entries, in list order.
  */
-static QVector<QPair<QString, QString>> ReferenceListEntries(xmlNodePtr Group)
+static QVector<QPair<QString, QString>> ReferenceListEntries(
+    xmlNodePtr Group, const BibCache* Cache)
 {
     QVector<QPair<QString, QString>> Entries;
     if (Group == nullptr) {
@@ -7746,8 +7786,16 @@ static QVector<QPair<QString, QString>> ReferenceListEntries(xmlNodePtr Group)
         Entries.append(qMakePair(Anchor, DocDocument::ReferenceLabel(Entry)));
     }
     for (xmlNodePtr Include : DocDocument::ReferenceIncludeNodes(Group)) {
-        QString Anchor = DocDocument::ReferenceAnchorFromIncludeHref(
-            DocDocument::NodeAttribute(Include, "href"));
+        QString Href = DocDocument::NodeAttribute(Include, "href");
+        // The cached file carries the real anchor (BCP14, not
+        // BCP.14 from the file name); the derived anchor is
+        // only the fallback until it is fetched.
+        QString CachedAnchor = Cache != nullptr
+            ? Cache->CachedAnchor(Href)
+            : QString();
+        QString Anchor = CachedAnchor.isEmpty()
+            ? DocDocument::ReferenceAnchorFromIncludeHref(Href)
+            : CachedAnchor;
         if (Anchor.isEmpty()) {
             continue;
         }
@@ -7841,8 +7889,13 @@ void TextEditor::AddReferenceActions(QMenu* Menu)
         QStringList Items;
         QSet<QString> Seen;
         for (const DocDocument::InternalTarget& Target : Targets) {
-            QString Item = Target.Title + QStringLiteral(" (") +
-                Target.Kind + QStringLiteral(")");
+            // A section shows its outline number in front of its
+            // title, as in the outline; figures and tables carry
+            // no number here.
+            QString Item = Target.Number.isEmpty()
+                ? Target.Title
+                : Target.Number + QStringLiteral(" ") + Target.Title;
+            Item += QStringLiteral(" (") + Target.Kind + QStringLiteral(")");
             // QInputDialog returns the picked string, so two
             // targets with the same title and kind need
             // different strings.
@@ -7882,7 +7935,7 @@ void TextEditor::AddReferenceActions(QMenu* Menu)
             continue;
         }
         QVector<QPair<QString, QString>> Entries =
-            ReferenceListEntries(Group);
+            ReferenceListEntries(Group, _BibCache);
         if (Entries.isEmpty()) {
             ListMenu->setEnabled(false);
             continue;
@@ -8677,6 +8730,11 @@ void TextEditor::SetDocument(const DocDocument* Document)
     _Document = Document;
 }
 
+void TextEditor::SetBibCache(const BibCache* Cache)
+{
+    _BibCache = Cache;
+}
+
 void TextEditor::SelectedRange(int& Start, int& End) const
 {
     QTextCursor Cursor = _TextEdit->textCursor();
@@ -8689,6 +8747,40 @@ void TextEditor::SelectedRange(int& Start, int& End) const
     End = Cursor.selectionEnd();
 }
 
+/**
+ * @brief Puts the caret just after a link, with the format the
+ *        text would have without the link.
+ *
+ * Wrapping or inserting a link leaves the caret holding the
+ * link's format, so the next typed text joins the link. The
+ * caret goes just after the link with the link tag stripped
+ * from its format, so typing after the link is plain text.
+ * @param Edit The text edit (borrowed).
+ * @param End The document position just after the link.
+ * @param Tag The link tag to strip (xref, eref, relref, cref).
+ */
+static void PlaceCaretAfterTag(QTextEdit* Edit, int End, const QString& Tag)
+{
+    if (Edit == nullptr) {
+        return;
+    }
+    QTextCursor Cursor = Edit->textCursor();
+    Cursor.setPosition(End);
+    QTextCharFormat Plain = Cursor.charFormat();
+    DocTagStack Stack = StackOf(Plain);
+    if (StackHolds(Stack, Tag)) {
+        Stack = StackWithoutTag(Stack, Tag);
+        Plain.setProperty(DocStackProperty, StackToVariant(Stack));
+        ApplyStackVisuals(Plain, Stack);
+        QVariant MarkerValue = Plain.property(DocMarkerProperty);
+        if (MarkerValue.isValid()) {
+            ApplyMarkerVisuals(Plain, EntryFromVariant(MarkerValue));
+        }
+    }
+    Cursor.setCharFormat(Plain);
+    Edit->setTextCursor(Cursor);
+}
+
 void TextEditor::InsertXrefMarker(const QString& Anchor, int SelectionStart,
                                   int SelectionEnd)
 {
@@ -8696,6 +8788,7 @@ void TextEditor::InsertXrefMarker(const QString& Anchor, int SelectionStart,
     Entry.Name = QStringLiteral("xref");
     Entry.Attributes.append(
         QPair<QString, QString>(QStringLiteral("target"), Anchor));
+    int End = -1;
     if (SelectionStart < 0 || SelectionEnd <= SelectionStart) {
         // No text to cite: drop a bare marker at the cursor, as
         // the tag menu does. The References menu only offers
@@ -8705,16 +8798,21 @@ void TextEditor::InsertXrefMarker(const QString& Anchor, int SelectionStart,
         DocTagStack Stack = StackOf(Cursor.charFormat());
         Cursor.insertText(MarkerText(Entry), FormatForMarker(Stack, Entry));
         Cursor.endEditBlock();
-        _TextEdit->setTextCursor(Cursor);
-        return;
+        End = Cursor.position();
+    } else {
+        // The highlighted text stays as the cross-reference's
+        // content, the same way the tag menu wraps a selection in
+        // a Cross-Reference, External Link, or Relative Reference.
+        // A fragment that already holds a cross-reference is left
+        // alone: remove the old link first, then cite the new one.
+        ChangeStacks(SelectionStart, SelectionEnd,
+                     QStringLiteral("xref"), &Entry);
+        End = SelectionEnd;
     }
-    // The highlighted text stays as the cross-reference's
-    // content, the same way the tag menu wraps a selection in
-    // a Cross-Reference, External Link, or Relative Reference.
-    // A fragment that already holds a cross-reference is left
-    // alone: remove the old link first, then cite the new one.
-    ChangeStacks(SelectionStart, SelectionEnd,
-                 QStringLiteral("xref"), &Entry);
+    // The caret lands just after the reference, with the format
+    // the text would have without the link: typing after the
+    // reference is plain text, not more of the link.
+    PlaceCaretAfterTag(_TextEdit, End, QStringLiteral("xref"));
 }
 
 /**
@@ -9085,6 +9183,54 @@ void TextEditor::ToggleBlockList(const QString& Kind)
     // The button keeps keyboard focus after a click; hand it
     // back to the text so typing continues there.
     _TextEdit->setFocus();
+}
+
+void TextEditor::OnCaretMoved()
+{
+    QTextCursor Cursor = _TextEdit->textCursor();
+    if (Cursor.hasSelection()) {
+        return;
+    }
+    int Pos = Cursor.position();
+    if (Pos <= 0) {
+        return;
+    }
+    QTextDocument* Document = _TextEdit->document();
+    DocTagStack Before = StackAtPosition(Document, Pos - 1);
+    // The link tag on the character before the caret, if any.
+    QString Link;
+    for (const QString& Name :
+         {QStringLiteral("xref"), QStringLiteral("eref"),
+          QStringLiteral("relref"), QStringLiteral("cref")}) {
+        if (StackHolds(Before, Name)) {
+            Link = Name;
+            break;
+        }
+    }
+    if (Link.isEmpty()) {
+        return;
+    }
+    // Inside one link the character after the caret holds the
+    // same link, and typing there extends it, as it should.
+    // Just after the link it does not, so typing there is plain
+    // text: strip the link from the caret's format.
+    DocTagStack After = StackAtPosition(Document, Pos);
+    if (SameLink(Before, After, Link)) {
+        return;
+    }
+    QTextCharFormat Plain = Cursor.charFormat();
+    DocTagStack Stack = StackOf(Plain);
+    if (!StackHolds(Stack, Link)) {
+        return;
+    }
+    Stack = StackWithoutTag(Stack, Link);
+    Plain.setProperty(DocStackProperty, StackToVariant(Stack));
+    ApplyStackVisuals(Plain, Stack);
+    QVariant MarkerValue = Plain.property(DocMarkerProperty);
+    if (MarkerValue.isValid()) {
+        ApplyMarkerVisuals(Plain, EntryFromVariant(MarkerValue));
+    }
+    _TextEdit->setCurrentCharFormat(Plain);
 }
 
 void TextEditor::UpdateBlockButtons()
@@ -10839,7 +10985,16 @@ void TextEditor::WrapSelection(const QString& Name)
     if (!PromptForTag(Name, Entry)) {
         return;
     }
+    int End = Cursor.selectionEnd();
     ChangeStacks(Cursor.selectionStart(), Cursor.selectionEnd(), Name, &Entry);
+    // A wrapped link leaves the caret holding the link's format,
+    // so typing after it would join the link: put the caret just
+    // after it with the link stripped. Other tags keep the
+    // caret's format as it was.
+    if (Name == QStringLiteral("xref") || Name == QStringLiteral("eref") ||
+        Name == QStringLiteral("relref") || Name == QStringLiteral("cref")) {
+        PlaceCaretAfterTag(_TextEdit, End, Name);
+    }
 }
 
 void TextEditor::ToggleTag(const QString& Name, bool Active)

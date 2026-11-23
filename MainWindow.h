@@ -47,6 +47,7 @@ class QDialog;
 class QGroupBox;
 class QLabel;
 class QLineEdit;
+class QListWidget;
 class QMenu;
 class QPlainTextEdit;
 class QPushButton;
@@ -240,6 +241,45 @@ private slots:
                              const QString& ListName);
 
     /**
+     * @brief Finishes adding a new RFC reference, once its file is fetched.
+     *
+     * The fetch runs first so the anchors the file provides are
+     * known: when one is already provided (a group in the document
+     * carries it inside itself, BCP14 providing RFC2119), the
+     * existing reference is cited instead of adding a second copy.
+     * @param Editor The text editor that asked, borrowed.
+     * @param Group The list the include goes in, borrowed.
+     * @param Wanted The reference anchor.
+     * @param Href The bibliography address of the include.
+     * @param SelectionStart The start of the highlighted range, or -1.
+     * @param SelectionEnd The end of the highlighted range, or -1.
+     */
+    void FinishNewReference(TextEditor* Editor, xmlNodePtr Group,
+                            const QString& Wanted, const QString& Href,
+                            int SelectionStart, int SelectionEnd);
+
+    /**
+     * @brief The anchors the document's references provide, and what provides each.
+     *
+     * Manual entries provide their anchor; includes provide the
+     * anchors their cached file carries (a group provides its own
+     * anchor and its inner anchors), or the anchor derived from
+     * the file name until fetched.
+     * @return Each provided anchor, with the references that provide it, in document order.
+     */
+    QMap<QString, QStringList> ProvidedAnchorProviders() const;
+
+    /**
+     * @brief The first anchor in NewAnchors the document already provides.
+     * @param NewAnchors The anchors a new reference would provide.
+     * @param Clash Set to the clashing anchor, or empty.
+     * @param Provider Set to the reference that already provides it, or empty.
+     * @return True when one of the new anchors is already provided.
+     */
+    bool FindProvidedAnchorClash(const QStringList& NewAnchors,
+                                 QString& Clash, QString& Provider);
+
+    /**
      * @brief The nested reference list with this name, creating it when missing.
      *
      * The named list under the outer "References" list, creating
@@ -256,6 +296,11 @@ private slots:
      * @brief Removes the shown reference entry, after confirming.
      */
     void OnRemoveReferenceEntry();
+
+    /**
+     * @brief Removes the selected included reference, after confirming.
+     */
+    void OnRemoveReferenceInclude();
 
     /**
      * @brief Moves the shown reference entry up among its list's entries.
@@ -283,6 +328,26 @@ private slots:
     void OnReferenceMoveToGroupChanged();
 
     /**
+     * @brief Moves the shown reference entry to the picked section.
+     */
+    void OnReferenceSectionChanged();
+
+    /**
+     * @brief Moves the picked included reference to the picked section.
+     */
+    void OnReferenceIncludeSectionChanged();
+
+    /**
+     * @brief Moves a reference entry or an included reference into
+     *        the Normative or Informative nested list under its
+     *        current outer list, creating that list when needed.
+     * @param Item The entry or include node to move (borrowed).
+     * @param Normative True for the Normative section, false for
+     *        the Informative section.
+     */
+    void MoveReferenceToSection(xmlNodePtr Item, bool Normative);
+
+    /**
      * @brief Adds a series info row to the shown reference entry.
      */
     void OnAddSeriesInfo();
@@ -302,6 +367,30 @@ private slots:
      *        for the full name first.
      */
     void OnAddReferenceAuthor();
+
+    /**
+     * @brief Removes the selected author of the shown reference
+     *        entry, after confirming.
+     */
+    void OnRemoveReferenceAuthor();
+
+    /**
+     * @brief Shows the selected author of the shown reference
+     *        entry in the author fields on the entry form.
+     */
+    void OnReferenceAuthorSelected();
+
+    /**
+     * @brief Writes the author fields on the reference entry form
+     *        into the selected author of the shown entry.
+     */
+    void OnReferenceAuthorEdited();
+
+    /**
+     * @brief Writes the role choice on the reference entry form
+     *        into the selected author of the shown entry.
+     */
+    void OnReferenceAuthorRoleChanged();
 
     /**
      * @brief Runs the new-draft wizard and shows the new document.
@@ -350,6 +439,24 @@ private slots:
     void OnBibliography();
 
     /**
+     * @brief Asks for an RFC number and opens the published RFC
+     *        in the system viewer, in a format that exists for it.
+     */
+    void OnViewPublishedRfc();
+
+    /**
+     * @brief Asks for an Internet-Draft title and version and opens
+     *        the published draft in the system viewer.
+     */
+    void OnViewPublishedId();
+
+    /**
+     * @brief Asks for a draft name and two versions and shows the
+     *        differences between them.
+     */
+    void OnViewPublishedIdDiff();
+
+    /**
      * @brief Shows what the text editor's special characters mean.
      */
     void OnLegend();
@@ -364,6 +471,11 @@ private slots:
      *        copyright and license.
      */
     void OnAbout();
+
+    /**
+     * @brief Opens the GitHub issues page in the default browser.
+     */
+    void OnFeedback();
 
     /**
      * @brief Remembers the checked output formats when one changes.
@@ -573,9 +685,61 @@ private:
     void FillReferenceGroupForm();
 
     /**
+     * @brief The anchor an xi:include carries: the cached file's
+     *        own anchor, or the anchor derived from its file name
+     *        until it is fetched.
+     * @param Include The <xi:include> node, borrowed.
+     * @return The anchor, or empty.
+     */
+    QString IncludeAnchor(xmlNodePtr Include);
+
+    /**
+     * @brief The label for an xi:include: its title and anchor,
+     *        with the words that cite it first.
+     * @param Include The <xi:include> node, borrowed.
+     * @return The label.
+     */
+    QString IncludeLabel(xmlNodePtr Include);
+
+    /**
+     * @brief The cited-words prefix for a reference label.
+     *
+     * The distinct words that cite the anchor, up to three, plus
+     * " - "; empty when nothing cites the anchor.
+     * @param Anchor The anchor the xrefs point at.
+     * @return The prefix, or empty.
+     */
+    QString CitedLabelPrefix(const QString& Anchor);
+
+    /**
+     * @brief True when no cross-reference cites the anchor.
+     *
+     * When the anchor is still cited, warns the author how many
+     * citations stand and returns false: a cited reference must
+     * not be removed while the citations stand.
+     * @param Anchor The anchor to check.
+     * @return True when nothing cites the anchor.
+     */
+    bool ReferenceAnchorUnused(const QString& Anchor);
+
+    /**
      * @brief Fills the reference entry form with the shown entry.
      */
     void FillReferenceEntryForm();
+
+    /**
+     * @brief Fills the author fields on the reference entry form
+     *        with the selected author of the shown entry.
+     */
+    void FillReferenceAuthorFields();
+
+    /**
+     * @brief Returns the selected author of the shown reference
+     *        entry.
+     * @return The author node (borrowed), or nullptr when none is
+     *         selected.
+     */
+    xmlNodePtr ShownReferenceAuthor();
 
     /**
      * @brief Returns the author the author form shows: a draft
@@ -745,6 +909,18 @@ private:
     int FilterIncludeErrors(DocValidationResult& Result);
 
     /**
+     * @brief Reports the anchors more than one reference provides.
+     *
+     * A group include and another reference can both provide the
+     * same anchor (BCP14 provides RFC2119, and so does the RFC2119
+     * include); the duplicate fails validation after expansion, so
+     * it is reported plainly here instead of as a bare duplicate-ID
+     * error.
+     * @param Result The validation result to append to, in place.
+     */
+    void ReportAnchorCollisions(DocValidationResult& Result);
+
+    /**
      * @brief Appends text to the run log dialog.
      * @param Text The text to append.
      */
@@ -761,6 +937,8 @@ private:
     int _AuthorEntry;
     QString _ReferenceGroupPath;
     int _ReferenceEntryIndex;
+    int _ReferenceAuthorIndex;
+    int _ReferenceIncludeIndex;
     QString _SectionPath;
     bool _RunFailed;
 
@@ -811,6 +989,10 @@ private:
     QPushButton* _AddReferenceEntryButton;
     QPushButton* _AddNestedListButton;
     QLabel* _ReferenceGroupPreservedLabel;
+    QLabel* _ReferenceIncludeLabel;
+    QPushButton* _RemoveReferenceIncludeButton;
+    QRadioButton* _ReferenceIncludeNormativeRadio;
+    QRadioButton* _ReferenceIncludeInformativeRadio;
     QLineEdit* _ReferenceAnchorEdit;
     QLineEdit* _ReferenceTargetEdit;
     QLineEdit* _ReferenceTitleEdit;
@@ -820,6 +1002,19 @@ private:
     QComboBox* _ReferenceStreamCombo;
     QTableWidget* _ReferenceSeriesTable;
     QComboBox* _ReferenceMoveToCombo;
+    QRadioButton* _ReferenceNormativeRadio;
+    QRadioButton* _ReferenceInformativeRadio;
+    QListWidget* _ReferenceAuthorList;
+    QLineEdit* _ReferenceAuthorFullnameEdit;
+    QLineEdit* _ReferenceAuthorInitialsEdit;
+    QLineEdit* _ReferenceAuthorSurnameEdit;
+    QLineEdit* _ReferenceAuthorOrganizationEdit;
+    QLineEdit* _ReferenceAuthorEmailEdit;
+    QLineEdit* _ReferenceAuthorPhoneEdit;
+    QLineEdit* _ReferenceAuthorUriEdit;
+    QRadioButton* _ReferenceAuthorRadio;
+    QRadioButton* _ReferenceEditorRadio;
+    QPushButton* _RemoveReferenceAuthorButton;
     QLabel* _ReferenceEntryPreservedLabel;
     QLineEdit* _SettingsTitleEdit;
     QLineEdit* _SettingsTitleAbbrevEdit;

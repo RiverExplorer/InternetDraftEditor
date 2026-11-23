@@ -76,6 +76,8 @@ class QPushButton;
 class QTabWidget;
 class QTextEdit;
 class QToolButton;
+
+class BibCache;
 class SpellChecker;
 class SpellHighlighter;
 
@@ -186,6 +188,18 @@ public:
      * @param Document The document, borrowed, or nullptr.
      */
     void SetDocument(const DocDocument* Document);
+
+    /**
+     * @brief Sets the bibliography cache the References menu reads anchors from.
+     *
+     * The pointer is borrowed, never owned, and only read: an
+     * included reference's anchor comes from its cached file
+     * (BCP14, not BCP.14 from the file name) when it is
+     * cached, and from the file name otherwise. May be
+     * nullptr, in which case the file name is used.
+     * @param Cache The cache, borrowed, or nullptr.
+     */
+    void SetBibCache(const BibCache* Cache);
 
     /**
      * @brief Wraps the given range in a cross-reference to the anchor.
@@ -759,6 +773,15 @@ private:
     void UpdateBlockButtons();
 
     /**
+     * @brief Keeps typing after a link plain: when the caret
+     *        lands just after a link, its format loses the link
+     *        tag, so the next typed text is plain text and not
+     *        more of the link. Inside a link the caret is left
+     *        alone, so editing the link text still extends it.
+     */
+    void OnCaretMoved();
+
+    /**
      * @brief Wraps the selection in a tag.
      * @param Name The tag name.
      */
@@ -864,6 +887,7 @@ private:
     int _SrcPlaceholderHintBlock;
     SpellChecker* _SpellChecker;
     const DocDocument* _Document;
+    const BibCache* _BibCache;
     SpellHighlighter* _SpellHighlighter;
 };
 

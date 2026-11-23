@@ -516,16 +516,47 @@ public:
     static QString ReferenceLabel(xmlNodePtr Entry);
 
     /**
+     * @brief The distinct texts that cite an anchor.
+     *
+     * The text contents of the <xref> elements under Root whose
+     * target is Anchor, in document order: the words the author
+     * tagged when they marked something as a reference. Empty
+     * contents are skipped, and a text that appears more than
+     * once is listed once.
+     * @param Root The tree to walk, borrowed.
+     * @param Anchor The anchor the xrefs point at.
+     * @return The citing texts, distinct, in document order.
+     */
+    static QStringList CitedTextsForAnchor(xmlNodePtr Root,
+                                           const QString& Anchor);
+
+    /**
+     * @brief How many cross-references cite an anchor.
+     *
+     * Counts the <xref> and <relref> elements under Root whose
+     * target is Anchor, with content or without: a reference
+     * with any count at all is in use and must not be removed
+     * while the citations stand.
+     * @param Root The tree to walk, borrowed.
+     * @param Anchor The anchor the citations point at.
+     * @return The number of citations.
+     */
+    static int CitationCountForAnchor(xmlNodePtr Root,
+                                      const QString& Anchor);
+
+    /**
      * @brief One internal target a cross-reference can point at.
      *
      * Title is the section, figure, or table title as the author
-     * sees it; Kind names which it is; Anchor is its anchor, which
-     * may be empty when the editor has not given it one yet; Node
-     * is the element, borrowed.
+     * sees it; Number is a section's outline number (1, 1.2),
+     * empty for figures and tables; Kind names which it is;
+     * Anchor is its anchor, which may be empty when the editor
+     * has not given it one yet; Node is the element, borrowed.
      */
     struct InternalTarget
     {
         QString Title;
+        QString Number;
         QString Kind;
         QString Anchor;
         xmlNodePtr Node;
