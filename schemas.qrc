@@ -1,0 +1,11 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+    <qresource prefix="/">
+        <file>schemas/v2.rng</file>
+        <file>schemas/rfc7991.rng</file>
+        <file>schemas/referencegroup.rng</file>
+        <file>schemas/reference.rng</file>
+        <file>schemas/SVG-1.2-RFC.rng</file>
+        <file>schemas/v3.rng</file>
+    </qresource>
+</RCC>

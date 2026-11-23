@@ -1,0 +1,8 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+    <qresource prefix="/">
+        <file>templates/standard.xml</file>
+        <file>templates/bare.xml</file>
+        <file>templates/annotated.xml</file>
+    </qresource>
+</RCC>
