@@ -1,3 +1,9 @@
+// Copyright (c) 2026 RiverExplorer LLC
+// RiverExplorer is a registered trademark of Douglas Mark Royer.
+//
+// This software is released under the MIT License.
+// See LICENSE.md for the full license text.
+
 /**
  * @file TextEditor.h
  * @brief Two-tab text editor for section bodies and the abstract
@@ -124,6 +130,48 @@ public:
     };
 
     /**
+     * @brief How a cross-reference is shown: the form of the <xref>.
+     *
+     * These are the forms published RFCs actually use (RFC 8933,
+     * RFC 8773, RFC 8792). LinkText wraps the highlighted words
+     * as the link's content; Bracket leaves the words plain and
+     * puts an empty xref after them, which renders as the
+     * bracketed anchor; SectionOf and SectionBare point at a
+     * section of the target, rendering as "Section N of [X]" and
+     * "Section N"; Counter shows only the target's number. The
+     * forms the spec defines but no published RFC uses
+     * (format="title", format="none", sectionFormat "comma" and
+     * "parens", pageno, relative) are deliberately not offered.
+     */
+    enum class XrefForm
+    {
+        LinkText = 0,
+        Bracket = 1,
+        SectionOf = 2,
+        SectionBare = 3,
+        Counter = 4
+    };
+
+    /**
+     * @brief Asks which form a cross-reference should take.
+     *
+     * Shows the forms published RFCs use, with the anchor in
+     * each label so the choice is concrete. A section form
+     * asks for the section number afterwards. Returns false
+     * when the user cancels either prompt, in which case the
+     * form and section are left alone and nothing is cited.
+     * @param Parent The dialog parent.
+     * @param Anchor The cross-reference target.
+     * @param Highlight The highlighted words, or empty.
+     * @param Form Set to the picked form.
+     * @param Section Set to the section number, for a section form.
+     * @return False when the user cancelled.
+     */
+    static bool PickXrefForm(QWidget* Parent, const QString& Anchor,
+                             const QString& Highlight, XrefForm& Form,
+                             QString& Section);
+
+    /**
      * @brief Creates the text editor.
      * @param Parent The parent widget, or nullptr.
      */
@@ -178,6 +226,20 @@ public:
     void Clear();
 
     /**
+     * @brief The number of text blocks currently in the Text tab.
+     * @return The block count of the text document.
+     */
+    int BlockCount() const;
+
+    /**
+     * @brief A one-line report of the last option-marker sweep
+     * (Bug 502 diagnostic: setting, blocks scanned, first source
+     * blocks, gears inserted and removed).
+     * @return The report text.
+     */
+    QString MarkerSweepReport() const;
+
+    /**
      * @brief Gives the editor the document to read references from.
      *
      * The pointer is borrowed, never owned, and only read: the
@@ -202,6 +264,34 @@ public:
     void SetBibCache(const BibCache* Cache);
 
     /**
+     * @brief Inserts a cross-reference to the anchor, in the given form.
+     *
+     * LinkText wraps the given range in the cross-reference, so
+     * the highlighted text stays as its content:
+     * <xref target="RFC4324">[iCal]</xref> shows as [iCal] and
+     * points at RFC4324. The other forms are empty xrefs (no
+     * content): Bracket puts a bare marker after the range,
+     * which renders as the bracketed anchor, so the words stay
+     * plain and the reference follows them; SectionOf and
+     * SectionBare put a bare marker carrying the section after
+     * the range; Counter puts a bare marker carrying
+     * format="counter" after the range. With no selection (both
+     * ends -1, or an empty range) a bare marker is dropped at
+     * the cursor instead, for every form. The range is passed
+     * in rather than read from the live cursor: the outline
+     * rebuild reloads the section body and drops the live
+     * selection, so a range read after the rebuild lands at
+     * the start of the section instead of the highlight.
+     * @param Anchor The cross-reference target.
+     * @param Section The section number, for a section form.
+     * @param Form Which form the cross-reference takes.
+     * @param SelectionStart The first character of the range, or -1.
+     * @param SelectionEnd The character after the range, or -1.
+     */
+    void InsertXref(const QString& Anchor, const QString& Section,
+                    XrefForm Form, int SelectionStart, int SelectionEnd);
+
+    /**
      * @brief Wraps the given range in a cross-reference to the anchor.
      *
      * The highlighted text stays as the cross-reference's
@@ -223,11 +313,37 @@ public:
                           int SelectionEnd);
 
     /**
+     * @brief Inserts a cross-reference carrying the given text, at the cursor.
+     *
+     * The text is put in at the cursor and wrapped in the
+     * cross-reference, so the reference shows words instead of
+     * the bare marker (U+FFFD) a marker with no content shows
+     * as. The caret lands just after the reference, with the
+     * format the text would have without the link: typing after
+     * the reference is plain text, not more of the link. Only
+     * the LinkText form inserts the text; the other forms are
+     * empty xrefs, so they drop a bare marker at the cursor
+     * instead and the text is ignored.
+     * @param Anchor The cross-reference target.
+     * @param Text The words the reference shows, for LinkText.
+     * @param Section The section number, for a section form.
+     * @param Form Which form the cross-reference takes.
+     */
+    void InsertXrefWithText(const QString& Anchor, const QString& Text,
+                            const QString& Section, XrefForm Form);
+
+    /**
      * @brief The current selection range, or -1/-1 when there is none.
      * @param Start Set to the first selected character, or -1.
      * @param End Set to the character after the selection, or -1.
      */
     void SelectedRange(int& Start, int& End) const;
+
+    /**
+     * @brief The currently selected text, or empty when there is none.
+     * @return The selected words.
+     */
+    QString SelectedText() const;
 
     /**
      * @brief Makes the option markers match the document and the
@@ -884,6 +1000,12 @@ private:
     QCheckBox* _ShowMarkersCheck;
     QString _BlockKind;
     bool _SettingParagraphs;
+    // Last option-marker sweep counts (Bug 502 diagnostic).
+    bool _DiagMarkersShown;
+    int _DiagMarkersBlocks;
+    int _DiagMarkersSourceFirst;
+    int _DiagMarkersGearsInserted;
+    int _DiagMarkersGearsRemoved;
     int _SrcPlaceholderHintBlock;
     SpellChecker* _SpellChecker;
     const DocDocument* _Document;

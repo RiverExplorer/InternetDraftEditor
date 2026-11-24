@@ -1,3 +1,9 @@
+// Copyright (c) 2026 RiverExplorer LLC
+// RiverExplorer is a registered trademark of Douglas Mark Royer.
+//
+// This software is released under the MIT License.
+// See LICENSE.md for the full license text.
+
 /**
  * @file DocValidator.h
  * @brief Validates a draft XML file against the RFCXML v3 schema.

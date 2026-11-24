@@ -1,3 +1,9 @@
+// Copyright (c) 2026 RiverExplorer LLC
+// RiverExplorer is a registered trademark of Douglas Mark Royer.
+//
+// This software is released under the MIT License.
+// See LICENSE.md for the full license text.
+
 /**
  * @file DocModel.h
  * @brief Document model for the ProtocolDocEditor: the draft as a libxml2 tree.
@@ -509,11 +515,17 @@ public:
      * @brief The outline label for a reference entry.
      *
      * The anchor, plus " - " plus the title when the title is
-     * non-empty; the title alone when the anchor is empty.
+     * non-empty; the title alone when the anchor is empty. A
+     * display name, when given, stands in place of the anchor:
+     * an entry mapped by a displayreference lists under the
+     * name readers see, not the anchor they never see.
      * @param Entry The <reference> node, borrowed.
+     * @param DisplayName The display name for the entry's anchor,
+     *        or empty to use the anchor itself.
      * @return The label.
      */
-    static QString ReferenceLabel(xmlNodePtr Entry);
+    static QString ReferenceLabel(xmlNodePtr Entry,
+                                  const QString& DisplayName = QString());
 
     /**
      * @brief The distinct texts that cite an anchor.

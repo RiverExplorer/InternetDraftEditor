@@ -1,3 +1,9 @@
+// Copyright (c) 2026 RiverExplorer LLC
+// RiverExplorer is a registered trademark of Douglas Mark Royer.
+//
+// This software is released under the MIT License.
+// See LICENSE.md for the full license text.
+
 /**
  * @file MainWindow.h
  * @brief Main window for the ProtocolDocEditor (goal #1).
@@ -39,6 +45,7 @@
 #include "DocModel.h"
 #include "DocValidator.h"
 #include "SpellChecker.h"
+#include "TextEditor.h"
 
 class QAction;
 class QCheckBox;
@@ -56,7 +63,6 @@ class QStackedWidget;
 class QTableWidget;
 class QTreeWidget;
 class QTreeWidgetItem;
-class TextEditor;
 
 /**
  * @brief The main window: outline left, details right.
@@ -217,6 +223,23 @@ private slots:
     void OnReferenceGroupNameEdited(const QString& Text);
 
     /**
+     * @brief Adds a display name for a reference, asking for the
+     *        reference and the name to show first (Bug 405).
+     */
+    void OnAddDisplayReference();
+
+    /**
+     * @brief Removes the selected display name (Bug 405).
+     */
+    void OnRemoveDisplayReference();
+
+    /**
+     * @brief Writes the edited display names into the document
+     *        (Bug 405).
+     */
+    void OnDisplayReferenceChanged();
+
+    /**
      * @brief Adds a reference entry to the shown list, asking for
      *        its anchor first.
      */
@@ -251,11 +274,15 @@ private slots:
      * @param Group The list the include goes in, borrowed.
      * @param Wanted The reference anchor.
      * @param Href The bibliography address of the include.
+     * @param Form Which form the cross-reference takes.
+     * @param Section The section number, for a section form.
      * @param SelectionStart The start of the highlighted range, or -1.
      * @param SelectionEnd The end of the highlighted range, or -1.
      */
     void FinishNewReference(TextEditor* Editor, xmlNodePtr Group,
                             const QString& Wanted, const QString& Href,
+                            TextEditor::XrefForm Form,
+                            const QString& Section,
                             int SelectionStart, int SelectionEnd);
 
     /**
@@ -278,6 +305,19 @@ private slots:
      */
     bool FindProvidedAnchorClash(const QStringList& NewAnchors,
                                  QString& Clash, QString& Provider);
+
+    /**
+     * @brief The entry or include that provides this anchor, or nullptr.
+     *
+     * The node the clash paths move into the list the author
+     * chose: a manual reference entry whose anchor matches,
+     * or an include whose cached file provides the anchor
+     * (a group include provides its own anchor and its inner
+     * anchors, so the group itself is what moves).
+     * @param Anchor The anchor to find a provider for.
+     * @return The providing entry or include, or nullptr.
+     */
+    xmlNodePtr FindAnchorProviderNode(const QString& Anchor) const;
 
     /**
      * @brief The nested reference list with this name, creating it when missing.
@@ -926,10 +966,28 @@ private:
      */
     void AppendRunLog(const QString& Text);
 
+    /**
+     * @brief Records what the just-loaded document holds for the
+     * abstract (Bug 502 diagnostic), for the Abstract page to show.
+     */
+    void RecordLoadDiagnostic();
+
     DocDocument _Document;
     BibCache _BibCache;
     QString _FilePath;
     bool _Modified;
+    // Load-time abstract counts (Bug 502 diagnostic).
+    bool _DiagLoadFront;
+    bool _DiagLoadAbstract;
+    int _DiagLoadAbstractChildren;
+    // Abstract-editor syncs since load (Bug 502 diagnostic).
+    int _DiagSyncCount;
+    int _DiagSyncLastNodes;
+    // Bug 502 fix: true only while the abstract editor holds content
+    // filled from the current document. A sync from an editor that
+    // has not been filled for this document must not overwrite the
+    // loaded abstract.
+    bool _AbstractEditCurrent;
     std::unique_ptr<SpellChecker> _SpellChecker;
     QString _SelectedKey;
     int _AuthorIndex;
@@ -993,6 +1051,7 @@ private:
     QPushButton* _RemoveReferenceIncludeButton;
     QRadioButton* _ReferenceIncludeNormativeRadio;
     QRadioButton* _ReferenceIncludeInformativeRadio;
+    QTableWidget* _DisplayReferenceTable;
     QLineEdit* _ReferenceAnchorEdit;
     QLineEdit* _ReferenceTargetEdit;
     QLineEdit* _ReferenceTitleEdit;
@@ -1001,6 +1060,7 @@ private:
     QLineEdit* _ReferenceDateYearEdit;
     QComboBox* _ReferenceStreamCombo;
     QTableWidget* _ReferenceSeriesTable;
+    QLineEdit* _ReferenceAnnotationEdit;
     QComboBox* _ReferenceMoveToCombo;
     QRadioButton* _ReferenceNormativeRadio;
     QRadioButton* _ReferenceInformativeRadio;

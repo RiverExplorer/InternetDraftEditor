@@ -1,3 +1,9 @@
+// Copyright (c) 2026 RiverExplorer LLC
+// RiverExplorer is a registered trademark of Douglas Mark Royer.
+//
+// This software is released under the MIT License.
+// See LICENSE.md for the full license text.
+
 /**
  * @file DocModel.cpp
  * @brief Implementation of the draft document model: the draft as a
@@ -2467,12 +2473,15 @@ QVector<xmlNodePtr> DocDocument::ReferenceEntries(xmlNodePtr Group)
     return ChildElements(Group, "reference");
 }
 
-QString DocDocument::ReferenceLabel(xmlNodePtr Entry)
+QString DocDocument::ReferenceLabel(xmlNodePtr Entry,
+                                    const QString& DisplayName)
 {
     if (Entry == nullptr) {
         return QString();
     }
-    QString Label = NodeAttribute(Entry, "anchor").trimmed();
+    QString Label = DisplayName.trimmed().isEmpty()
+        ? NodeAttribute(Entry, "anchor").trimmed()
+        : DisplayName.trimmed();
     xmlNodePtr Front = ChildElement(Entry, "front");
     QString EntryTitle = Front != nullptr ? ChildText(Front, "title") : QString();
     if (!EntryTitle.trimmed().isEmpty()) {

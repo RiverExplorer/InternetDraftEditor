@@ -583,7 +583,9 @@ the text of the document goes.
   Either list, and either entry, can be removed when not needed.
 - A list page edits the list name and offers Add Entry, Add
   Nested List, Remove List (which removes its entries too), and
-  Up and Down to reorder the lists among their siblings. When
+  Up and Down to reorder the lists among their siblings. Add
+  Entry asks for the anchor and refuses one that is already
+  used, naming what provides it. When
   an included reference is picked in the outline, the list page
   names it and offers Remove Included Reference for it.
 - A nested list shows under its parent list in the outline, and
@@ -630,11 +632,30 @@ the text of the document goes.
   removed. Neither a manual entry nor an include is removed
   while a cross-reference still cites it: the editor says how
   many citations stand.
-- Kept, not edited yet: reference groups, display names, the
-  notes after an entry's front matter (annotation, refcontent,
+- Kept, not edited yet: reference groups, the notes after an
+  entry's front matter other than the annotation (refcontent
   and the like), the quoting and derived-anchor attributes,
   and the series info attributes beyond name and value. They
   round-trip on save.
+- The entry form has an Annotation field (Bug 404): extra prose
+  shown after the entry in the rendered output. Typing creates
+  the <annotation> element after the front; clearing the field
+  removes it. Plain text only: an annotation holding inline
+  markup loses that markup when edited.
+- Display names (Bug 405): a list page holds a Display names
+  table, one row per mapping, with Add Display Name and Remove
+  Display Name. A mapping names a reference by its anchor and
+  the name to show instead, such as TCP for RFC793, and is
+  written as <displayreference target="RFC793" to="TCP"/>
+  before the first reference list. One mapping per reference:
+  adding a second one for the same anchor warns and adds
+  nothing. The display name edits in the table; the reference
+  does not — changing the reference is a remove plus an add.
+  A plain bracket cross-reference to a mapped anchor shows
+  the display name, [TCP] instead of [RFC793], in the body
+  text and in the reference list; section and counter forms
+  keep the anchor. A mapping whose reference is removed stays
+  in the file until removed from the table.
 - Author names may hold any text, including non-ASCII names.
   The ASCII fallback attributes (on the author, the
   organization, and the postal parts) are kept when a file is
@@ -675,8 +696,34 @@ the text of the document goes.
   cited it. When the anchor is already provided, by a manual
   entry, by an include, or inside a group include (BCP14
   provides RFC2119), the existing reference is cited instead
-  of a duplicate; an RFC include is fetched first so the
-  anchors it provides are known before it is added. A file with no back
+  of a duplicate, and it is moved into the list the author
+  chose first (a group include moves as a whole, carrying
+  every anchor its file provides); an RFC include is fetched
+  first so the anchors it provides are known before it is
+  added.
+- Cross-reference forms: every cite (References > New,
+  References > Existing, and the Bibliography dialog's
+  Insert) asks how the reference should appear, offering
+  the forms published RFCs actually use. Bracket puts an
+  empty xref after the highlighted words, so the words stay
+  plain and the reference follows them: "means [RFC793]"
+  (RFC 8933). Link text wraps the highlighted words as the
+  link's content, as before. Section of asks for the section
+  number and cites it as "Section 4.2.11 of [RFC8446]"
+  (RFC 8773). Section bare cites it as just "Section 5.4",
+  with no bracket shown (RFC 8933). Counter shows only the
+  target's number, for a section, figure, or table. The
+  forms the spec defines but no published RFC uses
+  (format="title", format="none", sectionFormat "comma" and
+  "parens", pageno, relative) are not offered. In the
+  editor the empty forms show as the words they render as,
+  not as the placeholder glyph: a bracket shows "[RFC793]"
+  after the words, a section "of" shows "Section 4.2.11 of
+  [RFC8446]", a bare section shows "Section 5.4", and a
+  counter shows the bracketed target (the number itself is
+  resolved when the document renders). Hovering the marker
+  names the target, the section, and whether it is a counter
+  or a bare section. A file with no back
   matter gains the nested IETF form (outer References with
   both nested lists, empty). A section, figure, or table
   with no anchor gets one derived from its title when
@@ -713,7 +760,24 @@ the text of the document goes.
   fetches the selected entries again, Delete removes them,
   Clear All empties the cache. Add fetches a new entry: type an
   RFC number (2119, or RFC 2119) and it is looked up at
-  bib.ietf.org, or type a full bibliography address. The cache
+  bib.ietf.org, or type a full bibliography address. Insert puts
+  a cached entry into the document: pick a row, type the target
+  name (prefilled with the entry's anchor; it must be one of the
+  anchors the entry provides), pick Normative or Informative, and
+  press Insert. The include goes into that References list and a
+  cross-reference to it is put at the cursor, showing the anchor
+  as its words, so the reference reads instead of showing a bare
+  marker. If the target box is empty, the dialog asks which of
+  the anchors the entry provides to cite. If the document already
+  provides that target, it cites the existing reference instead of
+  adding a second copy; if
+  another anchor the entry carries is already provided, it refuses,
+  since adding the include would define that anchor twice. The Target
+  column fills in for an entry the document cites, whether the
+  citation came from a new include or from an existing entry (a
+  manual entry provides its anchor too). When the cursor is not in
+  the text, the include is added and the dialog says to cite it from
+  there. The cache
   lives under %APPDATA%\RiverExplorer\InternetDraftEditor\
   Bibliography; a cache from the old CoOp folder is carried
   over the first time the editor runs. Browse moves it (Copy

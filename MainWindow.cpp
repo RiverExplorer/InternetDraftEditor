@@ -1,3 +1,9 @@
+// Copyright (c) 2026 RiverExplorer LLC
+// RiverExplorer is a registered trademark of Douglas Mark Royer.
+//
+// This software is released under the MIT License.
+// See LICENSE.md for the full license text.
+
 /**
  * @file MainWindow.cpp
  * @brief Implementation of the main window.
@@ -262,7 +268,8 @@ static bool ReferenceEntryHasPreservedContent(xmlNodePtr Entry)
     if (NodeHasAttributesOtherThan(Entry, QStringList{"anchor", "target"})) {
         return true;
     }
-    if (NodeHasChildrenOtherThan(Entry, QStringList{"stream", "front"})) {
+    if (NodeHasChildrenOtherThan(Entry, QStringList{"stream", "front",
+                                                    "annotation"})) {
         return true;
     }
     xmlNodePtr Front = DocDocument::ChildElement(Entry, "front");
@@ -495,6 +502,130 @@ static void SetReferenceStream(xmlNodePtr Entry, const QString& Stream)
 }
 
 /**
+ * @brief Writes a reference entry's annotation.
+ *
+ * The <annotation> child sits after the <front>; an empty
+ * annotation removes the element. Only the first annotation
+ * is edited; any further ones in the file are left alone.
+ * The text is plain: an annotation holding inline markup
+ * loses that markup when edited here.
+ * @param Entry The reference entry node.
+ * @param Annotation The annotation text, or empty to remove it.
+ */
+static void SetReferenceAnnotation(xmlNodePtr Entry, const QString& Annotation)
+{
+    if (Entry == nullptr) {
+        return;
+    }
+    xmlNodePtr AnnotationNode = DocDocument::ChildElement(Entry, "annotation");
+    if (AnnotationNode != nullptr) {
+        DocDocument::SetChildText(Entry, "annotation", Annotation);
+        return;
+    }
+    if (Annotation.trimmed().isEmpty()) {
+        return;
+    }
+    xmlNodePtr Created = xmlNewNode(nullptr, XmlChars("annotation"));
+    xmlNodePtr Front = DocDocument::ChildElement(Entry, "front");
+    if (Front != nullptr) {
+        xmlAddNextSibling(Front, Created);
+    } else {
+        xmlAddChild(Entry, Created);
+    }
+    DocDocument::SetNodeText(Created, Annotation);
+}
+
+/**
+ * @brief The displayreference elements in the back matter, in file order.
+ *
+ * A displayreference is a direct child of <back>, before the
+ * reference lists; it is not part of any one entry (Bug 405).
+ * @param Document The document.
+ * @return The <displayreference> nodes, borrowed, file order.
+ */
+static QVector<xmlNodePtr> DisplayReferenceNodes(DocDocument& Document)
+{
+    return DocDocument::ChildElements(Document.BackNode(),
+                                      "displayreference");
+}
+
+/**
+ * @brief The display name for one anchor, from its displayreference.
+ *
+ * The first mapping for the anchor wins; a mapping with an
+ * empty display name counts as no mapping.
+ * @param Document The document.
+ * @param Anchor The reference anchor.
+ * @return The "to" value, or empty when no mapping exists.
+ */
+static QString DisplayNameForAnchor(DocDocument& Document,
+                                    const QString& Anchor)
+{
+    QString Wanted = Anchor.trimmed();
+    if (Wanted.isEmpty()) {
+        return QString();
+    }
+    for (xmlNodePtr Node : DisplayReferenceNodes(Document)) {
+        if (DocDocument::NodeAttribute(Node, "target").trimmed() ==
+            Wanted) {
+            return DocDocument::NodeAttribute(Node, "to").trimmed();
+        }
+    }
+    return QString();
+}
+
+/**
+ * @brief Inserts a displayreference node into the back matter.
+ *
+ * The node lands before the first <references> element, as
+ * the schema orders them (displayreferences, then lists,
+ * then sections); with no list yet it goes at the end of
+ * the back matter. The back matter itself is created when
+ * the document has none.
+ * @param Document The document.
+ * @param Node The node to insert (adopted on success).
+ * @return True when the node was inserted.
+ */
+static bool InsertDisplayReferenceNode(DocDocument& Document,
+                                       xmlNodePtr Node)
+{
+    if (Node == nullptr) {
+        return false;
+    }
+    xmlNodePtr Back = Document.BackNode();
+    if (Back == nullptr) {
+        xmlNodePtr Rfc = Document.RfcNode();
+        if (Rfc == nullptr) {
+            return false;
+        }
+        Back = DocDocument::NewChildElement(Rfc, "back");
+    }
+    for (xmlNodePtr Child = Back->children; Child != nullptr;
+         Child = Child->next) {
+        if (Child->type == XML_ELEMENT_NODE &&
+            DocDocument::NodeNameEquals(Child, "references")) {
+            xmlAddPrevSibling(Child, Node);
+            return true;
+        }
+    }
+    xmlAddChild(Back, Node);
+    return true;
+}
+
+/**
+ * @brief Removes one displayreference node from the back matter.
+ * @param Node The node to remove (freed), or nullptr.
+ */
+static void RemoveDisplayReferenceNode(xmlNodePtr Node)
+{
+    if (Node == nullptr) {
+        return;
+    }
+    xmlUnlinkNode(Node);
+    xmlFreeNode(Node);
+}
+
+/**
  * @brief Writes a reference entry's title into its front.
  *
  * The title is the front's leading child; an empty title
@@ -669,6 +800,32 @@ static void AppendReferenceEntry(xmlNodePtr Group, xmlNodePtr Entry)
 }
 
 /**
+ * @brief Moves a reference entry or include into the given list.
+ *
+ * The cite flow's move: unlike MoveReferenceToSection it does
+ * not touch the selection, so the author stays in the section
+ * body they were citing from. Entries go after the last entry
+ * in the list; includes go at the end. A group include moves
+ * as a whole, carrying every anchor its file provides.
+ * @param Item The entry or include to move.
+ * @param Group The list to move it into.
+ * @return True when the item moved.
+ */
+static bool MoveReferenceIntoList(xmlNodePtr Item, xmlNodePtr Group)
+{
+    if (Item == nullptr || Group == nullptr || Item->parent == Group) {
+        return false;
+    }
+    xmlUnlinkNode(Item);
+    if (DocDocument::NodeNameEquals(Item, "reference")) {
+        AppendReferenceEntry(Group, Item);
+    } else {
+        xmlAddChild(Group, Item);
+    }
+    return true;
+}
+
+/**
  * @brief Creates the main window: menus, outline, details, and buttons.
  */
 MainWindow::MainWindow(QWidget* Parent)
@@ -677,6 +834,12 @@ MainWindow::MainWindow(QWidget* Parent)
     , _BibCache(this)
     , _FilePath()
     , _Modified(false)
+    , _DiagLoadFront(false)
+    , _DiagLoadAbstract(false)
+    , _DiagLoadAbstractChildren(0)
+    , _DiagSyncCount(0)
+    , _DiagSyncLastNodes(0)
+    , _AbstractEditCurrent(false)
     , _SelectedKey()
     , _AuthorIndex(-1)
     , _AuthorGroupPath()
@@ -736,6 +899,7 @@ MainWindow::MainWindow(QWidget* Parent)
     , _RemoveReferenceIncludeButton(nullptr)
     , _ReferenceIncludeNormativeRadio(nullptr)
     , _ReferenceIncludeInformativeRadio(nullptr)
+    , _DisplayReferenceTable(nullptr)
     , _ReferenceAnchorEdit(nullptr)
     , _ReferenceTargetEdit(nullptr)
     , _ReferenceTitleEdit(nullptr)
@@ -1109,6 +1273,8 @@ MainWindow::MainWindow(QWidget* Parent)
             });
     _AbstractPreservedLabel = new QLabel(AbstractPageWidget);
     _AbstractPreservedLabel->setWordWrap(true);
+    _AbstractPreservedLabel->setTextInteractionFlags(
+        Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
     QVBoxLayout* AbstractLayout = new QVBoxLayout(AbstractPageWidget);
     AbstractLayout->addWidget(new QLabel(tr("Abstract:"), AbstractPageWidget));
     AbstractLayout->addWidget(_AbstractEdit);
@@ -1225,11 +1391,49 @@ MainWindow::MainWindow(QWidget* Parent)
     GroupButtons->addWidget(MoveGroupUpButton);
     GroupButtons->addWidget(MoveGroupDownButton);
     GroupButtons->addStretch(1);
+    // The display names are document-level, not part of one
+    // list, but they are managed here, on the list page, next
+    // to the entries they rename (Bug 405). The table follows
+    // the series info table: two columns, edited in place,
+    // with Add and Remove below.
+    _DisplayReferenceTable = new QTableWidget(ReferenceGroupPageWidget);
+    _DisplayReferenceTable->setColumnCount(2);
+    _DisplayReferenceTable->setHorizontalHeaderLabels(
+        {tr("Reference"), tr("Display as")});
+    _DisplayReferenceTable->horizontalHeader()->setStretchLastSection(true);
+    _DisplayReferenceTable->setToolTip(
+        tr("The name shown for a reference instead of its anchor, "
+           "such as TCP for RFC793."));
+    connect(_DisplayReferenceTable, &QTableWidget::cellChanged,
+            this, &MainWindow::OnDisplayReferenceChanged);
+    QPushButton* AddDisplayReferenceButton = new QPushButton(
+        tr("Add Display Name"), ReferenceGroupPageWidget);
+    AddDisplayReferenceButton->setToolTip(
+        tr("Add a display name for a reference."));
+    connect(AddDisplayReferenceButton, &QPushButton::clicked,
+            this, &MainWindow::OnAddDisplayReference);
+    QPushButton* RemoveDisplayReferenceButton = new QPushButton(
+        tr("Remove Display Name"), ReferenceGroupPageWidget);
+    RemoveDisplayReferenceButton->setToolTip(
+        tr("Remove the selected display name."));
+    connect(RemoveDisplayReferenceButton, &QPushButton::clicked,
+            this, &MainWindow::OnRemoveDisplayReference);
+    QWidget* DisplayReferenceWidget = new QWidget(ReferenceGroupPageWidget);
+    QVBoxLayout* DisplayReferenceLayout =
+        new QVBoxLayout(DisplayReferenceWidget);
+    DisplayReferenceLayout->setContentsMargins(0, 0, 0, 0);
+    DisplayReferenceLayout->addWidget(_DisplayReferenceTable);
+    QHBoxLayout* DisplayReferenceButtons = new QHBoxLayout();
+    DisplayReferenceButtons->addWidget(AddDisplayReferenceButton);
+    DisplayReferenceButtons->addWidget(RemoveDisplayReferenceButton);
+    DisplayReferenceButtons->addStretch(1);
+    DisplayReferenceLayout->addLayout(DisplayReferenceButtons);
     QFormLayout* ReferenceGroupLayout = new QFormLayout(ReferenceGroupPageWidget);
     ReferenceGroupLayout->addRow(tr("Section:"), ReferenceIncludeSectionWidget);
     ReferenceGroupLayout->addRow(tr("List name:"), _ReferenceGroupNameEdit);
     ReferenceGroupLayout->addRow(tr("Included reference:"), _ReferenceIncludeLabel);
     ReferenceGroupLayout->addRow(GroupButtons);
+    ReferenceGroupLayout->addRow(tr("Display names:"), DisplayReferenceWidget);
     ReferenceGroupLayout->addRow(_ReferenceGroupPreservedLabel);
     _Details->addWidget(ReferenceGroupPageWidget);
 
@@ -1285,6 +1489,9 @@ MainWindow::MainWindow(QWidget* Parent)
     SeriesButtons->addWidget(RemoveSeriesButton);
     SeriesButtons->addStretch(1);
     SeriesLayout->addLayout(SeriesButtons);
+    _ReferenceAnnotationEdit = new QLineEdit(ReferenceEntryPageWidget);
+    _ReferenceAnnotationEdit->setToolTip(tr("Extra prose shown after this reference entry."));
+    connect(_ReferenceAnnotationEdit, &QLineEdit::textEdited, this, &MainWindow::OnReferenceEntryEdited);
     _ReferenceMoveToCombo = new QComboBox(ReferenceEntryPageWidget);
     _ReferenceMoveToCombo->setToolTip(tr("Move this entry to another list."));
     connect(_ReferenceMoveToCombo,
@@ -1380,6 +1587,7 @@ MainWindow::MainWindow(QWidget* Parent)
     ReferenceEntryLayout->addRow(tr("Year:"), _ReferenceDateYearEdit);
     ReferenceEntryLayout->addRow(tr("Stream:"), _ReferenceStreamCombo);
     ReferenceEntryLayout->addRow(tr("Series info:"), SeriesWidget);
+    ReferenceEntryLayout->addRow(tr("Annotation:"), _ReferenceAnnotationEdit);
     ReferenceEntryLayout->addRow(tr("Move to list:"), _ReferenceMoveToCombo);
     ReferenceEntryLayout->addRow(tr("Authors:"), _ReferenceAuthorList);
     ReferenceEntryLayout->addRow(tr("Author full name *:"), _ReferenceAuthorFullnameEdit);
@@ -1641,6 +1849,10 @@ MainWindow::MainWindow(QWidget* Parent)
 void MainWindow::SetDocument(const DocDocument& Document, const QString& FilePath)
 {
     _Document = Document;
+    RecordLoadDiagnostic();
+    // Bug 502 fix: see OpenDraftFile — the abstract editor is not
+    // current for this document until its page is filled.
+    _AbstractEditCurrent = false;
     _FilePath = FilePath;
     UpdateProjectDictionary();
     _SelectedKey = QStringLiteral("title");
@@ -1648,6 +1860,28 @@ void MainWindow::SetDocument(const DocDocument& Document, const QString& FilePat
     SetModified(true);
     RebuildOutline();
     UpdateViewButtons();
+}
+
+void MainWindow::RecordLoadDiagnostic()
+{
+    _DiagSyncCount = 0;
+    _DiagSyncLastNodes = 0;
+    xmlNodePtr Front = _Document.FrontNode();
+    _DiagLoadFront = (Front != nullptr);
+    xmlNodePtr Abstract = nullptr;
+    if (Front != nullptr) {
+        Abstract = DocDocument::ChildElement(Front, "abstract");
+    }
+    _DiagLoadAbstract = (Abstract != nullptr);
+    _DiagLoadAbstractChildren = 0;
+    if (Abstract != nullptr) {
+        for (xmlNodePtr Child = Abstract->children; Child != nullptr;
+             Child = Child->next) {
+            if (Child->type == XML_ELEMENT_NODE) {
+                ++_DiagLoadAbstractChildren;
+            }
+        }
+    }
 }
 
 void MainWindow::OpenDraftFile(const QString& Path)
@@ -1660,6 +1894,11 @@ void MainWindow::OpenDraftFile(const QString& Path)
         return;
     }
     _Document = Loaded;
+    RecordLoadDiagnostic();
+    // Bug 502 fix: the editors still hold the previous document (or
+    // nothing). The abstract editor is not current for this file
+    // until its page is filled.
+    _AbstractEditCurrent = false;
     _FilePath = Path;
     UpdateProjectDictionary();
     _SelectedKey = QStringLiteral("docset");
@@ -2614,27 +2853,16 @@ void MainWindow::OnBibliography()
     // the first column's item, so the buttons can find it again.
     // The Target column shows the name this document cites an
     // entry by, which belongs to the document, not to the cached
-    // file: the entry only gets a target when the document both
-    // includes its address and cites one of the anchors it
-    // provides; otherwise the field stays blank.
+    // file: the entry gets a target when the document cites one
+    // of the anchors it provides. That is not only the included
+    // form: a manual entry provides its anchor too, and citing
+    // that is a citation of this entry all the same (Bug 495:
+    // RFC793 is cited from the manual entry, with no include,
+    // and its Target stayed blank until this was counted).
     auto FillTable = [&]() {
         Table->setRowCount(0);
         QStringList Cited;
         CollectCitedTargets(_Document.RfcNode(), Cited);
-        QMap<QString, QStringList> Included;
-        for (xmlNodePtr Include :
-             DocDocument::DocumentIncludeNodes(_Document.RfcNode())) {
-            QString Href = DocDocument::NodeAttribute(Include, "href");
-            if (Href.isEmpty() || Included.contains(Href)) {
-                continue;
-            }
-            QStringList Provided = _BibCache.CachedAnchors(Href);
-            if (Provided.isEmpty()) {
-                Provided.append(
-                    DocDocument::ReferenceAnchorFromIncludeHref(Href));
-            }
-            Included.insert(Href, Provided);
-        }
         QVector<BibCacheEntry> Entries = _BibCache.Entries();
         for (const BibCacheEntry& Entry : Entries) {
             int Row = Table->rowCount();
@@ -2648,13 +2876,20 @@ void MainWindow::OnBibliography()
             ReferenceItem->setData(Qt::UserRole, Entry.Url);
             ReferenceItem->setToolTip(Entry.Url);
             Table->setItem(Row, 0, ReferenceItem);
+            QStringList Provided = _BibCache.CachedAnchors(Entry.Url);
+            if (Provided.isEmpty()) {
+                Provided = Entry.Anchors;
+            }
+            if (Provided.isEmpty()) {
+                Provided.append(
+                    DocDocument::ReferenceAnchorFromIncludeHref(
+                        Entry.Url));
+            }
             QString Target;
-            if (Included.contains(Entry.Url)) {
-                for (const QString& Anchor : Included.value(Entry.Url)) {
-                    if (!Anchor.isEmpty() && Cited.contains(Anchor)) {
-                        Target = Anchor;
-                        break;
-                    }
+            for (const QString& Anchor : Provided) {
+                if (!Anchor.isEmpty() && Cited.contains(Anchor)) {
+                    Target = Anchor;
+                    break;
                 }
             }
             Table->setItem(Row, 1, new QTableWidgetItem(Target));
@@ -2687,6 +2922,32 @@ void MainWindow::OnBibliography()
     AddLayout->addWidget(AddEdit, 1);
     AddLayout->addWidget(AddButton);
 
+    // Insert: pick a cached entry and put it in the document (Bug 495).
+    // The target name is prefilled with the entry's anchor when a row
+    // is picked, and can be changed to any other anchor the entry
+    // provides. The radios pick which list the include goes into.
+    QLabel* InsertLabel = new QLabel(tr("Insert:"), &Dialog);
+    QLineEdit* TargetEdit = new QLineEdit(&Dialog);
+    TargetEdit->setPlaceholderText(tr("Target name"));
+    TargetEdit->setToolTip(
+        tr("The name this document will cite the entry by."));
+    QRadioButton* NormativeButton =
+        new QRadioButton(tr("Normative"), &Dialog);
+    QRadioButton* InformativeButton =
+        new QRadioButton(tr("Informative"), &Dialog);
+    InformativeButton->setChecked(true);
+    QPushButton* InsertButton = new QPushButton(tr("Insert"), &Dialog);
+    InsertButton->setToolTip(
+        tr("Add the selected entry to the References list and cite it "
+           "at the cursor."));
+    InsertButton->setEnabled(false);
+    QHBoxLayout* InsertLayout = new QHBoxLayout();
+    InsertLayout->addWidget(InsertLabel);
+    InsertLayout->addWidget(TargetEdit, 1);
+    InsertLayout->addWidget(NormativeButton);
+    InsertLayout->addWidget(InformativeButton);
+    InsertLayout->addWidget(InsertButton);
+
     QPushButton* RefreshButton = new QPushButton(tr("Refresh"), &Dialog);
     RefreshButton->setToolTip(
         tr("Fetch the selected entries again. Only matters for "
@@ -2707,6 +2968,7 @@ void MainWindow::OnBibliography()
     Layout->addLayout(LocationLayout);
     Layout->addWidget(Table, 1);
     Layout->addLayout(AddLayout);
+    Layout->addLayout(InsertLayout);
     Layout->addWidget(StatusLabel);
     Layout->addLayout(ButtonLayout);
 
@@ -2720,6 +2982,228 @@ void MainWindow::OnBibliography()
         }
         return Urls;
     };
+
+    // The selected cached entry, or an entry with no address when
+    // nothing is selected.
+    auto SelectedEntry = [&]() {
+        BibCacheEntry Found;
+        for (QTableWidgetItem* Item : Table->selectedItems()) {
+            if (Item->column() != 0) {
+                continue;
+            }
+            QString Url = Item->data(Qt::UserRole).toString();
+            for (const BibCacheEntry& Entry : _BibCache.Entries()) {
+                if (Entry.Url == Url) {
+                    return Entry;
+                }
+            }
+            break;
+        }
+        return Found;
+    };
+
+    // Picking a row prefills the target name with the entry's
+    // anchor and enables Insert.
+    connect(Table, &QTableWidget::itemSelectionChanged, &Dialog, [&]() {
+        BibCacheEntry Entry = SelectedEntry();
+        InsertButton->setEnabled(!Entry.Url.isEmpty());
+        if (!Entry.Url.isEmpty()) {
+            TargetEdit->setText(Entry.Anchor);
+        }
+    });
+
+    connect(InsertButton, &QPushButton::clicked, &Dialog, [&]() {
+        BibCacheEntry Entry = SelectedEntry();
+        if (Entry.Url.isEmpty()) {
+            return;
+        }
+        QString Target = TargetEdit->text().trimmed();
+        // What the entry provides: its own anchor first, then the
+        // anchors inside it when it is a group. The target name
+        // must be one of those, or the citation would point at
+        // nothing the document defines. The list is worked out
+        // first, because the ask below needs it.
+        QStringList Provided = _BibCache.CachedAnchors(Entry.Url);
+        if (Provided.isEmpty()) {
+            Provided = Entry.Anchors;
+        }
+        if (Provided.isEmpty()) {
+            Provided.append(
+                DocDocument::ReferenceAnchorFromIncludeHref(Entry.Url));
+        }
+        if (Target.isEmpty()) {
+            // No target name yet: it has not been made up, so ask
+            // which of the anchors the entry provides to cite.
+            if (Provided.isEmpty()) {
+                StatusLabel->setText(
+                    tr("This entry provides no anchor to cite."));
+                return;
+            }
+            bool Ok = false;
+            QString Picked = QInputDialog::getItem(
+                &Dialog, tr("Insert Reference"), tr("Target name:"),
+                Provided, 0, false, &Ok);
+            if (!Ok) {
+                return;
+            }
+            Target = Picked.trimmed();
+            TargetEdit->setText(Target);
+        }
+        if (Target.isEmpty()) {
+            StatusLabel->setText(tr("Enter a target name."));
+            return;
+        }
+        if (!Provided.contains(Target)) {
+            StatusLabel->setText(
+                tr("This entry provides %1. Enter one of those as "
+                   "the target name.")
+                    .arg(Provided.join(QStringLiteral(", "))));
+            return;
+        }
+        // The text editor the reference is cited from: the one
+        // showing. Its selection is captured before the outline
+        // rebuild below, which reloads the section body and drops
+        // the live selection.
+        TextEditor* Editor = nullptr;
+        if (_SectionBodyEdit != nullptr &&
+            _SectionBodyEdit->isVisible()) {
+            Editor = _SectionBodyEdit;
+        } else if (_AbstractEdit != nullptr &&
+                   _AbstractEdit->isVisible()) {
+            Editor = _AbstractEdit;
+        } else if (_SettingsNoteEdit != nullptr &&
+                   _SettingsNoteEdit->isVisible()) {
+            Editor = _SettingsNoteEdit;
+        }
+        int SelectionStart = -1;
+        int SelectionEnd = -1;
+        if (Editor != nullptr) {
+            Editor->SelectedRange(SelectionStart, SelectionEnd);
+        }
+        // Which form the cross-reference takes: the forms
+        // published RFCs use. Asked once, up front, so the
+        // same form is used whether the reference is new or
+        // already there. Skipped when no text editor is
+        // showing: there is no cursor to cite from.
+        TextEditor::XrefForm Form = TextEditor::XrefForm::LinkText;
+        QString Section;
+        if (Editor != nullptr) {
+            if (!TextEditor::PickXrefForm(&Dialog, Target,
+                                          Editor->SelectedText(), Form,
+                                          Section)) {
+                return;
+            }
+        }
+        // Cites at the cursor: with a selection the highlighted
+        // text is the reference's content; with none, the anchor
+        // itself is the content, so the reference shows words
+        // instead of the bare marker.
+        auto CiteAtCursor = [&](const QString& Anchor) {
+            if (Editor == nullptr) {
+                return;
+            }
+            if (SelectionStart < 0 || SelectionEnd <= SelectionStart) {
+                Editor->InsertXrefWithText(Anchor, Anchor, Section, Form);
+            } else {
+                Editor->InsertXref(Anchor, Section, Form, SelectionStart,
+                                   SelectionEnd);
+            }
+        };
+        // Pushes the editor's text back into the document, so the
+        // table below reads the citation just placed. The edit
+        // normally syncs itself through TextChanged, but the table
+        // must not depend on that having fired yet.
+        auto SyncEditorToDocument = [&]() {
+            if (Editor == _SectionBodyEdit) {
+                OnSectionBodyEdited();
+            } else if (Editor == _AbstractEdit) {
+                OnAbstractEdited();
+            } else if (Editor == _SettingsNoteEdit) {
+                OnSettingsNoteEdited();
+            }
+        };
+        QString Clash;
+        QString Provider;
+        QString ListName = NormativeButton->isChecked()
+            ? QStringLiteral("Normative")
+            : QStringLiteral("Informative");
+        if (FindProvidedAnchorClash(Provided, Clash, Provider)) {
+            if (Clash == Target) {
+                // The document already provides this target:
+                // move it into the list the author picked, then
+                // cite the existing reference instead of a
+                // duplicate.
+                xmlNodePtr Group = EnsureReferenceList(ListName);
+                bool Moved = false;
+                if (Group != nullptr) {
+                    Moved = MoveReferenceIntoList(
+                        FindAnchorProviderNode(Clash), Group);
+                }
+                if (Moved) {
+                    SetModified(true);
+                    RebuildOutline();
+                }
+                CiteAtCursor(Clash);
+                SyncEditorToDocument();
+                if (Editor != nullptr) {
+                    StatusLabel->setText(
+                        tr("%1 already provides %2: citing the "
+                           "existing reference.")
+                            .arg(Provider, Clash));
+                } else {
+                    StatusLabel->setText(
+                        tr("%1 already provides %2. Place the cursor "
+                           "in the text and cite it from there.")
+                            .arg(Provider, Clash));
+                }
+                FillTable();
+                return;
+            }
+            // Another anchor the entry carries is already
+            // provided: adding the include would define it
+            // twice, so refuse instead of adding it.
+            StatusLabel->setText(
+                tr("Cannot add this entry: %1 already provides %2.")
+                    .arg(Provider, Clash));
+            return;
+        }
+        xmlNodePtr Group = EnsureReferenceList(ListName);
+        if (Group == nullptr) {
+            StatusLabel->setText(
+                tr("There is no References list to add to."));
+            return;
+        }
+        xmlNsPtr XiNs =
+            DocDocument::EnsureXIncludeNamespace(_Document.RfcNode());
+        if (XiNs == nullptr) {
+            StatusLabel->setText(
+                tr("Could not add the included reference."));
+            return;
+        }
+        xmlNodePtr Include =
+            xmlNewChild(Group, XiNs, XmlChars("include"), nullptr);
+        DocDocument::SetNodeAttribute(Include, "href", Entry.Url);
+        SetModified(true);
+        // The citation goes to the cursor, so it is placed and
+        // synced before the outline rebuild below: the rebuild
+        // reloads the section body, which would move the cursor
+        // and leave the sync pointing at a stale selection.
+        CiteAtCursor(Target);
+        SyncEditorToDocument();
+        RebuildOutline();
+        if (Editor != nullptr) {
+            StatusLabel->setText(
+                tr("Added the included reference %1 and cited it at "
+                   "the cursor.")
+                    .arg(Target));
+        } else {
+            StatusLabel->setText(
+                tr("Added the included reference %1. Place the cursor "
+                   "in the text and cite it from there.")
+                    .arg(Target));
+        }
+        FillTable();
+    });
 
     connect(AddEdit, &QLineEdit::returnPressed,
             AddButton, &QPushButton::click);
@@ -4242,7 +4726,23 @@ void MainWindow::OnRemoveNote()
 
 void MainWindow::OnAbstractEdited()
 {
-    _Document.SetAbstractBody(_AbstractEdit->BodyNodes(),
+    QVector<xmlNodePtr> Nodes = _AbstractEdit->BodyNodes();
+    // Bug 502 diagnostic: how many times the abstract editor has
+    // synced since load, and how many nodes the last sync carried.
+    ++_DiagSyncCount;
+    _DiagSyncLastNodes = Nodes.size();
+    // Bug 502 fix: ignore a sync from an editor that has not been
+    // filled for the current document. A stale editor (empty, or
+    // holding a previous document's text) must not overwrite the
+    // loaded abstract. The nodes built above are dropped, not
+    // adopted, so they are freed here.
+    if (!_AbstractEditCurrent) {
+        for (xmlNodePtr Node : Nodes) {
+            xmlFreeNode(Node);
+        }
+        return;
+    }
+    _Document.SetAbstractBody(Nodes,
                               _Document.AbstractPreservedNodes());
     SetModified(true);
 }
@@ -4514,9 +5014,12 @@ void MainWindow::AddReferenceGroupItem(QTreeWidgetItem* Parent, xmlNodePtr Group
         // The label leads with the words that cite the entry, so
         // the author can match what they tagged to the entry it
         // points at; an entry nothing cites keeps its plain label.
-        QString Label = CitedLabelPrefix(
-            DocDocument::NodeAttribute(Entry, "anchor")) +
-            DocDocument::ReferenceLabel(Entry);
+        // A mapped entry lists under its display name (Bug 405):
+        // the list reads the way the rendered references do.
+        QString Anchor = DocDocument::NodeAttribute(Entry, "anchor");
+        QString Label = CitedLabelPrefix(Anchor) +
+            DocDocument::ReferenceLabel(
+                Entry, DisplayNameForAnchor(_Document, Anchor));
         EntryItem->setText(0, Label.isEmpty() ? tr("(untitled)") : Label);
         EntryItem->setData(0, Qt::UserRole, KindReferenceEntry);
         EntryItem->setData(0, Qt::UserRole + 1, Path);
@@ -4653,18 +5156,35 @@ void MainWindow::ShowDetailsFor(QTreeWidgetItem* Item)
     case KindAbstract: {
         QSignalBlocker Blocker(_AbstractEdit);
         _AbstractEdit->SetBodyNodes(_Document.AbstractBodyNodes());
+        // Bug 502 fix: from here on the editor holds this document's
+        // abstract, so its edits may sync back into the model.
+        _AbstractEditCurrent = true;
         QVector<DocPreservedItem> Preserved = _Document.AbstractPreservedNodes();
         _AbstractEdit->SetPreservedNodes(Preserved);
         int Blocks = Preserved.size();
+        // Bug 502 diagnostic: load-time counts plus fill-time counts.
+        QString Diag = tr("Diag (Bug 502): on load, front %1, abstract %2, "
+                          "%3 element children; on this page, body %4, "
+                          "preserved %5, editor blocks %6; syncs since load "
+                          "%7, last sync nodes %8.")
+            .arg(_DiagLoadFront ? tr("yes") : tr("no"))
+            .arg(_DiagLoadAbstract ? tr("yes") : tr("no"))
+            .arg(_DiagLoadAbstractChildren)
+            .arg(_Document.AbstractBodyNodes().size())
+            .arg(Blocks)
+            .arg(_AbstractEdit->BlockCount())
+            .arg(_DiagSyncCount)
+            .arg(_DiagSyncLastNodes);
         if (Blocks > 0) {
             QString Word = (Blocks == 1) ? tr("block") : tr("blocks");
             _AbstractPreservedLabel->setText(
                 tr("The abstract also holds %1 preserved %2, kept when you "
-                   "save and shown in the XML tab.").arg(Blocks).arg(Word));
-            _AbstractPreservedLabel->show();
+                   "save and shown in the XML tab.").arg(Blocks).arg(Word) +
+                QStringLiteral("\n") + Diag);
         } else {
-            _AbstractPreservedLabel->hide();
+            _AbstractPreservedLabel->setText(Diag);
         }
+        _AbstractPreservedLabel->show();
         _Details->setCurrentIndex(DetailAbstract);
         break;
     }
@@ -4690,8 +5210,11 @@ void MainWindow::ShowDetailsFor(QTreeWidgetItem* Item)
                "helpful context that are not required for implementation.");
         int BackItems = 0;
         for (xmlNodePtr Child : _Document.BackChildNodes()) {
+            // A displayreference is not counted here: it is shown
+            // on the list pages now, not kept out of sight (Bug 405).
             if (Child->type == XML_ELEMENT_NODE &&
-                !DocDocument::NodeNameEquals(Child, "references")) {
+                !DocDocument::NodeNameEquals(Child, "references") &&
+                !DocDocument::NodeNameEquals(Child, "displayreference")) {
                 ++BackItems;
             }
         }
@@ -5130,6 +5653,7 @@ void MainWindow::FillReferenceGroupForm()
     QSignalBlocker Blocker(_ReferenceGroupNameEdit);
     QSignalBlocker BlockSectionNormative(_ReferenceIncludeNormativeRadio);
     QSignalBlocker BlockSectionInformative(_ReferenceIncludeInformativeRadio);
+    QSignalBlocker BlockDisplay(_DisplayReferenceTable);
     xmlNodePtr Group = FindReferenceGroup(_ReferenceGroupPath);
     if (Group == nullptr) {
         _ReferenceGroupNameEdit->clear();
@@ -5141,6 +5665,7 @@ void MainWindow::FillReferenceGroupForm()
         _ReferenceIncludeNormativeRadio->setChecked(false);
         _ReferenceIncludeInformativeRadio->setEnabled(false);
         _ReferenceIncludeInformativeRadio->setChecked(false);
+        _DisplayReferenceTable->setRowCount(0);
         _ReferenceGroupPreservedLabel->hide();
         return;
     }
@@ -5190,6 +5715,23 @@ void MainWindow::FillReferenceGroupForm()
     } else {
         _ReferenceGroupPreservedLabel->hide();
     }
+    // The display names are document-level, so every list page
+    // shows the same mappings (Bug 405). The reference column
+    // is the mapping's key and never edits here: changing the
+    // reference is a remove plus an add.
+    QVector<xmlNodePtr> DisplayNodes = DisplayReferenceNodes(_Document);
+    _DisplayReferenceTable->setRowCount(DisplayNodes.size());
+    for (int i = 0; i < DisplayNodes.size(); ++i) {
+        QTableWidgetItem* TargetItem = new QTableWidgetItem(
+            DocDocument::NodeAttribute(DisplayNodes[i], "target"));
+        TargetItem->setFlags(TargetItem->flags() &
+                             ~Qt::ItemIsEditable);
+        _DisplayReferenceTable->setItem(i, 0, TargetItem);
+        _DisplayReferenceTable->setItem(
+            i, 1,
+            new QTableWidgetItem(
+                DocDocument::NodeAttribute(DisplayNodes[i], "to")));
+    }
 }
 
 void MainWindow::FillReferenceEntryForm()
@@ -5202,6 +5744,7 @@ void MainWindow::FillReferenceEntryForm()
     QSignalBlocker BlockYear(_ReferenceDateYearEdit);
     QSignalBlocker BlockStream(_ReferenceStreamCombo);
     QSignalBlocker BlockSeries(_ReferenceSeriesTable);
+    QSignalBlocker BlockAnnotation(_ReferenceAnnotationEdit);
     QSignalBlocker BlockMoveTo(_ReferenceMoveToCombo);
     QSignalBlocker BlockSectionNormative(_ReferenceNormativeRadio);
     QSignalBlocker BlockSectionInformative(_ReferenceInformativeRadio);
@@ -5216,6 +5759,7 @@ void MainWindow::FillReferenceEntryForm()
         _ReferenceDateYearEdit->clear();
         _ReferenceStreamCombo->setCurrentIndex(0);
         _ReferenceSeriesTable->setRowCount(0);
+        _ReferenceAnnotationEdit->clear();
         _ReferenceMoveToCombo->clear();
         _ReferenceNormativeRadio->setChecked(false);
         _ReferenceInformativeRadio->setChecked(false);
@@ -5258,6 +5802,7 @@ void MainWindow::FillReferenceEntryForm()
         StreamIndex = _ReferenceStreamCombo->findText(Stream);
     }
     _ReferenceStreamCombo->setCurrentIndex(StreamIndex < 0 ? 0 : StreamIndex);
+    _ReferenceAnnotationEdit->setText(DocDocument::ChildText(Entry, "annotation"));
     QVector<xmlNodePtr> Series = ReferenceSeriesNodes(Entry);
     _ReferenceSeriesTable->setRowCount(Series.size());
     for (int i = 0; i < Series.size(); ++i) {
@@ -5520,6 +6065,115 @@ void MainWindow::OnReferenceGroupNameEdited(const QString& Text)
     SetModified(true);
 }
 
+void MainWindow::OnAddDisplayReference()
+{
+    // The target must be a reference the document already
+    // provides, manual or included: a displayreference points
+    // at an anchor, and a target with no anchor would fail
+    // validation.
+    QStringList Anchors = ProvidedAnchorProviders().keys();
+    if (Anchors.isEmpty()) {
+        QMessageBox::information(this, tr("Add Display Name"),
+            tr("There are no references to name yet."));
+        return;
+    }
+    bool Ok = false;
+    QString Target = QInputDialog::getItem(this, tr("Add Display Name"),
+                                           tr("Reference:"), Anchors, 0,
+                                           false, &Ok);
+    if (!Ok) {
+        return;
+    }
+    // One mapping per target: a second one for the same anchor
+    // would leave xml2rfc with two names for it. The check is
+    // the same shape as the Add Entry duplicate check (Bug 487).
+    if (!DisplayNameForAnchor(_Document, Target).isEmpty()) {
+        QMessageBox::warning(this, tr("Add Display Name"),
+            tr("A display name for \"%1\" already exists.").arg(Target));
+        return;
+    }
+    QString Shown = QInputDialog::getText(this, tr("Add Display Name"),
+                                          tr("Display as:"),
+                                          QLineEdit::Normal, QString(), &Ok);
+    while (Ok && Shown.trimmed().isEmpty()) {
+        Shown = QInputDialog::getText(this, tr("Add Display Name"),
+                                      tr("Display as (required):"),
+                                      QLineEdit::Normal, QString(), &Ok);
+    }
+    if (!Ok) {
+        return;
+    }
+    xmlNodePtr Created = xmlNewNode(nullptr, XmlChars("displayreference"));
+    DocDocument::SetNodeAttribute(Created, "target", Target.trimmed());
+    DocDocument::SetNodeAttribute(Created, "to", Shown.trimmed());
+    if (!InsertDisplayReferenceNode(_Document, Created)) {
+        xmlFreeNode(Created);
+        return;
+    }
+    SetModified(true);
+    RebuildOutline();
+    // The outline rebuild refilled the table: put the new
+    // mapping's row back under the cursor.
+    QVector<xmlNodePtr> DisplayNodes = DisplayReferenceNodes(_Document);
+    for (int i = 0; i < DisplayNodes.size(); ++i) {
+        if (DocDocument::NodeAttribute(DisplayNodes[i], "target")
+                .trimmed() == Target.trimmed()) {
+            _DisplayReferenceTable->setCurrentCell(i, 1);
+            break;
+        }
+    }
+}
+
+void MainWindow::OnRemoveDisplayReference()
+{
+    QVector<xmlNodePtr> DisplayNodes = DisplayReferenceNodes(_Document);
+    int Row = _DisplayReferenceTable->currentRow();
+    if (Row < 0 || Row >= DisplayNodes.size()) {
+        return;
+    }
+    // Removing a mapping breaks no citation: the bracket
+    // simply shows the anchor again, so there is no cited
+    // guard here as there is for removing an entry.
+    RemoveDisplayReferenceNode(DisplayNodes[Row]);
+    SetModified(true);
+    RebuildOutline();
+}
+
+void MainWindow::OnDisplayReferenceChanged()
+{
+    QVector<xmlNodePtr> DisplayNodes = DisplayReferenceNodes(_Document);
+    if (_DisplayReferenceTable->rowCount() != DisplayNodes.size()) {
+        return;
+    }
+    // Rows map one-to-one onto the mappings; only the display
+    // name edits here, the reference column never does.
+    // A display name is required by the schema, so an emptied
+    // cell goes back to the name it held, with a warning,
+    // instead of writing an empty "to" into the file.
+    bool WarnedEmpty = false;
+    for (int i = 0; i < DisplayNodes.size(); ++i) {
+        QTableWidgetItem* ShownItem = _DisplayReferenceTable->item(i, 1);
+        if (ShownItem == nullptr) {
+            continue;
+        }
+        QString Shown = ShownItem->text().trimmed();
+        if (Shown.isEmpty()) {
+            QSignalBlocker Blocker(_DisplayReferenceTable);
+            ShownItem->setText(
+                DocDocument::NodeAttribute(DisplayNodes[i], "to"));
+            WarnedEmpty = true;
+            continue;
+        }
+        DocDocument::SetNodeAttribute(DisplayNodes[i], "to", Shown);
+    }
+    if (WarnedEmpty) {
+        QMessageBox::warning(this, tr("Display Names"),
+            tr("A display name cannot be empty."));
+    }
+    SetModified(true);
+    RebuildOutline();
+}
+
 /**
  * @brief A title turned into an anchor: lower case, words joined by dashes.
  * @param Title The title.
@@ -5635,6 +6289,41 @@ bool MainWindow::FindProvidedAnchorClash(const QStringList& NewAnchors,
     Clash.clear();
     Provider.clear();
     return false;
+}
+
+xmlNodePtr MainWindow::FindAnchorProviderNode(const QString& Anchor) const
+{
+    QString Wanted = Anchor.trimmed();
+    if (Wanted.isEmpty()) {
+        return nullptr;
+    }
+    for (const QString& Path : _Document.ReferenceGroupPaths()) {
+        xmlNodePtr Group = _Document.ReferenceGroupAtPath(Path);
+        if (Group == nullptr) {
+            continue;
+        }
+        for (xmlNodePtr Entry : DocDocument::ReferenceEntries(Group)) {
+            if (DocDocument::NodeAttribute(Entry, "anchor").trimmed() ==
+                Wanted) {
+                return Entry;
+            }
+        }
+        for (xmlNodePtr Include :
+             DocDocument::ReferenceIncludeNodes(Group)) {
+            QString Href = DocDocument::NodeAttribute(Include, "href");
+            QStringList Anchors = _BibCache.CachedAnchors(Href);
+            if (Anchors.isEmpty()) {
+                QString Single = _BibCache.CachedAnchor(Href);
+                Anchors.append(Single.isEmpty()
+                    ? DocDocument::ReferenceAnchorFromIncludeHref(Href)
+                    : Single);
+            }
+            if (Anchors.contains(Wanted)) {
+                return Include;
+            }
+        }
+    }
+    return nullptr;
 }
 
 xmlNodePtr MainWindow::EnsureReferenceList(const QString& ListName)
@@ -5753,6 +6442,16 @@ void MainWindow::HandleMakeReference(TextEditor* Editor, int Action,
     if (Group == nullptr) {
         return;
     }
+    // Which form the cross-reference takes: the forms
+    // published RFCs use. Asked once, up front, so the same
+    // form is used whether the reference is new or already
+    // there, and whether it is an RFC or a placeholder.
+    TextEditor::XrefForm Form = TextEditor::XrefForm::LinkText;
+    QString Section;
+    if (!TextEditor::PickXrefForm(this, Wanted, Editor->SelectedText(),
+                                  Form, Section)) {
+        return;
+    }
     QString RfcNumber = RfcNumberFromAnchor(Wanted);
     if (!RfcNumber.isEmpty()) {
         // An RFC include: fetch its file first, so the anchors
@@ -5768,9 +6467,10 @@ void MainWindow::HandleMakeReference(TextEditor* Editor, int Action,
             RfcNumber + QStringLiteral(".xml");
         statusBar()->showMessage(tr("Fetching bibliography entry..."));
         connect(&_BibCache, &BibCache::FetchFinished, this,
-            [this, Editor, Group, Wanted, Href, SelectionStart, SelectionEnd]() {
-                FinishNewReference(Editor, Group, Wanted, Href,
-                                   SelectionStart, SelectionEnd);
+            [this, Editor, Group, Wanted, Href, Form, Section,
+             SelectionStart, SelectionEnd]() {
+                FinishNewReference(Editor, Group, Wanted, Href, Form,
+                                   Section, SelectionStart, SelectionEnd);
             },
             Qt::SingleShotConnection);
         _BibCache.EnsureCached(QStringList(Href));
@@ -5782,11 +6482,22 @@ void MainWindow::HandleMakeReference(TextEditor* Editor, int Action,
     QString Clash;
     QString Provider;
     if (FindProvidedAnchorClash(QStringList(Wanted), Clash, Provider)) {
-        // The entry is already there: cite it instead of a duplicate.
+        // The entry is already there: move it into the list
+        // the author chose, then cite it instead of a
+        // duplicate. The move keeps the author in the section
+        // body; the outline rebuilds only when something
+        // actually moved.
+        bool Moved = MoveReferenceIntoList(
+            FindAnchorProviderNode(Clash), Group);
         statusBar()->showMessage(
             tr("%1 already provides %2: citing the existing reference.")
                 .arg(Provider, Clash));
-        Editor->InsertXrefMarker(Clash, SelectionStart, SelectionEnd);
+        if (Moved) {
+            SetModified(true);
+            RebuildOutline();
+        }
+        Editor->InsertXref(Clash, Section, Form, SelectionStart,
+                           SelectionEnd);
         return;
     }
     {
@@ -5815,11 +6526,13 @@ void MainWindow::HandleMakeReference(TextEditor* Editor, int Action,
     }
     SetModified(true);
     RebuildOutline();
-    Editor->InsertXrefMarker(Wanted, SelectionStart, SelectionEnd);
+    Editor->InsertXref(Wanted, Section, Form, SelectionStart, SelectionEnd);
 }
 
 void MainWindow::FinishNewReference(TextEditor* Editor, xmlNodePtr Group,
                                     const QString& Wanted, const QString& Href,
+                                    TextEditor::XrefForm Form,
+                                    const QString& Section,
                                     int SelectionStart, int SelectionEnd)
 {
     if (Editor == nullptr) {
@@ -5850,12 +6563,20 @@ void MainWindow::FinishNewReference(TextEditor* Editor, xmlNodePtr Group,
     QString Provider;
     if (FindProvidedAnchorClash(Provided, Clash, Provider)) {
         // The anchor is already provided (a group carries it
-        // inside itself, for example): cite it instead of
-        // adding a second copy, and say why.
+        // inside itself, for example): move it into the list
+        // the author chose, then cite it instead of adding a
+        // second copy, and say why.
+        bool Moved = MoveReferenceIntoList(
+            FindAnchorProviderNode(Clash), Group);
         statusBar()->showMessage(
             tr("%1 already provides %2: citing the existing reference.")
                 .arg(Provider, Clash));
-        Editor->InsertXrefMarker(Clash, SelectionStart, SelectionEnd);
+        if (Moved) {
+            SetModified(true);
+            RebuildOutline();
+        }
+        Editor->InsertXref(Clash, Section, Form, SelectionStart,
+                           SelectionEnd);
         return;
     }
     // xml2rfc pulls the full reference from its database; the
@@ -5873,7 +6594,7 @@ void MainWindow::FinishNewReference(TextEditor* Editor, xmlNodePtr Group,
     RebuildOutline();
     statusBar()->showMessage(
         tr("Added the included reference %1.").arg(Wanted));
-    Editor->InsertXrefMarker(Wanted, SelectionStart, SelectionEnd);
+    Editor->InsertXref(Wanted, Section, Form, SelectionStart, SelectionEnd);
 }
 
 void MainWindow::OnAddReferenceEntry()
@@ -5900,6 +6621,19 @@ void MainWindow::OnAddReferenceEntry()
                                        QString(), &Ok);
     }
     if (!Ok) {
+        return;
+    }
+    Anchor = Anchor.trimmed();
+    // The anchor must not already be provided: a second entry
+    // with the same anchor would define it twice. The check is
+    // the one the other add flows use, so a manual entry and an
+    // included reference both count.
+    QString Clash;
+    QString Provider;
+    if (FindProvidedAnchorClash(QStringList(Anchor), Clash, Provider)) {
+        QMessageBox::warning(this, tr("Add Entry"),
+            tr("Cannot add this entry: %1 already provides %2.")
+                .arg(Provider, Clash));
         return;
     }
     xmlNodePtr Entry = xmlNewNode(nullptr, XmlChars("reference"));
@@ -6174,9 +6908,11 @@ void MainWindow::OnReferenceEntryEdited()
     SetReferenceDatePart(Entry, "day", _ReferenceDateDayEdit->text());
     SetReferenceDatePart(Entry, "month", _ReferenceDateMonthEdit->text());
     SetReferenceDatePart(Entry, "year", _ReferenceDateYearEdit->text());
+    SetReferenceAnnotation(Entry, _ReferenceAnnotationEdit->text());
     QTreeWidgetItem* Current = _Outline->currentItem();
     if (Current != nullptr) {
-        QString Label = DocDocument::ReferenceLabel(Entry);
+        QString Label = DocDocument::ReferenceLabel(
+            Entry, DisplayNameForAnchor(_Document, NewAnchor));
         Current->setText(0, Label.isEmpty() ? tr("(untitled)") : Label);
     }
     SetModified(true);

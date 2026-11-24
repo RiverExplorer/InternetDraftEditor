@@ -1,3 +1,9 @@
+// Copyright (c) 2026 RiverExplorer LLC
+// RiverExplorer is a registered trademark of Douglas Mark Royer.
+//
+// This software is released under the MIT License.
+// See LICENSE.md for the full license text.
+
 /**
  * @file TextEditor.cpp
  * @brief Implementation of the two-tab text editor (Bugs 322, 382-387, 393, 395-402, 420).
@@ -441,6 +447,71 @@ const QChar EmptyItemGlyph(0xFFFD);
  * @brief The option marker glyph: a gear, U+2699 (Bug 420).
  */
 const QChar OptionGlyph(0x2699);
+
+/**
+ * @brief The QTextDocument property holding the display names.
+ *
+ * A QVariantMap from reference anchor to the name a
+ * displayreference shows for it (Bug 405). It rides on the
+ * text document, so the file-local helpers that build markers
+ * and read them back can use the mappings without a document
+ * pointer: those helpers only ever see a cursor, a block, or
+ * a run of events. SetBodyNodes refreshes it from the
+ * document whenever a body is loaded.
+ */
+const char DisplayNamesProperty[] = "DocEditorDisplayNames";
+
+/**
+ * @brief The display names in a document, from its displayreferences.
+ *
+ * The first mapping for a target wins; a mapping with an
+ * empty target or an empty display name counts as no mapping.
+ * @param Document The document, or nullptr for no mappings.
+ * @return The anchor-to-display-name map.
+ */
+static QVariantMap DisplayNamesFromDocument(const DocDocument* Document)
+{
+    QVariantMap Names;
+    if (Document == nullptr) {
+        return Names;
+    }
+    for (xmlNodePtr Node : DocDocument::ChildElements(
+             Document->BackNode(), "displayreference")) {
+        QString Target =
+            DocDocument::NodeAttribute(Node, "target").trimmed();
+        QString To = DocDocument::NodeAttribute(Node, "to").trimmed();
+        if (Target.isEmpty() || To.isEmpty() || Names.contains(Target)) {
+            continue;
+        }
+        Names.insert(Target, To);
+    }
+    return Names;
+}
+
+/**
+ * @brief The display names a text document carries (Bug 405).
+ *
+ * The property SetBodyNodes stored there, with empty or
+ * duplicate entries already left out.
+ * @param Document The text document, or nullptr for no mappings.
+ * @return The anchor-to-display-name map.
+ */
+static QVariantMap DisplayNamesForDocument(const QTextDocument* Document)
+{
+    QVariantMap Names;
+    if (Document == nullptr) {
+        return Names;
+    }
+    QVariantMap Stored =
+        Document->property(DisplayNamesProperty).toMap();
+    for (auto It = Stored.constBegin(); It != Stored.constEnd(); ++It) {
+        QString To = It.value().toString().trimmed();
+        if (!It.key().trimmed().isEmpty() && !To.isEmpty()) {
+            Names.insert(It.key().trimmed(), To);
+        }
+    }
+    return Names;
+}
 
 /**
  * @brief The clipboard format carrying a copied sourcecode
@@ -1577,6 +1648,16 @@ static QString MarkerTooltip(const DocTagEntry& Marker)
             if (!Section.isEmpty()) {
                 Text += QStringLiteral(", section ") + Section;
             }
+            QString Format =
+                AttributeOf(Marker.Attributes, QStringLiteral("format"));
+            if (Format == QLatin1String("counter")) {
+                Text += QStringLiteral(" (counter)");
+            }
+            QString SectionFormat = AttributeOf(
+                Marker.Attributes, QStringLiteral("sectionFormat"));
+            if (SectionFormat == QLatin1String("bare")) {
+                Text += QStringLiteral(" (bare)");
+            }
         }
         return Text;
     }
@@ -1591,15 +1672,71 @@ static QString MarkerTooltip(const DocTagEntry& Marker)
  *
  * A Break shows as one symbol, a Vertical Space as its symbol
  * plus its blank-line count, and an Index Entry as its item
- * text, so the item can be read (and edited) in place. Any other
- * marker shows a placeholder glyph, so the marker still has a
- * character to stand on: an Index Entry with no item, and every
- * element with no text of its own, such as an empty
- * cross-reference (Bug 440).
+ * text, so the item can be read (and edited) in place. A bare
+ * cross-reference shows its rendered form, so the editor reads
+ * the way the published RFC does. Any other marker shows a
+ * placeholder glyph, so the marker still has a character to
+ * stand on: an Index Entry with no item, and every element
+ * with no text of its own (Bug 440).
  * @param Marker The marker entry.
+ * @param DisplayNames The anchor-to-display-name map, used for
+ *        a bare cross-reference (Bug 405).
  * @return The marker text.
  */
-static QString MarkerText(const DocTagEntry& Marker)
+/**
+ * @brief The text a bare cross-reference shows in the editor.
+ *
+ * An empty xref renders as its form, not as a placeholder
+ * glyph, so the editor reads the way the published RFC does:
+ * a bracket shows "[RFC793]", a section "of" shows
+ * "Section 4.2.11 of [RFC8446]", a bare section shows
+ * "Section 5.4". A counter shows the bracketed target: the
+ * number itself is resolved at render time, and the hover
+ * says it is a counter. A targetless xref keeps the glyph.
+ * A bracket for a mapped anchor shows the display name
+ * instead (Bug 405): with a displayreference for RFC793 to
+ * TCP, the bracket reads "[TCP]". The mapping applies only
+ * to the plain bracket form (RFC 7991 section 2.19: it
+ * applies only to xrefs whose format is "default"); a
+ * section or counter form keeps the anchor.
+ * @param Marker The cross-reference entry.
+ * @param DisplayNames The anchor-to-display-name map.
+ * @return The display text, or the placeholder glyph.
+ */
+static QString XrefMarkerText(const DocTagEntry& Marker,
+                              const QVariantMap& DisplayNames)
+{
+    QString Target =
+        AttributeOf(Marker.Attributes, QStringLiteral("target"));
+    if (Target.isEmpty()) {
+        return QString(EmptyItemGlyph);
+    }
+    QString Format =
+        AttributeOf(Marker.Attributes, QStringLiteral("format"));
+    if (Format == QLatin1String("counter")) {
+        return QStringLiteral("[") + Target + QStringLiteral("]");
+    }
+    QString Section =
+        AttributeOf(Marker.Attributes, QStringLiteral("section"));
+    if (!Section.isEmpty()) {
+        QString SectionFormat = AttributeOf(
+            Marker.Attributes, QStringLiteral("sectionFormat"));
+        if (SectionFormat == QLatin1String("bare")) {
+            return QStringLiteral("Section ") + Section;
+        }
+        return QStringLiteral("Section ") + Section +
+            QStringLiteral(" of [") + Target + QStringLiteral("]");
+    }
+    QString Shown = Target;
+    if ((Format.isEmpty() || Format == QLatin1String("default")) &&
+        DisplayNames.contains(Target)) {
+        Shown = DisplayNames.value(Target).toString();
+    }
+    return QStringLiteral("[") + Shown + QStringLiteral("]");
+}
+
+static QString MarkerText(const DocTagEntry& Marker,
+                          const QVariantMap& DisplayNames)
 {
     if (Marker.Name == QLatin1String("br")) {
         return QString(BreakGlyph);
@@ -1610,6 +1747,9 @@ static QString MarkerText(const DocTagEntry& Marker)
             Lines = QStringLiteral("0");
         }
         return QString(VspaceGlyph) + Lines;
+    }
+    if (Marker.Name == QLatin1String("xref")) {
+        return XrefMarkerText(Marker, DisplayNames);
     }
     QString Item = AttributeOf(Marker.Attributes, QStringLiteral("item"));
     // A newline in an item would split the block when inserted, so
@@ -2031,9 +2171,12 @@ static bool NodeIsBlank(xmlNodePtr Node)
  * @param Events The events.
  * @param Pos The next event to read; advanced past the events used.
  * @param Parent The node gaining the children.
+ * @param DisplayNames The anchor-to-display-name map, so a
+ *        mapped bracket strips its shown text (Bug 405).
  */
 static void BuildNodeRuns(const QVector<DocEvent>& Events, int& Pos,
-                          xmlNodePtr Parent)
+                          xmlNodePtr Parent,
+                          const QVariantMap& DisplayNames)
 {
     while (Pos < Events.size()) {
         const DocEvent& Event = Events[Pos];
@@ -2047,7 +2190,7 @@ static void BuildNodeRuns(const QVector<DocEvent>& Events, int& Pos,
             xmlNodePtr Child = NewNode(Name.constData());
             SetNodeAttributes(Child, Event.Tag.Attributes);
             xmlAddChild(Parent, Child);
-            BuildNodeRuns(Events, Pos, Child);
+            BuildNodeRuns(Events, Pos, Child, DisplayNames);
             continue;
         }
         if (Event.EventKind == DocEvent::Kind::TextRun) {
@@ -2104,6 +2247,27 @@ static void BuildNodeRuns(const QVector<DocEvent>& Events, int& Pos,
                 Item = AttributeOf(Event.Tag.Attributes, QStringLiteral("item"));
             }
             DocDocument::SetNodeAttribute(Run, "item", Item);
+        } else if (Event.Tag.Name == QLatin1String("xref")) {
+            // The marker shows its rendered form (the bracket,
+            // the section, or the counter); that text is the
+            // marker's own display, not text the author typed.
+            // It comes off the front or the back, and anything
+            // left is text typed into the marker, kept as
+            // ordinary text. When the display itself was edited
+            // so neither end matches, the non-glyph text is
+            // kept, as for other markers.
+            QString Shown = MarkerText(Event.Tag, DisplayNames);
+            QString Kept = Event.Text;
+            if (!Shown.isEmpty() && Kept.startsWith(Shown)) {
+                Kept.remove(0, Shown.length());
+            } else if (!Shown.isEmpty() && Kept.endsWith(Shown)) {
+                Kept.chop(Shown.length());
+            }
+            for (QChar Ch : Kept) {
+                if (Ch != EmptyItemGlyph) {
+                    Stray += Ch;
+                }
+            }
         } else {
             // Any other marker shows the placeholder glyph; text
             // typed into it is kept as ordinary text (Bug 440).
@@ -2221,7 +2385,11 @@ static xmlNodePtr NodeFromBlock(const QTextBlock& Block)
     }
     xmlNodePtr Paragraph = NewNode("t");
     int Pos = 0;
-    BuildNodeRuns(Events, Pos, Paragraph);
+    // The display names ride on the block's own text document,
+    // so a pasted block reads back with the same mappings the
+    // body was loaded with (Bug 405).
+    BuildNodeRuns(Events, Pos, Paragraph,
+                  DisplayNamesForDocument(Block.document()));
     return Paragraph;
 }
 
@@ -3090,7 +3258,10 @@ static void InsertNodeChildren(QTextCursor& Cursor, xmlNodePtr Node,
             Marker.Name = QString::fromUtf8(
                 reinterpret_cast<const char*>(Child->name));
             Marker.Attributes = NodeAttributes(Child);
-            Cursor.insertText(MarkerText(Marker), FormatForMarker(Stack, Marker));
+            Cursor.insertText(
+                MarkerText(Marker,
+                           DisplayNamesForDocument(Cursor.document())),
+                FormatForMarker(Stack, Marker));
         } else if (IsListNode(Child)) {
             for (xmlNodePtr Item = Child->children; Item != nullptr;
                  Item = Item->next) {
@@ -6012,6 +6183,11 @@ TextEditor::TextEditor(QWidget* Parent)
     , _ShowMarkersCheck(nullptr)
     , _BlockKind()
     , _SettingParagraphs(false)
+    , _DiagMarkersShown(false)
+    , _DiagMarkersBlocks(0)
+    , _DiagMarkersSourceFirst(0)
+    , _DiagMarkersGearsInserted(0)
+    , _DiagMarkersGearsRemoved(0)
     , _SrcPlaceholderHintBlock(-1)
     , _SpellChecker(nullptr)
     , _Document(nullptr)
@@ -6591,7 +6767,10 @@ bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
         if (IsHeaderCellBlock(Cursor.block())) {
             MarkerFormat.setFontWeight(QFont::Bold);
         }
-        Cursor.insertText(MarkerText(Entry), MarkerFormat);
+        Cursor.insertText(
+            MarkerText(Entry,
+                       DisplayNamesForDocument(_TextEdit->document())),
+            MarkerFormat);
         Cursor.endEditBlock();
         _TextEdit->setTextCursor(Cursor);
         return true;
@@ -6880,6 +7059,11 @@ void TextEditor::SetBodyNodes(const QVector<xmlNodePtr>& Nodes)
         _BodyNodes.append(DocDocument::CopyNode(Node));
     }
     _TextEdit->clear();
+    // The display names ride on the text document from here on,
+    // so every marker built below, and every marker read back
+    // from this text, shows the mapped name (Bug 405).
+    _TextEdit->document()->setProperty(
+        DisplayNamesProperty, DisplayNamesFromDocument(_Document));
     QTextCursor Cursor(_TextEdit->document());
     Cursor.beginEditBlock();
     // The first block is a plain paragraph until a structural
@@ -7256,6 +7440,25 @@ void TextEditor::Clear()
     _SettingParagraphs = false;
 }
 
+int TextEditor::BlockCount() const
+{
+    if (_TextEdit == nullptr || _TextEdit->document() == nullptr) {
+        return 0;
+    }
+    return _TextEdit->document()->blockCount();
+}
+
+QString TextEditor::MarkerSweepReport() const
+{
+    return tr("Markers: setting %1, blocks scanned %2, first source "
+              "blocks %3, gears inserted %4, gears removed %5.")
+        .arg(_DiagMarkersShown ? tr("on") : tr("off"))
+        .arg(_DiagMarkersBlocks)
+        .arg(_DiagMarkersSourceFirst)
+        .arg(_DiagMarkersGearsInserted)
+        .arg(_DiagMarkersGearsRemoved);
+}
+
 void TextEditor::OnTextDocumentChanged()
 {
     if (_SettingParagraphs) {
@@ -7281,6 +7484,12 @@ void TextEditor::UpdateOptionMarkers()
 {
     QTextDocument* Document = _TextEdit->document();
     bool Shown = OptionMarkersShown();
+    // Bug 502 diagnostic: counts for the sweep report.
+    _DiagMarkersShown = Shown;
+    _DiagMarkersBlocks = 0;
+    _DiagMarkersSourceFirst = 0;
+    _DiagMarkersGearsInserted = 0;
+    _DiagMarkersGearsRemoved = 0;
     // The sweep's own edits must not re-enter the change
     // handler, which would sweep again mid-walk.
     QSignalBlocker Blocker(_TextEdit);
@@ -7296,6 +7505,10 @@ void TextEditor::UpdateOptionMarkers()
          Block = Block.previous()) {
         int BlockPos = Block.position();
         bool First = IsFirstSourceBlock(Block);
+        ++_DiagMarkersBlocks;
+        if (First) {
+            ++_DiagMarkersSourceFirst;
+        }
         bool ShowGear = Shown && First;
         QVector<int> Gears;
         for (QTextBlock::iterator It = Block.begin(); !It.atEnd(); ++It) {
@@ -7322,6 +7535,7 @@ void TextEditor::UpdateOptionMarkers()
             Sweep.setPosition(Gears[i]);
             Sweep.setPosition(Gears[i] + 1, QTextCursor::KeepAnchor);
             Sweep.removeSelectedText();
+            ++_DiagMarkersGearsRemoved;
             if (CursorPos > Gears[i]) {
                 --CursorPos;
             }
@@ -7338,6 +7552,7 @@ void TextEditor::UpdateOptionMarkers()
             if (!Gears.contains(BlockPos)) {
                 Sweep.setPosition(BlockPos);
                 Sweep.insertText(QString(OptionGlyph), Wanted);
+                ++_DiagMarkersGearsInserted;
                 if (CursorPos > BlockPos) {
                     ++CursorPos;
                 }
@@ -7551,6 +7766,10 @@ void TextEditor::OnShowMarkersToggled(bool Checked)
     _SettingParagraphs = true;
     UpdateOptionMarkers();
     _SettingParagraphs = false;
+    // Bug 502 diagnostic: report the sweep that just ran, so the
+    // counts are visible without any other step.
+    QMessageBox::information(this, tr("Option markers"),
+                             MarkerSweepReport());
 }
 
 void TextEditor::OnContextMenuRequested(const QPoint& Pos)
@@ -7949,7 +8168,13 @@ void TextEditor::AddReferenceActions(QMenu* Menu)
                 int Start = -1;
                 int End = -1;
                 SelectedRange(Start, End);
-                InsertXrefMarker(Anchor, Start, End);
+                XrefForm Form = XrefForm::LinkText;
+                QString Section;
+                if (!PickXrefForm(this, Anchor, SelectedText(), Form,
+                                  Section)) {
+                    return;
+                }
+                InsertXref(Anchor, Section, Form, Start, End);
             });
         }
     }
@@ -8720,7 +8945,10 @@ void TextEditor::InsertTag(const QString& Name)
         return;
     }
     DocTagStack Stack = StackOf(Cursor.charFormat());
-    Cursor.insertText(MarkerText(Entry), FormatForMarker(Stack, Entry));
+    Cursor.insertText(
+        MarkerText(Entry,
+                   DisplayNamesForDocument(_TextEdit->document())),
+        FormatForMarker(Stack, Entry));
     Cursor.endEditBlock();
     _TextEdit->setTextCursor(Cursor);
 }
@@ -8745,6 +8973,66 @@ void TextEditor::SelectedRange(int& Start, int& End) const
     }
     Start = Cursor.selectionStart();
     End = Cursor.selectionEnd();
+}
+
+QString TextEditor::SelectedText() const
+{
+    QTextCursor Cursor = _TextEdit->textCursor();
+    if (!Cursor.hasSelection()) {
+        return QString();
+    }
+    return Cursor.selectedText();
+}
+
+bool TextEditor::PickXrefForm(QWidget* Parent, const QString& Anchor,
+                              const QString& Highlight, XrefForm& Form,
+                              QString& Section)
+{
+    // The forms published RFCs use, with the anchor in each
+    // label so the choice is concrete. The forms the spec
+    // defines but no published RFC uses (title, none, comma,
+    // parens, pageno, relative) are not offered.
+    QStringList Choices;
+    Choices.append(tr("Bracket: [%1]").arg(Anchor));
+    if (Highlight.isEmpty()) {
+        Choices.append(tr("Link text"));
+    } else {
+        Choices.append(tr("Link text: %1").arg(Highlight));
+    }
+    Choices.append(tr("Section of: Section <number> of [%1]").arg(Anchor));
+    Choices.append(tr("Section bare: Section <number>"));
+    Choices.append(tr("Counter: <number>"));
+    bool Ok = false;
+    QString Picked = QInputDialog::getItem(
+        Parent, tr("Cross-reference form"),
+        tr("How should this reference appear?"), Choices, 0, false, &Ok);
+    if (!Ok) {
+        return false;
+    }
+    if (Picked == Choices.at(0)) {
+        Form = XrefForm::Bracket;
+    } else if (Picked == Choices.at(1)) {
+        Form = XrefForm::LinkText;
+    } else if (Picked == Choices.at(2)) {
+        Form = XrefForm::SectionOf;
+    } else if (Picked == Choices.at(3)) {
+        Form = XrefForm::SectionBare;
+    } else {
+        Form = XrefForm::Counter;
+    }
+    Section.clear();
+    if (Form == XrefForm::SectionOf || Form == XrefForm::SectionBare) {
+        bool SectionOk = false;
+        QString Value = QInputDialog::getText(
+            Parent, tr("Cross-reference section"),
+            tr("Section number:"), QLineEdit::Normal, QString(),
+            &SectionOk);
+        if (!SectionOk || Value.trimmed().isEmpty()) {
+            return false;
+        }
+        Section = Value.trimmed();
+    }
+    return true;
 }
 
 /**
@@ -8781,25 +9069,35 @@ static void PlaceCaretAfterTag(QTextEdit* Edit, int End, const QString& Tag)
     Edit->setTextCursor(Cursor);
 }
 
-void TextEditor::InsertXrefMarker(const QString& Anchor, int SelectionStart,
-                                  int SelectionEnd)
+void TextEditor::InsertXref(const QString& Anchor, const QString& Section,
+                            XrefForm Form, int SelectionStart,
+                            int SelectionEnd)
 {
     DocTagEntry Entry;
     Entry.Name = QStringLiteral("xref");
     Entry.Attributes.append(
         QPair<QString, QString>(QStringLiteral("target"), Anchor));
+    if (Form == XrefForm::SectionOf) {
+        Entry.Attributes.append(
+            QPair<QString, QString>(QStringLiteral("section"), Section));
+        Entry.Attributes.append(
+            QPair<QString, QString>(QStringLiteral("sectionFormat"),
+                                    QStringLiteral("of")));
+    } else if (Form == XrefForm::SectionBare) {
+        Entry.Attributes.append(
+            QPair<QString, QString>(QStringLiteral("section"), Section));
+        Entry.Attributes.append(
+            QPair<QString, QString>(QStringLiteral("sectionFormat"),
+                                    QStringLiteral("bare")));
+    } else if (Form == XrefForm::Counter) {
+        Entry.Attributes.append(
+            QPair<QString, QString>(QStringLiteral("format"),
+                                    QStringLiteral("counter")));
+    }
+    QTextDocument* Document = _TextEdit->document();
     int End = -1;
-    if (SelectionStart < 0 || SelectionEnd <= SelectionStart) {
-        // No text to cite: drop a bare marker at the cursor, as
-        // the tag menu does. The References menu only offers
-        // itself with a selection, so this is a fallback only.
-        QTextCursor Cursor = _TextEdit->textCursor();
-        Cursor.beginEditBlock();
-        DocTagStack Stack = StackOf(Cursor.charFormat());
-        Cursor.insertText(MarkerText(Entry), FormatForMarker(Stack, Entry));
-        Cursor.endEditBlock();
-        End = Cursor.position();
-    } else {
+    if (Form == XrefForm::LinkText && SelectionStart >= 0 &&
+        SelectionEnd > SelectionStart) {
         // The highlighted text stays as the cross-reference's
         // content, the same way the tag menu wraps a selection in
         // a Cross-Reference, External Link, or Relative Reference.
@@ -8808,10 +9106,86 @@ void TextEditor::InsertXrefMarker(const QString& Anchor, int SelectionStart,
         ChangeStacks(SelectionStart, SelectionEnd,
                      QStringLiteral("xref"), &Entry);
         End = SelectionEnd;
+    } else {
+        // An empty xref (no content): the words stay plain and
+        // the reference follows them as a bare marker, which
+        // renders as the bracketed anchor (or its display name,
+        // when a displayreference maps it), the section, or the
+        // counter, depending on the form. With a selection the
+        // marker goes just after it, in the highlight's own
+        // stack, so it sits beside the plain words rather than
+        // inside whatever fragment follows them. With no
+        // selection it drops at the cursor, as the tag menu
+        // does. The References menu only offers itself with a
+        // selection, so the no-selection case is a fallback only.
+        QTextCursor Cursor = _TextEdit->textCursor();
+        DocTagStack Stack;
+        if (SelectionStart >= 0 && SelectionEnd > SelectionStart) {
+            Stack = StackAtPosition(Document, SelectionEnd - 1);
+            Cursor.setPosition(SelectionEnd);
+        } else {
+            Stack = StackOf(Cursor.charFormat());
+        }
+        Cursor.beginEditBlock();
+        Cursor.insertText(
+            MarkerText(Entry, DisplayNamesForDocument(Document)),
+            FormatForMarker(Stack, Entry));
+        Cursor.endEditBlock();
+        End = Cursor.position();
     }
     // The caret lands just after the reference, with the format
     // the text would have without the link: typing after the
     // reference is plain text, not more of the link.
+    PlaceCaretAfterTag(_TextEdit, End, QStringLiteral("xref"));
+}
+
+void TextEditor::InsertXrefMarker(const QString& Anchor, int SelectionStart,
+                                  int SelectionEnd)
+{
+    InsertXref(Anchor, QString(), XrefForm::LinkText, SelectionStart,
+               SelectionEnd);
+}
+
+void TextEditor::InsertXrefWithText(const QString& Anchor,
+                                    const QString& Text,
+                                    const QString& Section, XrefForm Form)
+{
+    QTextCursor Cursor = _TextEdit->textCursor();
+    if (Cursor.hasSelection()) {
+        // A selection is cited by wrapping it, as InsertXrefMarker does.
+        InsertXref(Anchor, Section, Form, Cursor.selectionStart(),
+                   Cursor.selectionEnd());
+        return;
+    }
+    if (Form != XrefForm::LinkText) {
+        // An empty xref has no content to show: drop a bare
+        // marker at the cursor instead, and ignore the text.
+        InsertXref(Anchor, Section, Form, -1, -1);
+        return;
+    }
+    if (Text.isEmpty()) {
+        // Nothing to show: fall back to the bare marker.
+        InsertXref(Anchor, Section, Form, -1, -1);
+        return;
+    }
+    DocTagEntry Entry;
+    Entry.Name = QStringLiteral("xref");
+    Entry.Attributes.append(
+        QPair<QString, QString>(QStringLiteral("target"), Anchor));
+    // The caret may sit inside a link: the inserted text would
+    // join it, and the wrap below would leave it there, since a
+    // fragment that already holds a cross-reference is left
+    // alone. Step just past any link first, so the new words
+    // are plain text before they are wrapped.
+    PlaceCaretAfterTag(_TextEdit, Cursor.position(),
+                       QStringLiteral("xref"));
+    Cursor = _TextEdit->textCursor();
+    int Start = Cursor.position();
+    Cursor.beginEditBlock();
+    Cursor.insertText(Text);
+    Cursor.endEditBlock();
+    int End = Start + Text.length();
+    ChangeStacks(Start, End, QStringLiteral("xref"), &Entry);
     PlaceCaretAfterTag(_TextEdit, End, QStringLiteral("xref"));
 }
 
