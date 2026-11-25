@@ -36,6 +36,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QMap>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
@@ -47,6 +48,7 @@
 #include <QPushButton>
 #include <QRadioButton>
 #include <QRegularExpression>
+#include <QSet>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSplitter>
@@ -61,6 +63,7 @@
 #include <QUrl>
 #include <QVBoxLayout>
 
+#include <functional>
 #include <libxml/tree.h>
 
 #include <utility>
@@ -344,11 +347,59 @@ static QStringList LinesFromPlainText(const QString& Text)
 }
 
 /**
+ * @brief True when a section path names an appendix section.
+ *
+ * Appendix paths carry a "back:" prefix ("back:0", "back:0.1");
+ * middle paths are bare dot-separated indices ("0", "1.2").
+ * @param Path The section path.
+ * @return True for an appendix path.
+ */
+static bool IsBackPath(const QString& Path)
+{
+    return Path.startsWith(QStringLiteral("back:"));
+}
+
+/**
+ * @brief True when a path names a top-level section of the middle.
+ *
+ * Only those lock as required sections (Bug 422): a top-level
+ * appendix never locks, whatever its title.
+ * @param Path The section path.
+ * @return True for a top-level middle section.
+ */
+static bool IsMiddleTopLevel(const QString& Path)
+{
+    return !IsBackPath(Path) && !Path.contains(QLatin1Char('.'));
+}
+
+/**
+ * @brief The path prefix for a section landing in the same list as
+ *        the section at a path: "back:" for a top-level appendix,
+ *        "" for a top-level middle section, or the parent path
+ *        plus "." for a subsection.
+ * @param Path The section path.
+ * @return The list prefix.
+ */
+static QString ParentListPrefix(const QString& Path)
+{
+    int Dot = Path.lastIndexOf(QLatin1Char('.'));
+    if (Dot >= 0) {
+        return Path.left(Dot) + QStringLiteral(".");
+    }
+    if (IsBackPath(Path)) {
+        return QStringLiteral("back:");
+    }
+    return QString();
+}
+
+/**
  * @brief Finds the sibling sections of the section at a path.
  *
  * The siblings are the parent's child sections, or the
  * top-level sections for a top-level path, from
- * DocDocument::ChildSectionNodes plus index arithmetic.
+ * DocDocument::ChildSectionNodes plus index arithmetic. A path
+ * starting with "back:" walks the appendix sections instead of
+ * the middle ones (Bug 513).
  * @param Document The document to search.
  * @param Path The dot-separated path of the section.
  * @param Siblings Set to the sibling section nodes (borrowed).
@@ -362,7 +413,13 @@ static bool SectionSiblings(const DocDocument& Document, const QString& Path,
     if (Path.isEmpty()) {
         return false;
     }
-    QStringList Parts = Path.split(QLatin1Char('.'));
+    QString Work = Path;
+    bool Back = false;
+    if (IsBackPath(Work)) {
+        Work = Work.mid(QStringLiteral("back:").size());
+        Back = true;
+    }
+    QStringList Parts = Work.split(QLatin1Char('.'));
     bool Ok = false;
     Index = Parts.last().toInt(&Ok);
     if (!Ok) {
@@ -370,10 +427,14 @@ static bool SectionSiblings(const DocDocument& Document, const QString& Path,
         return false;
     }
     if (Parts.size() == 1) {
-        Siblings = Document.TopSectionNodes();
+        Siblings = Back ? Document.BackSectionNodes()
+                        : Document.TopSectionNodes();
     } else {
         QString ParentPath = Parts.mid(0, Parts.size() - 1)
                                  .join(QLatin1Char('.'));
+        if (Back) {
+            ParentPath = QStringLiteral("back:") + ParentPath;
+        }
         xmlNodePtr Parent = Document.FindSectionNode(ParentPath);
         if (Parent == nullptr) {
             Index = -1;
@@ -1271,6 +1332,13 @@ MainWindow::MainWindow(QWidget* Parent)
             [this](int Action, xmlNodePtr Target, const QString& Anchor, const QString& ListName) {
                 HandleMakeReference(_AbstractEdit, Action, Target, Anchor, ListName);
             });
+    connect(_AbstractEdit, &TextEditor::AnchorChangeRequested, this,
+            [this](const QString& OldAnchor, const QString& NewAnchor,
+                   int FirstBlockPos, bool IsSourceCode,
+                   const QString& PartKind) {
+                HandleAnchorChange(_AbstractEdit, OldAnchor, NewAnchor,
+                                   FirstBlockPos, IsSourceCode, PartKind);
+            });
     _AbstractPreservedLabel = new QLabel(AbstractPageWidget);
     _AbstractPreservedLabel->setWordWrap(true);
     _AbstractPreservedLabel->setTextInteractionFlags(
@@ -1308,6 +1376,18 @@ MainWindow::MainWindow(QWidget* Parent)
             [this](int Action, xmlNodePtr Target, const QString& Anchor, const QString& ListName) {
                 HandleMakeReference(_SectionBodyEdit, Action, Target, Anchor, ListName);
             });
+    connect(_SectionBodyEdit, &TextEditor::AnchorChangeRequested, this,
+            [this](const QString& OldAnchor, const QString& NewAnchor,
+                   int FirstBlockPos, bool IsSourceCode,
+                   const QString& PartKind) {
+                HandleAnchorChange(_SectionBodyEdit, OldAnchor, NewAnchor,
+                                   FirstBlockPos, IsSourceCode, PartKind);
+            });
+    // Bug 520: pasted <section> nodes in the section body's XML
+    // tab become subsections of the current section.
+    _SectionBodyEdit->SetAllowSubsections(true);
+    connect(_SectionBodyEdit, &TextEditor::SubsectionsPasted, this,
+            &MainWindow::OnSubsectionsPasted);
     _SectionPreservedLabel = new QLabel(SectionPageWidget);
     _SectionPreservedLabel->setWordWrap(true);
     _SectionRequiredLabel = new QLabel(SectionPageWidget);
@@ -1683,6 +1763,13 @@ MainWindow::MainWindow(QWidget* Parent)
             [this](int Action, xmlNodePtr Target, const QString& Anchor, const QString& ListName) {
                 HandleMakeReference(_SettingsNoteEdit, Action, Target, Anchor, ListName);
             });
+    connect(_SettingsNoteEdit, &TextEditor::AnchorChangeRequested, this,
+            [this](const QString& OldAnchor, const QString& NewAnchor,
+                   int FirstBlockPos, bool IsSourceCode,
+                   const QString& PartKind) {
+                HandleAnchorChange(_SettingsNoteEdit, OldAnchor, NewAnchor,
+                                   FirstBlockPos, IsSourceCode, PartKind);
+            });
     QPushButton* RemoveNoteButton = new QPushButton(tr("Remove Note"), _SettingsNoteGroup);
     RemoveNoteButton->setToolTip(tr("Remove this note from the draft."));
     connect(RemoveNoteButton, &QPushButton::clicked, this, &MainWindow::OnRemoveNote);
@@ -1972,7 +2059,26 @@ void MainWindow::closeEvent(QCloseEvent* Event)
 
 void MainWindow::OnOutlineSelectionChanged()
 {
-    ShowDetailsFor(_Outline->currentItem());
+    // Bug 520: apply pending XML edits before leaving the
+    // current section, so a paste is not lost by the switch.
+    // The clicked item's key is kept first: applying may add
+    // subsections and rebuild the outline, which deletes the
+    // clicked item itself.
+    QTreeWidgetItem* Clicked = _Outline->currentItem();
+    QString NewKey = (Clicked == nullptr) ? QString()
+                                           : SelectionKey(Clicked);
+    if (!ApplyPendingXmlEdits()) {
+        // On a parse error the switch is refused; restore the
+        // old selection.
+        QTreeWidgetItem* Previous = FindItemByKey(nullptr, _SelectedKey);
+        if (Previous != nullptr) {
+            QSignalBlocker Blocker(_Outline);
+            _Outline->setCurrentItem(Previous);
+        }
+        return;
+    }
+    QTreeWidgetItem* NewItem = FindItemByKey(nullptr, NewKey);
+    ShowDetailsFor(NewItem);
 }
 
 void MainWindow::OnAddSection()
@@ -1987,14 +2093,11 @@ void MainWindow::OnAddSection()
         int Index = -1;
         if (SectionSiblings(_Document, Path, Siblings, Index)) {
             InsertAt = Index + 1;
-            int Dot = Path.lastIndexOf(QLatin1Char('.'));
-            ParentPath = (Dot >= 0) ? Path.left(Dot) : QString();
             xmlNodePtr Selected = Siblings[Index];
             xmlNodePtr Added = DocDocument::NewSectionNode(tr("New Section"));
             xmlAddNextSibling(Selected, Added);
-            QString NewPath = ParentPath.isEmpty()
-                ? QString::number(InsertAt)
-                : ParentPath + QStringLiteral(".") + QString::number(InsertAt);
+            QString NewPath = ParentListPrefix(Path) +
+                QString::number(InsertAt);
             _SelectedKey = QStringLiteral("section:") + NewPath;
             SetModified(true);
             RebuildOutline();
@@ -2004,12 +2107,139 @@ void MainWindow::OnAddSection()
     if (Parent == nullptr) {
         return;
     }
+    // No section selected: the new section goes at the end of the
+    // free body sections, before the required back-matter (Bug
+    // 512), so it lands where it can be moved. It used to append
+    // at the very end, after the required sections, where the move
+    // guard then trapped it.
+    QVector<xmlNodePtr> Top = _Document.TopSectionNodes();
+    InsertAt = Top.size();
+    for (int i = Top.size() - 1; i >= 0; --i) {
+        if (!DocDocument::IsRequiredSectionTitle(
+                DocDocument::SectionTitle(Top[i]))) {
+            InsertAt = i + 1;
+            break;
+        }
+    }
     xmlNodePtr Added = DocDocument::NewSectionNode(tr("New Section"));
-    xmlAddChild(Parent, Added);
+    if (InsertAt < Top.size()) {
+        xmlAddPrevSibling(Top[InsertAt], Added);
+    } else {
+        xmlAddChild(Parent, Added);
+    }
     QString NewPath = ParentPath.isEmpty()
         ? QString::number(InsertAt)
         : ParentPath + QStringLiteral(".") + QString::number(InsertAt);
     _SelectedKey = QStringLiteral("section:") + NewPath;
+    SetModified(true);
+    RebuildOutline();
+}
+
+/**
+ * @brief Makes every anchor in a pasted subtree unique in the
+ *        document (Bug 520).
+ *
+ * A pasted section may carry an anchor that already exists in
+ * the document (for example the same fragment pasted twice).
+ * Each colliding anchor is renamed (base-2, base-3, ...), and
+ * cross-references inside the pasted subtree that point at
+ * the old anchor are updated to the new one, so the file stays
+ * valid and the pasted references still resolve. The document
+ * itself is not changed: the renames happen on the pasted
+ * copy before it is added.
+ * @param Root The pasted subtree; owned by the caller.
+ * @param DocumentRoot The document root to check anchors against.
+ */
+static void MakePastedAnchorsUnique(xmlNodePtr Root, xmlNodePtr DocumentRoot)
+{
+    if (Root == nullptr || DocumentRoot == nullptr) {
+        return;
+    }
+    QMap<QString, QString> Renamed;
+    QSet<QString> Seen;
+    // First pass: rename every anchor that collides with the
+    // document or with an anchor already seen in this paste.
+    std::function<void(xmlNodePtr)> Rename =
+        [&](xmlNodePtr Node) {
+            if (Node == nullptr) {
+                return;
+            }
+            if (Node->type == XML_ELEMENT_NODE) {
+                QString Anchor =
+                    DocDocument::NodeAttribute(Node, "anchor").trimmed();
+                if (!Anchor.isEmpty()) {
+                    bool Collides =
+                        Seen.contains(Anchor) ||
+                        DocDocument::DocumentHasAnchor(DocumentRoot, Anchor);
+                    if (Collides) {
+                        QString Base = Anchor;
+                        QString Unique = Base;
+                        int Suffix = 2;
+                        while (Seen.contains(Unique) ||
+                               DocDocument::DocumentHasAnchor(DocumentRoot,
+                                                            Unique)) {
+                            Unique = Base + QStringLiteral("-") +
+                                QString::number(Suffix++);
+                        }
+                        Renamed.insert(Anchor, Unique);
+                        DocDocument::SetNodeAttribute(Node, "anchor", Unique);
+                        Seen.insert(Unique);
+                    } else {
+                        Seen.insert(Anchor);
+                    }
+                }
+            }
+            for (xmlNodePtr Child = Node->children; Child != nullptr;
+                 Child = Child->next) {
+                Rename(Child);
+            }
+        };
+    Rename(Root);
+    if (Renamed.isEmpty()) {
+        return;
+    }
+    // Second pass: point references inside the pasted subtree
+    // at the renamed anchors.
+    std::function<void(xmlNodePtr)> Retarget =
+        [&](xmlNodePtr Node) {
+            if (Node == nullptr) {
+                return;
+            }
+            if (Node->type == XML_ELEMENT_NODE) {
+                QString Target =
+                    DocDocument::NodeAttribute(Node, "target").trimmed();
+                if (!Target.isEmpty() && Renamed.contains(Target)) {
+                    DocDocument::SetNodeAttribute(Node, "target",
+                                                Renamed.value(Target));
+                }
+            }
+            for (xmlNodePtr Child = Node->children; Child != nullptr;
+                 Child = Child->next) {
+                Retarget(Child);
+            }
+        };
+    Retarget(Root);
+}
+
+void MainWindow::OnSubsectionsPasted(const QVector<xmlNodePtr>& Sections)
+{
+    xmlNodePtr Parent = FindSection(_SectionPath);
+    if (Parent == nullptr || Sections.isEmpty()) {
+        return;
+    }
+    for (xmlNodePtr Section : Sections) {
+        if (Section == nullptr) {
+            continue;
+        }
+        xmlNodePtr Copy = DocDocument::CopyNode(Section);
+        if (Copy == nullptr) {
+            continue;
+        }
+        MakePastedAnchorsUnique(Copy, _Document.RfcNode());
+        // Subsections go after the block content, at the end of
+        // the section's children (Bug 510 ordering).
+        xmlAddChild(Parent, Copy);
+    }
     SetModified(true);
     RebuildOutline();
 }
@@ -2062,9 +2292,9 @@ void MainWindow::OnRemoveSection()
     }
     // A required section cannot be removed (Bug 422). The button
     // is disabled for one; this guard covers any other path here.
-    // Only a top-level section locks: a subsection with a
-    // matching title stays removable.
-    if (!Path.contains(QLatin1Char('.')) &&
+    // Only a top-level middle section locks: a subsection with a
+    // matching title, or a top-level appendix, stays removable.
+    if (IsMiddleTopLevel(Path) &&
         DocDocument::IsRequiredSectionTitle(
             DocDocument::SectionTitle(Siblings[Index]))) {
         return;
@@ -2095,23 +2325,18 @@ void MainWindow::OnRemoveSection()
     int Remaining = Siblings.size() - 1;
     xmlUnlinkNode(Removed);
     xmlFreeNode(Removed);
-    // Select a neighbor: the next sibling, the previous one, or the
-    // middle group when none is left.
-    QString ParentPath;
-    int Dot = Path.lastIndexOf(QLatin1Char('.'));
-    ParentPath = (Dot >= 0) ? Path.left(Dot) : QString();
+    // Select a neighbor: the next sibling, the previous one, or
+    // the group (middle or back) when none is left.
     if (Index < Remaining) {
-        QString NextPath = ParentPath.isEmpty()
-            ? QString::number(Index)
-            : ParentPath + QStringLiteral(".") + QString::number(Index);
+        QString NextPath = ParentListPrefix(Path) + QString::number(Index);
         _SelectedKey = QStringLiteral("section:") + NextPath;
     } else if (Index > 0) {
-        QString PrevPath = ParentPath.isEmpty()
-            ? QString::number(Index - 1)
-            : ParentPath + QStringLiteral(".") + QString::number(Index - 1);
+        QString PrevPath = ParentListPrefix(Path) +
+            QString::number(Index - 1);
         _SelectedKey = QStringLiteral("section:") + PrevPath;
     } else {
-        _SelectedKey = QStringLiteral("middle");
+        _SelectedKey = IsBackPath(Path) ? QStringLiteral("back")
+                                        : QStringLiteral("middle");
     }
     SetModified(true);
     RebuildOutline();
@@ -2129,26 +2354,20 @@ void MainWindow::OnMoveSectionUp()
     if (!SectionSiblings(_Document, Path, Siblings, Index) || Index <= 0) {
         return;
     }
-    // No move may cross a required section (Bug 422): a required
-    // section never moves, and no free section swaps with one.
-    // Only top-level sections lock; a move within a child list
-    // never crosses one.
-    if (!Path.contains(QLatin1Char('.')) &&
-        (DocDocument::IsRequiredSectionTitle(
-             DocDocument::SectionTitle(Siblings[Index])) ||
-         DocDocument::IsRequiredSectionTitle(
-             DocDocument::SectionTitle(Siblings[Index - 1])))) {
+    // A required section never moves (Bug 422). A free section
+    // may move past a required neighbour (Bug 512): the required
+    // sections keep their relative order, only their numbers
+    // shift. Only top-level middle sections lock; a move within
+    // a child list, or among appendices, never crosses one.
+    if (IsMiddleTopLevel(Path) &&
+        DocDocument::IsRequiredSectionTitle(
+            DocDocument::SectionTitle(Siblings[Index]))) {
         return;
     }
     xmlNodePtr Moved = Siblings[Index];
     xmlUnlinkNode(Moved);
     xmlAddPrevSibling(Siblings[Index - 1], Moved);
-    QString ParentPath;
-    int Dot = Path.lastIndexOf(QLatin1Char('.'));
-    ParentPath = (Dot >= 0) ? Path.left(Dot) : QString();
-    QString NewPath = ParentPath.isEmpty()
-        ? QString::number(Index - 1)
-        : ParentPath + QStringLiteral(".") + QString::number(Index - 1);
+    QString NewPath = ParentListPrefix(Path) + QString::number(Index - 1);
     _SelectedKey = QStringLiteral("section:") + NewPath;
     SetModified(true);
     RebuildOutline();
@@ -2167,26 +2386,20 @@ void MainWindow::OnMoveSectionDown()
         Index < 0 || Index + 1 >= Siblings.size()) {
         return;
     }
-    // No move may cross a required section (Bug 422): a required
-    // section never moves, and no free section swaps with one.
-    // Only top-level sections lock; a move within a child list
-    // never crosses one.
-    if (!Path.contains(QLatin1Char('.')) &&
-        (DocDocument::IsRequiredSectionTitle(
-             DocDocument::SectionTitle(Siblings[Index])) ||
-         DocDocument::IsRequiredSectionTitle(
-             DocDocument::SectionTitle(Siblings[Index + 1])))) {
+    // A required section never moves (Bug 422). A free section
+    // may move past a required neighbour (Bug 512): the required
+    // sections keep their relative order, only their numbers
+    // shift. Only top-level middle sections lock; a move within
+    // a child list, or among appendices, never crosses one.
+    if (IsMiddleTopLevel(Path) &&
+        DocDocument::IsRequiredSectionTitle(
+            DocDocument::SectionTitle(Siblings[Index]))) {
         return;
     }
     xmlNodePtr Moved = Siblings[Index];
     xmlUnlinkNode(Moved);
     xmlAddNextSibling(Siblings[Index + 1], Moved);
-    QString ParentPath;
-    int Dot = Path.lastIndexOf(QLatin1Char('.'));
-    ParentPath = (Dot >= 0) ? Path.left(Dot) : QString();
-    QString NewPath = ParentPath.isEmpty()
-        ? QString::number(Index + 1)
-        : ParentPath + QStringLiteral(".") + QString::number(Index + 1);
+    QString NewPath = ParentListPrefix(Path) + QString::number(Index + 1);
     _SelectedKey = QStringLiteral("section:") + NewPath;
     SetModified(true);
     RebuildOutline();
@@ -2210,44 +2423,43 @@ void MainWindow::OnOutlineContextMenu(const QPoint& Pos)
     if (!SectionSiblings(_Document, Path, Siblings, Index)) {
         return;
     }
-    // Enablement mirrors RefreshSectionControls: only a top-level
-    // section locks, and no move may cross a required section.
-    // Keep the two computations in step.
+    // Enablement mirrors RefreshSectionControls: a required
+    // section never moves, and a free section may move past a
+    // required neighbour (Bug 512). Keep the two computations
+    // in step. Only a top-level middle section locks; a
+    // top-level appendix never does (Bug 513).
     bool TopLevel = !Path.contains(QLatin1Char('.'));
-    bool Required = TopLevel &&
+    bool Required = IsMiddleTopLevel(Path) &&
         DocDocument::IsRequiredSectionTitle(
             DocDocument::SectionTitle(Siblings[Index]));
     bool CanMoveUp = (Index > 0);
     bool CanMoveDown = (Index + 1 < Siblings.size());
-    if (TopLevel) {
-        if (Required) {
-            CanMoveUp = false;
-            CanMoveDown = false;
-        } else {
-            if (CanMoveUp &&
-                DocDocument::IsRequiredSectionTitle(
-                    DocDocument::SectionTitle(Siblings[Index - 1]))) {
-                CanMoveUp = false;
-            }
-            if (CanMoveDown &&
-                DocDocument::IsRequiredSectionTitle(
-                    DocDocument::SectionTitle(Siblings[Index + 1]))) {
-                CanMoveDown = false;
-            }
-        }
+    if (TopLevel && Required) {
+        CanMoveUp = false;
+        CanMoveDown = false;
     }
+    // The move and remove actions work on the section itself, so
+    // they say Section for a top-level section and Subsection for
+    // one below it (Bug 512). Add and Insert add a child section,
+    // so they always say Subsection.
+    QString MoveUpText = TopLevel ? tr("Move Section Up")
+                                  : tr("Move Subsection Up");
+    QString MoveDownText = TopLevel ? tr("Move Section Down")
+                                    : tr("Move Subsection Down");
+    QString RemoveText = TopLevel ? tr("Remove Section")
+                                  : tr("Remove Subsection");
     QMenu Menu(this);
     QAction* AddAction = Menu.addAction(tr("Add Subsection"));
     connect(AddAction, &QAction::triggered, this, &MainWindow::OnAddSubsection);
     QAction* InsertAction = Menu.addAction(tr("Insert Subsection"));
     connect(InsertAction, &QAction::triggered, this, &MainWindow::OnInsertSubsection);
-    QAction* RemoveAction = Menu.addAction(tr("Remove Subsection"));
+    QAction* RemoveAction = Menu.addAction(RemoveText);
     connect(RemoveAction, &QAction::triggered, this, &MainWindow::OnRemoveSection);
     RemoveAction->setEnabled(!Required);
-    QAction* UpAction = Menu.addAction(tr("Move Subsection Up"));
+    QAction* UpAction = Menu.addAction(MoveUpText);
     connect(UpAction, &QAction::triggered, this, &MainWindow::OnMoveSectionUp);
     UpAction->setEnabled(CanMoveUp);
-    QAction* DownAction = Menu.addAction(tr("Move Subsection Down"));
+    QAction* DownAction = Menu.addAction(MoveDownText);
     connect(DownAction, &QAction::triggered, this, &MainWindow::OnMoveSectionDown);
     DownAction->setEnabled(CanMoveDown);
     QAction* PromoteAction = Menu.addAction(tr("Promote Subsection"));
@@ -2340,11 +2552,8 @@ void MainWindow::OnPromoteSubsection()
     if (!SectionSiblings(_Document, ParentPath, ParentSiblings, ParentIndex)) {
         return;
     }
-    int ParentDot = ParentPath.lastIndexOf(QLatin1Char('.'));
-    QString GrandPath = (ParentDot >= 0) ? ParentPath.left(ParentDot) : QString();
-    QString NewPath = GrandPath.isEmpty()
-        ? QString::number(ParentIndex + 1)
-        : GrandPath + QStringLiteral(".") + QString::number(ParentIndex + 1);
+    QString NewPath = ParentListPrefix(ParentPath) +
+        QString::number(ParentIndex + 1);
     _SelectedKey = QStringLiteral("section:") + NewPath;
     SetModified(true);
     RebuildOutline();
@@ -2365,7 +2574,9 @@ void MainWindow::OnDemoteSubsection()
     // A top-level required section cannot be demoted: it would
     // leave the top level, and its presence there is fixed. The
     // menu disables this too; the guard covers any other path.
-    if (!Path.contains(QLatin1Char('.')) &&
+    // Only a top-level middle section locks; a top-level
+    // appendix demotes like any other free section.
+    if (IsMiddleTopLevel(Path) &&
         DocDocument::IsRequiredSectionTitle(
             DocDocument::SectionTitle(Siblings[Index]))) {
         return;
@@ -2379,11 +2590,7 @@ void MainWindow::OnDemoteSubsection()
     xmlNodePtr Previous = Siblings[Index - 1];
     int ChildAt = DocDocument::ChildSectionNodes(Previous).size();
     xmlAddChild(Previous, Moved);
-    int Dot = Path.lastIndexOf(QLatin1Char('.'));
-    QString ParentPath = (Dot >= 0) ? Path.left(Dot) : QString();
-    QString PrevPath = ParentPath.isEmpty()
-        ? QString::number(Index - 1)
-        : ParentPath + QStringLiteral(".") + QString::number(Index - 1);
+    QString PrevPath = ParentListPrefix(Path) + QString::number(Index - 1);
     _SelectedKey = QStringLiteral("section:") + PrevPath +
         QStringLiteral(".") + QString::number(ChildAt);
     SetModified(true);
@@ -4155,17 +4362,32 @@ void MainWindow::OnAbout()
 {
     // Same shape as the CoOp editor's About box: version, what
     // the tool is, copyright, and the MIT license text.
+    // Bug 518: the project page is a clickable link. The box
+    // uses rich text, and the link opens in the default browser.
+    // Only the link carries a color: the body text is left to
+    // the label, which reads on the dark background as it did
+    // before. The link gets an explicit light blue, because the
+    // default link color is dark on dark here (the app's dark
+    // look comes from a stylesheet, not a dark palette, so the
+    // palette's link color stays dark). Wrapping the whole text
+    // in the palette's window-text color was tried and was
+    // backwards: that color is black here, so it made all the
+    // text dark on dark.
     QMessageBox box(this);
     box.setWindowTitle(tr("About ProtocolDocEditor"));
+    box.setTextFormat(Qt::RichText);
     box.setText(
-        tr("ProtocolDocEditor %1\n"
-           "Built %2 %3\n\n"
-           "An editor for IETF Internet-Drafts in RFCXML (xml2rfc) format.\n\n"
-           "Copyright (c) 2026 RiverExplorer LLC\n"
+        tr("ProtocolDocEditor %1<br>"
+           "Built %2 %3<br><br>"
+           "An editor for IETF Internet-Drafts in RFCXML (xml2rfc) format.<br><br>"
+           "Project page: <a href=\"https://github.com/RiverExplorer/InternetDraftEditor\" "
+           "style=\"color: #6EA8FE;\">"
+           "https://github.com/RiverExplorer/InternetDraftEditor</a><br><br>"
+           "Copyright (c) 2026 RiverExplorer LLC<br>"
            "RiverExplorer%4 is a registered trademark of "
-           "Douglas Mark Royer.\n\n"
+           "Douglas Mark Royer.<br><br>"
            "MIT License — free to use and modify, keep the copyright "
-           "notice.\n\n"
+           "notice.<br><br>"
            "Permission is hereby granted, free of charge, to any person "
            "obtaining a copy of this software and associated documentation "
            "files (the \"Software\"), to deal in the Software without "
@@ -4173,10 +4395,10 @@ void MainWindow::OnAbout()
            "copy, modify, merge, publish, distribute, sublicense, and/or "
            "sell copies of the Software, and to permit persons to whom the "
            "Software is furnished to do so, subject to the following "
-           "conditions:\n\n"
+           "conditions:<br><br>"
            "The above copyright notice and this permission notice shall be "
            "included in all copies or substantial portions of the "
-           "Software.\n\n"
+           "Software.<br><br>"
            "THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY "
            "KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE "
            "WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE "
@@ -4189,6 +4411,14 @@ void MainWindow::OnAbout()
             .arg(QStringLiteral(__DATE__))
             .arg(QStringLiteral(__TIME__))
             .arg(QString(QChar(0x00AE))));
+    // A QMessageBox label does not open external links on its
+    // own: the text label (named "qt_msgbox_label" by Qt) needs
+    // openExternalLinks for the click to reach the browser.
+    QLabel* Label =
+        box.findChild<QLabel*>(QStringLiteral("qt_msgbox_label"));
+    if (Label != nullptr) {
+        Label->setOpenExternalLinks(true);
+    }
     box.addButton(QMessageBox::Ok);
     box.exec();
 }
@@ -4937,6 +5167,15 @@ void MainWindow::RebuildOutline()
         AddReferenceGroupItem(References, Groups[g], QString::number(g));
     }
 
+    // The appendix sections, after the references, shown like
+    // sections (Bug 513). Their paths carry a "back:" prefix so
+    // they never collide with the middle paths.
+    QVector<xmlNodePtr> BackSections = _Document.BackSectionNodes();
+    for (int i = 0; i < BackSections.size(); ++i) {
+        AddSectionItem(Back, BackSections[i],
+                       QStringLiteral("back:") + QString::number(i));
+    }
+
     _Outline->expandAll();
 
     QTreeWidgetItem* Selected = nullptr;
@@ -4963,6 +5202,21 @@ void MainWindow::RebuildOutline()
  */
 static QString SectionNumberFromPath(const QString& Path)
 {
+    if (IsBackPath(Path)) {
+        // Appendices are lettered, matching what xml2rfc prints:
+        // "Appendix A" at the top level, "A.1" below it.
+        QString Work = Path.mid(QStringLiteral("back:").size());
+        QStringList Parts = Work.split(QLatin1Char('.'));
+        QString Letter = DocDocument::AppendixLetter(Parts.first().toInt());
+        if (Parts.size() == 1) {
+            return QStringLiteral("Appendix ") + Letter;
+        }
+        QStringList Rest;
+        for (int i = 1; i < Parts.size(); ++i) {
+            Rest.append(QString::number(Parts[i].toInt() + 1));
+        }
+        return Letter + QStringLiteral(".") + Rest.join(QLatin1Char('.'));
+    }
     QStringList Parts = Path.split(QLatin1Char('.'));
     for (QString& Part : Parts) {
         Part = QString::number(Part.toInt() + 1);
@@ -5055,7 +5309,7 @@ void MainWindow::RefreshSectionControls(QTreeWidgetItem* Item)
         if (SectionSiblings(_Document, Path, Siblings, Index)) {
             // Only a top-level section locks: a subsection with a
             // matching title, or a back-matter section, stays free.
-            bool TopLevel = !Path.contains(QLatin1Char('.'));
+            bool TopLevel = IsMiddleTopLevel(Path);
             QString Title = DocDocument::SectionTitle(Siblings[Index]);
             Required = TopLevel &&
                 DocDocument::IsRequiredSectionTitle(Title);
@@ -5063,33 +5317,21 @@ void MainWindow::RefreshSectionControls(QTreeWidgetItem* Item)
                 DocDocument::IsRecommendedSectionTitle(Title);
             CanMoveUp = (Index > 0);
             CanMoveDown = (Index + 1 < Siblings.size());
-            if (TopLevel) {
-                // No move may cross a required section: a required
-                // section never moves, and no free section swaps
-                // with one, so Up is also off for the section just
-                // below one, and Down for the section just above.
-                if (Required) {
-                    CanMoveUp = false;
-                    CanMoveDown = false;
-                } else {
-                    if (CanMoveUp &&
-                        DocDocument::IsRequiredSectionTitle(
-                            DocDocument::SectionTitle(Siblings[Index - 1]))) {
-                        CanMoveUp = false;
-                    }
-                    if (CanMoveDown &&
-                        DocDocument::IsRequiredSectionTitle(
-                            DocDocument::SectionTitle(Siblings[Index + 1]))) {
-                        CanMoveDown = false;
-                    }
-                }
+            if (TopLevel && Required) {
+                // A required section never moves (Bug 422). A free
+                // section may move past a required neighbour (Bug
+                // 512): the required sections keep their relative
+                // order, only their numbers shift as free sections
+                // move past them.
+                CanMoveUp = false;
+                CanMoveDown = false;
             }
         }
     }
     // Add and Insert stay enabled: adding a section never moves a
     // required section relative to an existing one. Add is never
-    // disabled; it appends at the end of the middle list when no
-    // section is selected.
+    // disabled; with no section selected it goes at the end of the
+    // free body sections, before the required back-matter (Bug 512).
     _InsertSectionButton->setEnabled(IsSection);
     _RemoveSectionButton->setEnabled(IsSection && !Required);
     _MoveUpButton->setEnabled(CanMoveUp);
@@ -5208,22 +5450,6 @@ void MainWindow::ShowDetailsFor(QTreeWidgetItem* Item)
             QStringLiteral("\n") +
             tr("• Informative References: Background reading, examples, or "
                "helpful context that are not required for implementation.");
-        int BackItems = 0;
-        for (xmlNodePtr Child : _Document.BackChildNodes()) {
-            // A displayreference is not counted here: it is shown
-            // on the list pages now, not kept out of sight (Bug 405).
-            if (Child->type == XML_ELEMENT_NODE &&
-                !DocDocument::NodeNameEquals(Child, "references") &&
-                !DocDocument::NodeNameEquals(Child, "displayreference")) {
-                ++BackItems;
-            }
-        }
-        if (BackItems > 0) {
-            QString Word = (BackItems == 1) ? tr("item") : tr("items");
-            Text += QStringLiteral("\n\n") +
-                tr("This file also holds back matter (%1 %2), kept when "
-                   "you save but not shown here.").arg(BackItems).arg(Word);
-        }
         _ReferencesLabel->setText(Text);
         _Details->setCurrentIndex(DetailReferences);
         break;
@@ -6529,6 +6755,113 @@ void MainWindow::HandleMakeReference(TextEditor* Editor, int Action,
     Editor->InsertXref(Wanted, Section, Form, SelectionStart, SelectionEnd);
 }
 
+void MainWindow::HandleAnchorChange(TextEditor* Editor,
+                                    const QString& OldAnchor,
+                                    const QString& NewAnchor,
+                                    int FirstBlockPos, bool IsSourceCode,
+                                    const QString& PartKind)
+{
+    // Bug 464 v8: the gear menu asks the owner to change an
+    // anchor, so the references move with it and a cited
+    // anchor cannot be deleted.
+    if (Editor == nullptr) {
+        return;
+    }
+    QString Old = OldAnchor.trimmed();
+    QString New = NewAnchor.trimmed();
+    if (Old == New) {
+        return;
+    }
+    // The setter for this part: a table part goes through
+    // SetTablePartAnchor, a sourcecode or list element through
+    // SetElementAnchor (Bug 448).
+    auto SetAnchor = [&](const QString& Value) {
+        if (!PartKind.isEmpty()) {
+            Editor->SetTablePartAnchor(FirstBlockPos, PartKind, Value);
+        } else {
+            Editor->SetElementAnchor(FirstBlockPos, IsSourceCode, Value);
+        }
+    };
+    if (New.isEmpty()) {
+        // Deleting: refuse when the anchor is cited, or the
+        // cross-references would dangle. The count covers
+        // xrefs and relrefs.
+        if (Old.isEmpty()) {
+            return;
+        }
+        int Count = DocDocument::CitationCountForAnchor(_Document.RfcNode(), Old);
+        if (Count > 0) {
+            QMessageBox::warning(
+                this, tr("Anchor in use"),
+                tr("This anchor is cited by %1 cross-reference(s). It cannot be deleted. Remove the cross-references first.")
+                    .arg(Count));
+            return;
+        }
+        SetAnchor(QString());
+        SetModified(true);
+        return;
+    }
+    // A new anchor must not collide with one already in use:
+    // an anchor names one element.
+    if (DocDocument::DocumentHasAnchor(_Document.RfcNode(), New)) {
+        QMessageBox::warning(
+            this, tr("Anchor in use"),
+            tr("Another element already uses the anchor \"%1\". Pick a different one.")
+                .arg(New));
+        return;
+    }
+    int Cited = 0;
+    if (!Old.isEmpty()) {
+        Cited = DocDocument::CitationCountForAnchor(_Document.RfcNode(), Old);
+    }
+    SetAnchor(New);
+    if (Cited > 0) {
+        // The editor's sync above carried the new anchor into
+        // the model but left the old cross-reference targets in
+        // this section, so the rename runs after it, and the
+        // editor is reloaded from the model so its markers
+        // match the renamed references.
+        DocDocument::RenameXrefTargets(_Document.RfcNode(), Old, New);
+        ReloadEditorFromModel(Editor);
+    }
+    SetModified(true);
+}
+
+void MainWindow::ReloadEditorFromModel(TextEditor* Editor)
+{
+    if (Editor == nullptr) {
+        return;
+    }
+    int Start = -1;
+    int End = -1;
+    Editor->SelectedRange(Start, End);
+    if (Editor == _SectionBodyEdit) {
+        xmlNodePtr Section = FindSection(_SectionPath);
+        if (Section == nullptr) {
+            return;
+        }
+        _SectionBodyEdit->SetBodyNodes(DocDocument::BodyNodes(Section));
+        _SectionBodyEdit->SetPreservedNodes(
+            DocDocument::PreservedBodyNodes(Section));
+    } else if (Editor == _AbstractEdit) {
+        _AbstractEdit->SetBodyNodes(_Document.AbstractBodyNodes());
+        _AbstractEdit->SetPreservedNodes(_Document.AbstractPreservedNodes());
+        _AbstractEditCurrent = true;
+    } else if (Editor == _SettingsNoteEdit) {
+        QVector<xmlNodePtr> Notes = _Document.NoteNodes();
+        if (Notes.isEmpty()) {
+            return;
+        }
+        xmlNodePtr Note = Notes.first();
+        _SettingsNoteEdit->SetBodyNodes(DocDocument::BodyNodes(Note));
+        _SettingsNoteEdit->SetPreservedNodes(
+            DocDocument::PreservedBodyNodes(Note));
+    } else {
+        return;
+    }
+    Editor->RestoreSelection(Start, End);
+}
+
 void MainWindow::FinishNewReference(TextEditor* Editor, xmlNodePtr Group,
                                     const QString& Wanted, const QString& Href,
                                     TextEditor::XrefForm Form,
@@ -7288,8 +7621,29 @@ bool MainWindow::ConfirmDiscard()
     return true;
 }
 
+bool MainWindow::ApplyPendingXmlEdits()
+{
+    if (_SectionBodyEdit != nullptr &&
+        !_SectionBodyEdit->ApplyXmlEdits()) {
+        return false;
+    }
+    if (_AbstractEdit != nullptr && !_AbstractEdit->ApplyXmlEdits()) {
+        return false;
+    }
+    if (_SettingsNoteEdit != nullptr &&
+        !_SettingsNoteEdit->ApplyXmlEdits()) {
+        return false;
+    }
+    return true;
+}
+
 bool MainWindow::SaveToFile(const QString& Path)
 {
+    // Bug 520: apply pending XML edits before saving, so a
+    // paste is not lost by the save writing the old body.
+    if (!ApplyPendingXmlEdits()) {
+        return false;
+    }
     QStringList Found = _Document.Problems();
     if (!Found.isEmpty()) {
         QMessageBox::warning(this, tr("Save Draft"),
@@ -7337,10 +7691,20 @@ bool MainWindow::SaveToFile(const QString& Path)
         }
     }
     QString Error;
-    if (!_Document.WriteXml(Path, Error)) {
+    // Bug 505: the "used as an aid" comment goes in when the
+    // tool created or modified the content (the document is
+    // marked changed), or when the file already carries it (so
+    // an unchanged re-save keeps the marker). A file merely
+    // opened and saved unchanged, that never had the comment,
+    // gets none.
+    bool AddAidComment = _Modified || _Document.HasAidComment;
+    if (!_Document.WriteXml(Path, Error, AddAidComment)) {
         QMessageBox::critical(this, tr("Save Draft"),
                               tr("Could not save %1:\n%2").arg(Path, Error));
         return false;
+    }
+    if (AddAidComment) {
+        _Document.HasAidComment = true;
     }
     // The file now holds exactly what the editor holds, so the
     // skipped-content warning does not fire on the next save.

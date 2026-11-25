@@ -321,10 +321,28 @@ public:
     QVector<xmlNodePtr> TopSectionNodes() const;
 
     /**
-     * @brief Finds a section by its dotted path ("0", "1.2").
+     * @brief The <section> children of <back> (the appendices),
+     *        borrowed, file order. Empty when there is no <back>.
+     * @return The appendix sections.
+     */
+    QVector<xmlNodePtr> BackSectionNodes() const;
+
+    /**
+     * @brief The appendix letter for a zero-based appendix index:
+     *        0 is A, 25 is Z, 26 is AA, and so on.
+     * @param Index The zero-based appendix index.
+     * @return The letter or letters.
+     */
+    static QString AppendixLetter(int Index);
+
+    /**
+     * @brief Finds a section by its dotted path ("0", "1.2", or a
+     *        back path "back:0", "back:0.1").
      *
      * The path indexes into the top sections, then into child
-     * sections, the same scheme the outline already uses.
+     * sections, the same scheme the outline already uses. A path
+     * starting with "back:" indexes into the appendix sections
+     * instead.
      * @param Path The dotted path.
      * @return The section, borrowed, or nullptr when missing.
      */
@@ -880,9 +898,16 @@ public:
      * content is written back in its original position.
      * @param Path The file to write.
      * @param Error Set to the reason when writing fails.
+     * @param AddAidComment When true, a comment naming this tool
+     *        and its version is written at the top of the file,
+     *        before the root element (Bug 505). The caller passes
+     *        true only when the tool created or modified the
+     *        content, or when the file already carries the
+     *        comment (so an unchanged re-save keeps it).
      * @return True when the file was written.
      */
-    bool WriteXml(const QString& Path, QString& Error) const;
+    bool WriteXml(const QString& Path, QString& Error,
+                  bool AddAidComment) const;
 
     /**
      * @brief Reads a draft XML file into this document.
@@ -1095,6 +1120,17 @@ public:
      * content is not affected.
      */
     bool HadSkippedContent = false;
+
+    /**
+     * @brief True when the file already carries the "used as an
+     *        aid" comment (Bug 505).
+     *
+     * ReadXml sets this when the file's top holds the
+     * InternetDraftEditor comment. WriteXml re-writes the
+     * comment when it is set, so an unchanged re-save does not
+     * strip a marker the tool added on an earlier save.
+     */
+    bool HasAidComment = false;
 
 private:
     /**

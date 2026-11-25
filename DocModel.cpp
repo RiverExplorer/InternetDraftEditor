@@ -1414,10 +1414,13 @@ void DocDocument::RebuildBodyChildren(xmlNodePtr Parent,
     // freed, unless the caller passed the very same node back
     // in Editable. Old preserved nodes that the caller did not
     // pass back are freed too, except child sections, which the
-    // caller never lists: they are kept, with an anchor counting
-    // the editable nodes before them, so they stay in place.
+    // caller never lists: they are kept, anchored after all the
+    // editable nodes. The schema requires a section's own body
+    // content before its subsections, so a subsection must never
+    // sit ahead of a body node; anchoring it after the whole
+    // editable list keeps a newly typed paragraph ahead of the
+    // subsections instead of behind them (Bug 510).
     QVector<DocPreservedItem> KeptSections;
-    int EditableSeen = 0;
     for (xmlNodePtr Child : CollectChildren(Parent)) {
         if (Child == KeptName) {
             continue;
@@ -1428,7 +1431,6 @@ void DocDocument::RebuildBodyChildren(xmlNodePtr Parent,
             continue;
         }
         if (BodyNodeIsEditable(Child)) {
-            ++EditableSeen;
             if (!Editable.contains(Child)) {
                 xmlFreeNode(Child);
             }
@@ -1447,7 +1449,9 @@ void DocDocument::RebuildBodyChildren(xmlNodePtr Parent,
         if (IsElementKind(Child) &&
             NodeNameEquals(Child, "section")) {
             DocPreservedItem Kept;
-            Kept.AfterNodes = EditableSeen;
+            // Bug 510: anchor after the whole editable list,
+            // so the subsection lands behind every body node.
+            Kept.AfterNodes = static_cast<int>(Editable.size());
             Kept.Node = Child;
             KeptSections.append(Kept);
             continue;
@@ -1633,12 +1637,14 @@ static void RebuildTextChildren(xmlNodePtr Parent, const char* Name,
 
 DocDocument::DocDocument()
     : HadSkippedContent(false)
+    , HasAidComment(false)
     , _Document(nullptr)
 {
 }
 
 DocDocument::DocDocument(const DocDocument& Other)
     : HadSkippedContent(Other.HadSkippedContent)
+    , HasAidComment(Other.HasAidComment)
     , _Document(Other._Document != nullptr
                 ? xmlCopyDoc(Other._Document, 1) : nullptr)
 {
@@ -1646,10 +1652,12 @@ DocDocument::DocDocument(const DocDocument& Other)
 
 DocDocument::DocDocument(DocDocument&& Other) noexcept
     : HadSkippedContent(Other.HadSkippedContent)
+    , HasAidComment(Other.HasAidComment)
     , _Document(Other._Document)
 {
     Other._Document = nullptr;
     Other.HadSkippedContent = false;
+    Other.HasAidComment = false;
 }
 
 DocDocument& DocDocument::operator=(const DocDocument& Other)
@@ -1660,6 +1668,7 @@ DocDocument& DocDocument::operator=(const DocDocument& Other)
         if (Copied != nullptr || Other._Document == nullptr) {
             ResetDocument(Copied);
             HadSkippedContent = Other.HadSkippedContent;
+            HasAidComment = Other.HasAidComment;
         }
     }
     return *this;
@@ -1670,8 +1679,10 @@ DocDocument& DocDocument::operator=(DocDocument&& Other) noexcept
     if (this != &Other) {
         ResetDocument(Other._Document);
         HadSkippedContent = Other.HadSkippedContent;
+        HasAidComment = Other.HasAidComment;
         Other._Document = nullptr;
         Other.HadSkippedContent = false;
+        Other.HasAidComment = false;
     }
     return *this;
 }
@@ -2292,13 +2303,40 @@ QVector<xmlNodePtr> DocDocument::TopSectionNodes() const
     return ChildElements(MiddleNode(), "section");
 }
 
+QVector<xmlNodePtr> DocDocument::BackSectionNodes() const
+{
+    return ChildSectionNodes(BackNode());
+}
+
+QString DocDocument::AppendixLetter(int Index)
+{
+    if (Index < 0) {
+        return QString();
+    }
+    // Excel-style letters: 0 is A, 25 is Z, 26 is AA, 27 is AB.
+    QString Letters;
+    int N = Index;
+    do {
+        Letters.prepend(QChar('A' + (N % 26)));
+        N = N / 26 - 1;
+    } while (N >= 0);
+    return Letters;
+}
+
 xmlNodePtr DocDocument::FindSectionNode(const QString& Path) const
 {
     if (Path.trimmed().isEmpty()) {
         return nullptr;
     }
-    QStringList Parts = Path.split(QLatin1Char('.'));
-    QVector<xmlNodePtr> Level = TopSectionNodes();
+    QString Work = Path;
+    QVector<xmlNodePtr> Level;
+    if (Work.startsWith(QStringLiteral("back:"))) {
+        Work = Work.mid(QStringLiteral("back:").size());
+        Level = BackSectionNodes();
+    } else {
+        Level = TopSectionNodes();
+    }
+    QStringList Parts = Work.split(QLatin1Char('.'));
     xmlNodePtr Found = nullptr;
     for (const QString& Part : Parts) {
         bool Ok = false;
@@ -2526,20 +2564,29 @@ static bool TreeHasAnchor(xmlNodePtr Node, const QString& Anchor)
  * @param Targets The targets to add to.
  * @param Prefix The outline number of the parent section, empty
  *        at the top level.
+ * @param Appendix True when these are appendix sections: the top
+ *        level is lettered (A, B) instead of numbered, and the
+ *        children follow (A.1).
  */
 static void CollectSectionTargets(const QVector<xmlNodePtr>& Sections,
                                   QVector<DocDocument::InternalTarget>& Targets,
-                                  const QString& Prefix)
+                                  const QString& Prefix,
+                                  bool Appendix = false)
 {
     for (int i = 0; i < Sections.size(); ++i) {
         xmlNodePtr Section = Sections[i];
         DocDocument::InternalTarget Target;
         // The number is the outline number: each part one higher
         // than the zero-based position, matching the numbers
-        // xml2rfc prints (1, 1.2). It is display only.
-        Target.Number = Prefix.isEmpty()
-            ? QString::number(i + 1)
-            : Prefix + QStringLiteral(".") + QString::number(i + 1);
+        // xml2rfc prints (1, 1.2). Appendices are lettered (A,
+        // A.1). It is display only.
+        if (Appendix && Prefix.isEmpty()) {
+            Target.Number = DocDocument::AppendixLetter(i);
+        } else {
+            Target.Number = Prefix.isEmpty()
+                ? QString::number(i + 1)
+                : Prefix + QStringLiteral(".") + QString::number(i + 1);
+        }
         Target.Title = DocDocument::SectionTitle(Section);
         if (Target.Title.trimmed().isEmpty()) {
             Target.Title = QStringLiteral("(unnamed section)");
@@ -2549,7 +2596,7 @@ static void CollectSectionTargets(const QVector<xmlNodePtr>& Sections,
         Target.Node = Section;
         Targets.append(Target);
         CollectSectionTargets(DocDocument::ChildSectionNodes(Section), Targets,
-                             Target.Number);
+                             Target.Number, Appendix);
     }
 }
 
@@ -2593,6 +2640,7 @@ QVector<DocDocument::InternalTarget> DocDocument::InternalTargets() const
 {
     QVector<InternalTarget> Targets;
     CollectSectionTargets(TopSectionNodes(), Targets, QString());
+    CollectSectionTargets(BackSectionNodes(), Targets, QString(), true);
     CollectFigureTableTargets(RfcNode(), Targets);
     return Targets;
 }
@@ -5073,7 +5121,8 @@ static void UpdateWriteDefaults(xmlNodePtr Rfc)
                                   QString::number(Today.year()));
 }
 
-bool DocDocument::WriteXml(const QString& Path, QString& Error) const
+bool DocDocument::WriteXml(const QString& Path, QString& Error,
+                           bool AddAidComment) const
 {
     xmlNodePtr Rfc = RfcNode();
     if (Rfc == nullptr) {
@@ -5087,6 +5136,17 @@ bool DocDocument::WriteXml(const QString& Path, QString& Error) const
         return false;
     }
     AppendToBuffer(Buffer, QStringLiteral("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
+    // Bug 505: a comment naming this tool and its version, at
+    // the top of the file, before the root element. It is added
+    // only when the caller says the tool created or modified
+    // the content, or the file already carries it (so an
+    // unchanged re-save keeps it). The version is the About
+    // version.
+    if (AddAidComment) {
+        QString Aid = QStringLiteral("<!-- InternetDraftEditor %1 was used as an aid to create this document. https://github.com/RiverExplorer/InternetDraftEditor -->\n")
+                          .arg(QCoreApplication::applicationVersion());
+        AppendToBuffer(Buffer, Aid);
+    }
     SerializeElementInto(Buffer, Rfc, 0);
     AppendToBuffer(Buffer, QStringLiteral("\n"));
     QString Xml = BufferText(Buffer);
@@ -5267,8 +5327,21 @@ static void ApplyStructuralPass(xmlDocPtr Document, bool& Skipped)
         if (Child == Root) {
             continue;
         }
-        if (IsCommentKind(Child) || IsPiKind(Child) ||
-            IsEntityRefKind(Child)) {
+        if (IsCommentKind(Child)) {
+            // Bug 521: the tool's own "used as an aid" comment
+            // is written back on save (Bug 505, Bug 522), so it
+            // is not content the save will drop. Do not count
+            // it as skipped.
+            QString Comment;
+            if (Child->content != nullptr) {
+                Comment = TextFromXmlChars(
+                    reinterpret_cast<const xmlChar*>(Child->content));
+            }
+            if (!Comment.contains(
+                    QStringLiteral("InternetDraftEditor"))) {
+                Skipped = true;
+            }
+        } else if (IsPiKind(Child) || IsEntityRefKind(Child)) {
             Skipped = true;
         } else if (Child->type == XML_DTD_NODE) {
             Skipped = true;
@@ -5399,6 +5472,24 @@ bool DocDocument::ReadXml(const QString& Path, QString& Error)
         Error = QStringLiteral("The file does not start with an <rfc> element.");
         xmlFreeDoc(Parsed);
         return false;
+    }
+    // Bug 505: note whether the file already carries the
+    // "used as an aid" comment at the top, before the root
+    // element. It is a document-level comment, so it is a
+    // child of the parsed document, not of the <rfc> element.
+    // When set, a later save re-writes it, so an unchanged
+    // re-save does not strip a marker the tool added earlier.
+    HasAidComment = false;
+    for (xmlNodePtr Child = Parsed->children; Child != nullptr;
+         Child = Child->next) {
+        if (Child->type == XML_COMMENT_NODE && Child->content != nullptr) {
+            QString Comment = TextFromXmlChars(
+                reinterpret_cast<const xmlChar*>(Child->content));
+            if (Comment.contains(QStringLiteral("InternetDraftEditor"))) {
+                HasAidComment = true;
+                break;
+            }
+        }
     }
     bool Skipped = false;
     ApplyStructuralPass(Parsed, Skipped);

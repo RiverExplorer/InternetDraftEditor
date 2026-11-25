@@ -132,6 +132,20 @@ private slots:
     void OnAddSection();
 
     /**
+     * @brief Adds sections pasted into the section body's XML
+     *        tab as subsections of the current section (Bug 520).
+     *
+     * The sections are borrowed (the editor frees its copies
+     * after this returns), so each is deep-copied into the
+     * document first. A pasted anchor that already exists in
+     * the document is made unique, and cross-references inside
+     * the pasted section that point at it are updated to the
+     * new anchor, so the file stays valid.
+     * @param Sections The pasted <section> nodes; borrowed.
+     */
+    void OnSubsectionsPasted(const QVector<xmlNodePtr>& Sections);
+
+    /**
      * @brief Inserts a section before the selected section.
      */
     void OnInsertSection();
@@ -262,6 +276,32 @@ private slots:
     void HandleMakeReference(TextEditor* Editor, int Action,
                              xmlNodePtr Target, const QString& Anchor,
                              const QString& ListName);
+
+    /**
+     * @brief Finishes changing an anchor from a gear menu.
+     *
+     * A delete is refused when the anchor is cited: the
+     * cross-references would dangle. A rename moves every
+     * cross-reference to the new anchor, and the asking editor
+     * is reloaded from the model so its markers match. A new
+     * anchor must not collide with one already in use.
+     * @param Editor The text editor that asked, borrowed.
+     * @param OldAnchor The anchor now on the element, empty when none.
+     * @param NewAnchor The anchor the user entered, empty to clear it.
+     * @param FirstBlockPos The first block of the element, in the editor.
+     * @param IsSourceCode True for a sourcecode element, false for a list.
+     * @param PartKind The table part for a table gear, empty for a
+     *        sourcecode or list gear (Bug 448).
+     */
+    void HandleAnchorChange(TextEditor* Editor, const QString& OldAnchor,
+                            const QString& NewAnchor, int FirstBlockPos,
+                            bool IsSourceCode, const QString& PartKind);
+
+    /**
+     * @brief Reloads an editor from the model, keeping the cursor.
+     * @param Editor The text editor to reload, borrowed.
+     */
+    void ReloadEditorFromModel(TextEditor* Editor);
 
     /**
      * @brief Finishes adding a new RFC reference, once its file is fetched.
@@ -675,6 +715,17 @@ private:
      *        selection where the selected part still exists.
      */
     void RebuildOutline();
+
+    /**
+     * @brief Applies pending XML edits on the section, abstract,
+     *        and settings-note editors (Bug 520).
+     *
+     * Called before a save and before switching outline items,
+     * so an XML paste is not lost. Each editor's ApplyXmlEdits
+     * shows its own error on a parse failure.
+     * @return False when an editor refused to apply (parse error).
+     */
+    bool ApplyPendingXmlEdits();
 
     /**
      * @brief Rebuilds the recent-files entries in the File menu

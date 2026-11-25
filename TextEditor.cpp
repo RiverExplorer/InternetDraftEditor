@@ -35,6 +35,7 @@
 #include <QHelpEvent>
 #include <QInputDialog>
 #include <QKeyEvent>
+#include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
@@ -444,6 +445,15 @@ const QChar VspaceGlyph(0x2195);
 const QChar EmptyItemGlyph(0xFFFD);
 
 /**
+ * @brief The index entry marker glyph: U+24D8, a circled "i"
+ *        (Bug 503). Doug chose it over the replacement character
+ *        U+FFFD, which reads as "this couldn't be displayed",
+ *        and over a bullet: the circled i reads as "there is
+ *        information here", which is what an index entry is.
+ */
+const QChar IrefGlyph(0x24D8);
+
+/**
  * @brief The option marker glyph: a gear, U+2699 (Bug 420).
  */
 const QChar OptionGlyph(0x2699);
@@ -702,6 +712,52 @@ static QString AttributeOf(const QVector<QPair<QString, QString>>& Attributes,
 }
 
 /**
+ * @brief Sets an attribute on a tag entry's list, or removes it (Bug 503).
+ *
+ * An empty value removes the attribute; otherwise the existing
+ * pair is updated, or a new pair is appended when there is none.
+ * @param Attributes The list to change.
+ * @param Name The attribute name.
+ * @param Value The new value, empty to remove it.
+ */
+static void SetTagAttribute(QVector<QPair<QString, QString>>& Attributes,
+                            const QString& Name, const QString& Value)
+{
+    for (int i = 0; i < Attributes.size(); ++i) {
+        if (Attributes[i].first == Name) {
+            if (Value.isEmpty()) {
+                Attributes.remove(i);
+            } else {
+                Attributes[i].second = Value;
+            }
+            return;
+        }
+    }
+    if (!Value.isEmpty()) {
+        Attributes.append(QPair<QString, QString>(Name, Value));
+    }
+}
+
+/**
+ * @brief Returns the value to pre-fill an option prompt with:
+ *        the current value when the attribute is set, otherwise
+ *        the schema default (Bug 464 v3). A prompt that shows
+ *        the default writes it only when the user accepts it;
+ *        clearing the box removes the attribute.
+ * @param Attributes The attributes in file order.
+ * @param Name The attribute name.
+ * @param Default The schema default, empty when there is none.
+ * @return The current value, or the default.
+ */
+static QString PrefillAttribute(
+    const QVector<QPair<QString, QString>>& Attributes,
+    const QString& Name, const QString& Default)
+{
+    QString Value = AttributeOf(Attributes, Name);
+    return Value.isEmpty() ? Default : Value;
+}
+
+/**
  * @brief Sets one attribute, replacing it in place or appending it.
  * @param Attributes The attributes in file order.
  * @param Name The attribute name.
@@ -952,7 +1008,13 @@ static QString SerializeNode(xmlNodePtr Node)
         return QString();
     }
     QString Xml;
-    if (xmlNodeDump(Buffer, Document, Copy, 0, 0) >= 0 &&
+    // Bug 516: format the XML for readability. xmlNodeDump's
+    // format argument is 1 here (pretty-print with indentation),
+    // so the XML pane shows indented, readable XML instead of
+    // one long compact line per node. The pane is read-only, so
+    // the formatting is display only and never reaches the
+    // saved file (WriteXml serializes separately).
+    if (xmlNodeDump(Buffer, Document, Copy, 0, 1) >= 0 &&
         xmlBufferContent(Buffer) != nullptr) {
         Xml = QString::fromUtf8(
             reinterpret_cast<const char*>(xmlBufferContent(Buffer)));
@@ -996,6 +1058,73 @@ static bool FragmentNodeFromXml(const QString& Xml, xmlNodePtr& Node)
     }
     xmlFreeDoc(Document);
     return Node != nullptr;
+}
+
+/**
+ * @brief Parses an XML fragment into its top-level elements (Bug 520).
+ *
+ * The text is wrapped in a <fragment> root and parsed, so a pane
+ * holding several top-level elements (paragraphs, lists, sections)
+ * parses as one document. Only element children are returned; the
+ * whitespace between them (from the pane's pretty-printing) is
+ * skipped. Each returned node is a deep copy the caller owns.
+ * On a parse error the message and its line (in the pane's own
+ * lines, the wrapper line removed) are returned instead.
+ * @param Xml The fragment text.
+ * @param Nodes Receives the owned element nodes, in order.
+ * @param Error Receives the parse error, with its line, on failure.
+ * @return True when the fragment parsed.
+ */
+static bool ParseXmlFragment(const QString& Xml, QVector<xmlNodePtr>& Nodes,
+                             QString& Error)
+{
+    Nodes.clear();
+    Error.clear();
+    // The closing wrapper follows the text directly (no newline
+    // before it), so an unclosed element reports its error on
+    // the line that opened it, not on the wrapper's line.
+    QString Wrapped = QStringLiteral("<fragment>\n") + Xml +
+                      QStringLiteral("</fragment>");
+    QByteArray Utf8 = Wrapped.toUtf8();
+    xmlResetLastError();
+    xmlDocPtr Document = xmlReadMemory(
+        Utf8.constData(), Utf8.size(), nullptr, nullptr,
+        XML_PARSE_NONET | XML_PARSE_NOERROR | XML_PARSE_NOWARNING);
+    if (Document == nullptr) {
+        const xmlError* LastError = xmlGetLastError();
+        QString Text;
+        int Line = 0;
+        if (LastError != nullptr) {
+            Line = LastError->line;
+            if (LastError->message != nullptr) {
+                Text = QString::fromUtf8(
+                    reinterpret_cast<const char*>(LastError->message))
+                           .trimmed();
+            }
+        }
+        // The wrapper's <fragment> line is line 1, so the pane's
+        // own lines are one less than the reported line.
+        if (Line > 1) {
+            --Line;
+        }
+        Error = Text.isEmpty()
+            ? QStringLiteral("The XML could not be parsed.")
+            : (Line > 0
+               ? QStringLiteral("Line %1: %2").arg(Line).arg(Text)
+               : Text);
+        return false;
+    }
+    xmlNodePtr Root = xmlDocGetRootElement(Document);
+    if (Root != nullptr) {
+        for (xmlNodePtr Child = Root->children; Child != nullptr;
+             Child = Child->next) {
+            if (Child->type == XML_ELEMENT_NODE) {
+                Nodes.append(xmlCopyNode(Child, 1));
+            }
+        }
+    }
+    xmlFreeDoc(Document);
+    return true;
 }
 
 /**
@@ -1751,6 +1880,18 @@ static QString MarkerText(const DocTagEntry& Marker,
     if (Marker.Name == QLatin1String("xref")) {
         return XrefMarkerText(Marker, DisplayNames);
     }
+    if (Marker.Name == QLatin1String("iref")) {
+        // Bug 503: an index entry's marker shows only a glyph,
+        // never the item text. The item is the word beside the
+        // marker (the word being indexed), so showing it again
+        // in the marker doubles the word (RTTRTT). The item
+        // stays in the marker's attributes and shows in the
+        // hover; it is edited via Edit index entry, not by
+        // typing in the marker (Bug 514 approach). The glyph is
+        // the circled i (Doug's choice), not the replacement
+        // character, which reads as "couldn't be displayed".
+        return QString(IrefGlyph);
+    }
     QString Item = AttributeOf(Marker.Attributes, QStringLiteral("item"));
     // A newline in an item would split the block when inserted, so
     // newlines become spaces in the marker text.
@@ -2164,8 +2305,10 @@ static bool NodeIsBlank(xmlNodePtr Node)
  * Markers become element nodes: a Break keeps its stored
  * attributes, a Vertical Space takes its blank-line count from
  * the digits typed in its marker text, and an Index Entry takes
- * its item from its marker text, so the item can be edited in
- * place. Characters typed into a Break or Vertical Space marker
+ * its item from its stored attributes (Bug 503: the marker
+ * shows only a glyph, so there is no item text to read; the
+ * item is edited via Edit index entry, not in place).
+ * Characters typed into a Break or Vertical Space marker
  * come out as plain text after the marker, so nothing typed is
  * lost. Adjacent text joins into one text node.
  * @param Events The events.
@@ -2239,14 +2382,13 @@ static void BuildNodeRuns(const QVector<DocEvent>& Events, int& Pos,
                     Run, "blankLines", QString::number(Digits.toInt()));
             }
         } else if (Event.Tag.Name == QLatin1String("iref")) {
-            QString Item = Event.Text.trimmed();
-            if (Item == QString(EmptyItemGlyph)) {
-                Item.clear();
-            }
-            if (Item.isEmpty()) {
-                Item = AttributeOf(Event.Tag.Attributes, QStringLiteral("item"));
-            }
-            DocDocument::SetNodeAttribute(Run, "item", Item);
+            // Bug 503: the marker is a glyph (the circled i), so
+            // the item comes from the stored attributes, not the
+            // marker text. This keeps the save right whatever
+            // glyph the marker uses.
+            DocDocument::SetNodeAttribute(
+                Run, "item",
+                AttributeOf(Event.Tag.Attributes, QStringLiteral("item")));
         } else if (Event.Tag.Name == QLatin1String("xref")) {
             // The marker shows its rendered form (the bracket,
             // the section, or the counter); that text is the
@@ -2437,6 +2579,13 @@ static QTextListFormat ListFormatForKind(
     QTextListFormat Format;
     if (Name == QLatin1String("ol")) {
         Format.setStyle(QTextListFormat::ListDecimal);
+        // Bug 464 v5: an <ol> starts at its start attribute
+        // (default 1). Without this the display always began
+        // at 1 even when the file said start='3'.
+        bool Ok = false;
+        int Start =
+            AttributeOf(Attributes, QStringLiteral("start")).toInt(&Ok);
+        Format.setStart(Ok ? Start : 1);
     } else {
         Format.setStyle(QTextListFormat::ListDisc);
     }
@@ -2868,6 +3017,26 @@ static bool FigurePayloadOf(const QTextBlock& Block, xmlNodePtr& FigureNode,
 }
 
 /**
+ * @brief Returns the Qt alignment for a table align value
+ *        (Bug 448).
+ *
+ * The schema values are left, center, and right; anything else
+ * reads as left, which is the schema default for a cell.
+ * @param Align The align value, empty for none.
+ * @return The alignment.
+ */
+static Qt::Alignment AlignmentForAlignValue(const QString& Align)
+{
+    if (Align == QLatin1String("center")) {
+        return Qt::AlignCenter;
+    }
+    if (Align == QLatin1String("right")) {
+        return Qt::AlignRight;
+    }
+    return Qt::AlignLeft;
+}
+
+/**
  * @brief Marks the cursor's block as a table block with a role.
  * @param Cursor The cursor, in the block to mark.
  * @param Group The table's group number.
@@ -2902,6 +3071,17 @@ static void SetTableCellProperties(QTextCursor& Cursor, int Group,
     SetTableProperties(Cursor, Group, QStringLiteral("cell"), Payload);
     QTextBlockFormat Format = Cursor.blockFormat();
     Format.setProperty(DocTableCellProperty, TableCellToVariant(CellNode));
+    // Bug 448: a cell's align shows at once, so the alignment
+    // is visible in the editor as well as in the XML.
+    QString Align;
+    for (const QPair<QString, QString>& Attribute :
+         NodeAttributes(CellNode)) {
+        if (Attribute.first == QLatin1String("align")) {
+            Align = Attribute.second;
+            break;
+        }
+    }
+    Format.setAlignment(AlignmentForAlignValue(Align));
     Cursor.setBlockFormat(Format);
 }
 
@@ -3236,6 +3416,20 @@ static void InsertNodeChildren(QTextCursor& Cursor, xmlNodePtr Node,
             QString Shown = DocDocument::NodeText(Child);
             Shown.replace(QStringLiteral("\r\n"), QLatin1String("\n"));
             Shown.replace(QLatin1Char('\r'), QLatin1Char('\n'));
+            // Bug 523: a newline followed by indentation is the
+            // file's line wrap (pretty-printing), not a line
+            // break: collapse it and the whitespace around it
+            // to a single space, so the text pane shows flowing
+            // prose instead of the file's wrapped lines and
+            // their leading spaces. A bare newline (no
+            // indentation after it) is a Shift+Enter break the
+            // user put there by hand, so it stays a line break.
+            // Preformatted content (sourcecode, artwork) does
+            // not reach this branch; it has its own inserter
+            // that keeps line breaks.
+            Shown.replace(
+                QRegularExpression(QStringLiteral("[ \\t]*\\n[ \\t]+")),
+                QStringLiteral(" "));
             Shown.replace(QLatin1Char('\n'), SoftBreakChar);
             Cursor.insertText(Shown, FormatForStack(Stack));
         } else if (Child->type == XML_COMMENT_NODE) {
@@ -4826,8 +5020,10 @@ static bool OptionMarkersShown()
  * @brief Returns the hover text for a sourcecode option marker.
  *
  * The tag name, then each option set on the block, then the
- * hint. The anchor never shows: anchors stay invisible. Prep-
- * tool attributes and base/lang settings never show either.
+ * anchor when the block has one, then the hint. The anchor
+ * shows read-only (Bug 464 v2): it is displayed, never
+ * edited from the gear UI. Prep-tool attributes and
+ * base/lang settings never show either.
  * @param Attributes The block's attributes.
  * @return The hover text.
  */
@@ -4857,6 +5053,139 @@ static QString OptionMarkerTooltip(
     if (!Options.isEmpty()) {
         Text += QStringLiteral(": ") + Options.join(QStringLiteral(", "));
     }
+    // Bug 464 v7: the anchor always shows read-only: its
+    // value when the block has one, "(none)" when it has none.
+    QString Anchor = AttributeOf(Attributes, QStringLiteral("anchor"));
+    Text += QStringLiteral("\nAnchor: ") +
+            (Anchor.isEmpty() ? QStringLiteral("(none)") : Anchor);
+    Text += QStringLiteral("\nRight-click to change options.");
+    return Text;
+}
+
+/**
+ * @brief Returns the hover text for a list option marker (Bug 464).
+ *
+ * The tag name, then each option set on the list, then the
+ * anchor when the list has one, then the hint. For an inline
+ * <list> the options are its style, hang indent, and counter;
+ * for a <ul> they are its empty and bare switches, shown as
+ * on or off, plus its spacing and indent (Bug 464 v2). For
+ * an <ol> they are its type, start, group, spacing, and
+ * indent; for a <dl> its spacing, newline, and indent
+ * (Bug 464 v2). The anchor shows read-only: displayed,
+ * never edited from the gear UI. The pn never shows: it is
+ * prep-tool assigned.
+ * @param Kind The list element name: "list", "ul", "ol",
+ *        or "dl".
+ * @param Attributes The list's attributes.
+ * @return The hover text.
+ */
+static QString ListOptionTooltip(
+    const QString& Kind,
+    const QVector<QPair<QString, QString>>& Attributes)
+{
+    QStringList Options;
+    if (Kind == QLatin1String("list")) {
+        QString Style = AttributeOf(Attributes, QStringLiteral("style"));
+        if (!Style.isEmpty()) {
+            Options.append(QStringLiteral("style \"%1\"").arg(Style));
+        }
+        QString HangIndent =
+            AttributeOf(Attributes, QStringLiteral("hangIndent"));
+        if (!HangIndent.isEmpty()) {
+            Options.append(
+                QStringLiteral("hangIndent \"%1\"").arg(HangIndent));
+        }
+        QString Counter =
+            AttributeOf(Attributes, QStringLiteral("counter"));
+        if (!Counter.isEmpty()) {
+            Options.append(
+                QStringLiteral("counter \"%1\"").arg(Counter));
+        }
+    } else if (Kind == QLatin1String("ul")) {
+        QString Empty = AttributeOf(Attributes, QStringLiteral("empty"));
+        if (!Empty.isEmpty()) {
+            Options.append(Empty == QLatin1String("true")
+                               ? QStringLiteral("empty on")
+                               : QStringLiteral("empty off"));
+        }
+        QString Bare = AttributeOf(Attributes, QStringLiteral("bare"));
+        if (!Bare.isEmpty()) {
+            Options.append(Bare == QLatin1String("true")
+                               ? QStringLiteral("bare on")
+                               : QStringLiteral("bare off"));
+        }
+        // Bug 464 v2: a <ul> also carries spacing and indent.
+        QString Spacing =
+            AttributeOf(Attributes, QStringLiteral("spacing"));
+        if (!Spacing.isEmpty()) {
+            Options.append(
+                QStringLiteral("spacing \"%1\"").arg(Spacing));
+        }
+        QString Indent = AttributeOf(Attributes, QStringLiteral("indent"));
+        if (!Indent.isEmpty()) {
+            Options.append(
+                QStringLiteral("indent \"%1\"").arg(Indent));
+        }
+    } else if (Kind == QLatin1String("ol")) {
+        // Bug 464 v2: an <ol> carries type, start, group,
+        // spacing, and indent.
+        QString Type = AttributeOf(Attributes, QStringLiteral("type"));
+        if (!Type.isEmpty()) {
+            Options.append(QStringLiteral("type \"%1\"").arg(Type));
+        }
+        QString Start = AttributeOf(Attributes, QStringLiteral("start"));
+        if (!Start.isEmpty()) {
+            Options.append(QStringLiteral("start \"%1\"").arg(Start));
+        }
+        QString Group = AttributeOf(Attributes, QStringLiteral("group"));
+        if (!Group.isEmpty()) {
+            Options.append(QStringLiteral("group \"%1\"").arg(Group));
+        }
+        QString Spacing =
+            AttributeOf(Attributes, QStringLiteral("spacing"));
+        if (!Spacing.isEmpty()) {
+            Options.append(
+                QStringLiteral("spacing \"%1\"").arg(Spacing));
+        }
+        QString Indent = AttributeOf(Attributes, QStringLiteral("indent"));
+        if (!Indent.isEmpty()) {
+            Options.append(
+                QStringLiteral("indent \"%1\"").arg(Indent));
+        }
+    } else {
+        // Bug 464 v2: a <dl> carries spacing, newline, and indent.
+        QString Spacing =
+            AttributeOf(Attributes, QStringLiteral("spacing"));
+        if (!Spacing.isEmpty()) {
+            Options.append(
+                QStringLiteral("spacing \"%1\"").arg(Spacing));
+        }
+        // Bug 464 v10: the effective default is on (xml2rfc
+        // puts a bare <dl> definition on the next line), so
+        // the tooltip shows the effective value, not just a
+        // set attribute: "newline off" only when explicitly
+        // "false".
+        QString Newline =
+            AttributeOf(Attributes, QStringLiteral("newline"));
+        Options.append(Newline == QLatin1String("false")
+                           ? QStringLiteral("newline off")
+                           : QStringLiteral("newline on"));
+        QString Indent = AttributeOf(Attributes, QStringLiteral("indent"));
+        if (!Indent.isEmpty()) {
+            Options.append(
+                QStringLiteral("indent \"%1\"").arg(Indent));
+        }
+    }
+    QString Text = QStringLiteral("List");
+    if (!Options.isEmpty()) {
+        Text += QStringLiteral(": ") + Options.join(QStringLiteral(", "));
+    }
+    // Bug 464 v7: the anchor always shows read-only: its
+    // value when the list has one, "(none)" when it has none.
+    QString Anchor = AttributeOf(Attributes, QStringLiteral("anchor"));
+    Text += QStringLiteral("\nAnchor: ") +
+            (Anchor.isEmpty() ? QStringLiteral("(none)") : Anchor);
     Text += QStringLiteral("\nRight-click to change options.");
     return Text;
 }
@@ -4929,6 +5258,121 @@ static QTextCharFormat FormatForOptionMarker(
 }
 
 /**
+ * @brief Builds a fresh character format for a list option marker
+ *        (Bug 464).
+ *
+ * The gear shows plain: no underline, no special color, the
+ * document's own font. Only the marker property and the hover
+ * text are set. The property carries the list element name,
+ * "list", "ul", "ol", or "dl", the way the sourcecode marker
+ * carries "sourcecode".
+ * @param Kind The list element name: "list", "ul", "ol",
+ *        or "dl".
+ * @param Attributes The list's attributes, for the hover text.
+ * @return The format.
+ */
+static QTextCharFormat FormatForListOptionMarker(
+    const QString& Kind,
+    const QVector<QPair<QString, QString>>& Attributes)
+{
+    QTextCharFormat Format;
+    Format.setProperty(DocOptionMarkerProperty, Kind);
+    Format.setToolTip(ListOptionTooltip(Kind, Attributes));
+    return Format;
+}
+
+/**
+ * @brief Returns the hover text for a table option marker (Bug 448).
+ *
+ * The part name, then each option set on the part, then the
+ * anchor when the part has one, then the hint. A table and a
+ * cell show their align when set; a section and a row carry
+ * only an anchor. The anchor shows read-only: displayed,
+ * never edited from the gear UI. The pn never shows: it is
+ * prep-tool assigned.
+ * @param Kind The table part: "table", "thead", "tbody",
+ *        "tfoot", "tr", "td", or "th".
+ * @param Attributes The part's attributes.
+ * @return The hover text.
+ */
+/**
+ * @brief The body of a table part's hover text: name, align, anchor.
+ *
+ * No trailing "Right-click..." line: the single-part tooltip adds
+ * it, and a combined gear joins the bodies and adds it once.
+ * @param Kind The table part name.
+ * @param Attributes The part's attributes.
+ * @return The hover body.
+ */
+static QString TableOptionTooltipBody(
+    const QString& Kind,
+    const QVector<QPair<QString, QString>>& Attributes)
+{
+    QString Name;
+    if (Kind == QLatin1String("table")) {
+        Name = QStringLiteral("Table");
+    } else if (Kind == QLatin1String("thead")) {
+        Name = QStringLiteral("Table head");
+    } else if (Kind == QLatin1String("tbody")) {
+        Name = QStringLiteral("Table body");
+    } else if (Kind == QLatin1String("tfoot")) {
+        Name = QStringLiteral("Table foot");
+    } else if (Kind == QLatin1String("tr")) {
+        Name = QStringLiteral("Row");
+    } else if (Kind == QLatin1String("th")) {
+        Name = QStringLiteral("Header cell");
+    } else {
+        Name = QStringLiteral("Cell");
+    }
+    QStringList Options;
+    QString Align = AttributeOf(Attributes, QStringLiteral("align"));
+    if (!Align.isEmpty()) {
+        Options.append(QStringLiteral("align \"%1\"").arg(Align));
+    }
+    QString Text = Name;
+    if (!Options.isEmpty()) {
+        Text += QStringLiteral(": ") + Options.join(QStringLiteral(", "));
+    }
+    // Bug 464 v7: the anchor always shows read-only: its
+    // value when the part has one, "(none)" when it has none.
+    QString Anchor = AttributeOf(Attributes, QStringLiteral("anchor"));
+    Text += QStringLiteral("\nAnchor: ") +
+            (Anchor.isEmpty() ? QStringLiteral("(none)") : Anchor);
+    return Text;
+}
+
+static QString TableOptionTooltip(
+    const QString& Kind,
+    const QVector<QPair<QString, QString>>& Attributes)
+{
+    return TableOptionTooltipBody(Kind, Attributes) +
+           QStringLiteral("\nRight-click to change options.");
+}
+
+/**
+ * @brief Builds a fresh character format for a table option marker
+ *        (Bug 448).
+ *
+ * The gear shows plain: no underline, no special color, the
+ * document's own font. Only the marker property and the hover
+ * text are set. The property carries the table part name,
+ * "table", "thead", "tbody", "tfoot", "tr", "td", or "th", the
+ * way the list marker carries the list kind.
+ * @param Kind The table part name.
+ * @param Attributes The part's attributes, for the hover text.
+ * @return The format.
+ */
+static QTextCharFormat FormatForTableOptionMarker(
+    const QString& Kind,
+    const QVector<QPair<QString, QString>>& Attributes)
+{
+    QTextCharFormat Format;
+    Format.setProperty(DocOptionMarkerProperty, Kind);
+    Format.setToolTip(TableOptionTooltip(Kind, Attributes));
+    return Format;
+}
+
+/**
  * @brief True when the character at a position is an option marker.
  * @param Document The document.
  * @param Pos The character position.
@@ -4953,6 +5397,307 @@ static bool HasOptionMarkerAt(QTextDocument* Document, int Pos)
         }
     }
     return false;
+}
+
+/**
+ * @brief Returns the block whose option gear was clicked.
+ *
+ * The gear is the first character of its element's first
+ * block. A click on it can land at the end of the block
+ * above (the previous element's last block) at a boundary,
+ * so the block at the click and the block after it are both
+ * checked for a leading gear. Falls back to the block at
+ * the click when neither starts with a gear.
+ * @param Document The document.
+ * @param Pos The clicked position.
+ * @return The gear's block.
+ */
+static QTextBlock GearBlockAt(QTextDocument* Document, int Pos)
+{
+    QTextBlock Block = Document->findBlock(Pos);
+    if (Block.isValid() &&
+        HasOptionMarkerAt(Document, Block.position())) {
+        return Block;
+    }
+    QTextBlock Next = Block.isValid() ? Block.next() : QTextBlock();
+    if (Next.isValid() &&
+        HasOptionMarkerAt(Document, Next.position())) {
+        return Next;
+    }
+    return Block;
+}
+
+/**
+ * @brief Returns the table part of the option marker at a position
+ *        (Bug 448).
+ *
+ * The kind comes from the marker property of the fragment at
+ * the position: "table", "thead", "tbody", "tfoot", "tr", "td",
+ * or "th" for a table gear, empty when the character there is
+ * not a table marker.
+ * @param Document The document.
+ * @param Pos The character position.
+ * @return The part name, or empty when no table marker is there.
+ */
+static QString TableGearKindAt(QTextDocument* Document, int Pos)
+{
+    if (Pos < 0) {
+        return QString();
+    }
+    QTextBlock Block = Document->findBlock(Pos);
+    if (!Block.isValid()) {
+        return QString();
+    }
+    for (QTextBlock::iterator It = Block.begin(); !It.atEnd(); ++It) {
+        QTextFragment Fragment = It.fragment();
+        if (Pos >= Fragment.position() &&
+            Pos < Fragment.position() + Fragment.length()) {
+            QString Kind = Fragment.charFormat()
+                               .property(DocOptionMarkerProperty)
+                               .toString();
+            if (Kind == QLatin1String("table") ||
+                Kind == QLatin1String("thead") ||
+                Kind == QLatin1String("tbody") ||
+                Kind == QLatin1String("tfoot") ||
+                Kind == QLatin1String("tr") ||
+                Kind == QLatin1String("td") ||
+                Kind == QLatin1String("th")) {
+                return Kind;
+            }
+            return QString();
+        }
+    }
+    return QString();
+}
+
+/**
+ * @brief One gear a block should carry (Bug 448).
+ *
+ * A table cell's first block can carry up to three gears, outer
+ * part first: the section gear, then the row gear, then the cell
+ * gear. A sourcecode, list, or table caption block carries one.
+ */
+struct DocWantedGear
+{
+    QString Kind;
+    QVector<QPair<QString, QString>> Attributes;
+    // A combined table cell gear carries the hover text for all
+    // the parts it covers, instead of the one built from its own
+    // kind and attributes. Empty for a one-part gear, which keeps
+    // the tooltip its kind and attributes build (Bug 448 v2).
+    QString ToolTip;
+};
+
+/**
+ * @brief Builds the character format for one wanted gear.
+ *
+ * The kind picks the builder: sourcecode, a list kind, or a
+ * table part. The gear shows plain, with the part's hover text.
+ * @param Gear The wanted gear.
+ * @return The format.
+ */
+static QTextCharFormat FormatForGear(const DocWantedGear& Gear)
+{
+    QTextCharFormat Format;
+    if (Gear.Kind == QLatin1String("sourcecode")) {
+        Format = FormatForOptionMarker(Gear.Attributes);
+    } else if (Gear.Kind == QLatin1String("list") ||
+               Gear.Kind == QLatin1String("ul") ||
+               Gear.Kind == QLatin1String("ol") ||
+               Gear.Kind == QLatin1String("dl")) {
+        Format = FormatForListOptionMarker(Gear.Kind, Gear.Attributes);
+    } else {
+        Format = FormatForTableOptionMarker(Gear.Kind, Gear.Attributes);
+    }
+    // A combined table cell gear hovers all the parts it covers;
+    // a one-part gear keeps the tooltip its kind builds (Bug 448 v2).
+    if (!Gear.ToolTip.isEmpty()) {
+        Format.setToolTip(Gear.ToolTip);
+    }
+    return Format;
+}
+
+/**
+ * @brief Returns the row and column of the cell holding a block.
+ * @param Document The document.
+ * @param Block The block, the first block of a cell.
+ * @param Row Receives the grid row.
+ * @param Column Receives the grid column.
+ * @return False when the block sits in no table cell.
+ */
+static bool TableCellOfBlock(QTextDocument* Document,
+                             const QTextBlock& Block, int& Row,
+                             int& Column)
+{
+    Row = -1;
+    Column = -1;
+    QTextTable* Frame = TableOfBlock(Document, Block);
+    if (Frame == nullptr) {
+        return false;
+    }
+    for (int r = 0; r < Frame->rows(); ++r) {
+        for (int c = 0; c < Frame->columns(); ++c) {
+            QTextTableCell Cell = Frame->cellAt(r, c);
+            if (!Cell.isValid()) {
+                continue;
+            }
+            int First = Cell.firstCursorPosition().block().position();
+            int Last = Cell.lastCursorPosition().block().position();
+            if (Block.position() >= First && Block.position() <= Last) {
+                Row = r;
+                Column = c;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief Returns the first grid row of a section (Bug 448).
+ *
+ * The first row whose section, from the marks, is the section
+ * asked for. A table with no marks reads every row as a body
+ * row, so the body's first row is row 0 and the head and foot
+ * have none.
+ * @param Marks The row marks, in grid order.
+ * @param Rows The number of grid rows.
+ * @param Section The section: "thead", "tbody", or "tfoot".
+ * @return The first row of the section, or -1 when it has none.
+ */
+static int FirstRowOfSection(const QVector<DocTableRowMark>& Marks,
+                             int Rows, const QString& Section)
+{
+    for (int r = 0; r < Rows; ++r) {
+        if (SectionOfRow(Marks, r) == Section) {
+            return r;
+        }
+    }
+    return -1;
+}
+
+/**
+ * @brief Returns the gear a block should carry (Bug 448 v2).
+ *
+ * A caption block carries the table gear. A cell's first block
+ * carries ONE gear, whose menu holds a submenu for every part
+ * that applies there: the section when it is the first cell of
+ * the first row of its section, the row when it is the first
+ * cell of its row, and the cell itself, always. The gear's
+ * hover text lists all the parts it covers, outer part first.
+ * Any other block carries none. (v1 gave each part its own
+ * gear, which put three gears on the header row; v2 combines
+ * them into one.)
+ * @param Document The document.
+ * @param Block The block.
+ * @return The wanted gear, empty when the block carries none.
+ */
+static QVector<DocWantedGear> TableGearsForBlock(
+    QTextDocument* Document, const QTextBlock& Block)
+{
+    QVector<DocWantedGear> Gears;
+    if (!IsTableBlock(Block)) {
+        return Gears;
+    }
+    xmlNodePtr Shell = nullptr;
+    QVector<DocTableRowMark> Marks;
+    if (!TablePayloadOf(Block, Shell, Marks)) {
+        return Gears;
+    }
+    if (IsTableCaptionBlock(Block)) {
+        DocWantedGear Gear;
+        Gear.Kind = QStringLiteral("table");
+        Gear.Attributes = NodeAttributes(Shell);
+        Gears.append(Gear);
+        xmlFreeNode(Shell);
+        return Gears;
+    }
+    if (!IsTableCellBlock(Block)) {
+        xmlFreeNode(Shell);
+        return Gears;
+    }
+    int Row = -1;
+    int Column = -1;
+    if (!TableCellOfBlock(Document, Block, Row, Column)) {
+        xmlFreeNode(Shell);
+        return Gears;
+    }
+    QTextTable* Frame = TableOfBlock(Document, Block);
+    int Rows = Frame != nullptr ? Frame->rows() : 0;
+    QString Section = SectionOfRow(Marks, Row);
+    // The parts this one gear covers, outer part first, each
+    // with its own kind and attributes for the hover text.
+    struct Part {
+        QString Kind;
+        QVector<QPair<QString, QString>> Attributes;
+    };
+    QVector<Part> Parts;
+    // The section part sits on the first cell of the first row
+    // of the section.
+    if (Column == 0 && Row == FirstRowOfSection(Marks, Rows, Section)) {
+        Part SectionPart;
+        SectionPart.Kind = Section;
+        if (Section == QLatin1String("thead")) {
+            SectionPart.Attributes = NodeAttributes(
+                DocDocument::ChildElement(Shell, "thead"));
+        } else if (Section == QLatin1String("tfoot")) {
+            SectionPart.Attributes = NodeAttributes(
+                DocDocument::ChildElement(Shell, "tfoot"));
+        } else {
+            SectionPart.Attributes = NodeAttributes(
+                DocDocument::ChildElement(Shell, "tbody"));
+        }
+        Parts.append(SectionPart);
+    }
+    // The row part sits on the first cell of the row. A row the
+    // grid gained since the last load has no mark yet, so it
+    // carries an empty attribute list until one is set.
+    if (Column == 0 && Row >= 0) {
+        Part RowPart;
+        RowPart.Kind = QStringLiteral("tr");
+        if (Row < Marks.size()) {
+            RowPart.Attributes = Marks[Row].Attributes;
+            QString Anchor = Marks[Row].Anchor;
+            if (!Anchor.isEmpty()) {
+                RowPart.Attributes.append(
+                    QPair<QString, QString>(QStringLiteral("anchor"),
+                                            Anchor));
+            }
+        }
+        Parts.append(RowPart);
+    }
+    // The cell part sits on every cell's first block.
+    xmlNodePtr CellNode = nullptr;
+    if (TableCellFromVariant(
+            Block.blockFormat().property(DocTableCellProperty),
+            CellNode)) {
+        Part CellPart;
+        CellPart.Kind = DocDocument::NodeNameEquals(CellNode, "th")
+                            ? QStringLiteral("th")
+                            : QStringLiteral("td");
+        CellPart.Attributes = NodeAttributes(CellNode);
+        Parts.append(CellPart);
+        xmlFreeNode(CellNode);
+    }
+    xmlFreeNode(Shell);
+    if (Parts.isEmpty()) {
+        return Gears;
+    }
+    // One gear for the whole cell: its kind and attributes are
+    // the cell's own (the innermost part), and its hover text
+    // lists every part it covers, outer part first, with one
+    // "Right-click..." line at the end.
+    DocWantedGear Gear;
+    Gear.Kind = Parts.last().Kind;
+    Gear.Attributes = Parts.last().Attributes;
+    QStringList Tips;
+    for (const Part& P : Parts) {
+        Tips.append(TableOptionTooltipBody(P.Kind, P.Attributes));
+    }
+    Gear.ToolTip = Tips.join(QStringLiteral("\n")) +
+                   QStringLiteral("\nRight-click to change options.");
+    Gears.append(Gear);
+    return Gears;
 }
 
 /**
@@ -5180,6 +5925,131 @@ static QTextBlock FirstBlockOfSourceElement(const QTextBlock& Block)
            First.previous().blockFormat().property(DocSourceProperty) ==
                First.blockFormat().property(DocSourceProperty)) {
         First = First.previous();
+    }
+    return First;
+}
+
+/**
+ * @brief True when a block belongs to a list (Bug 464).
+ *
+ * A block belongs when it carries a list kind and either sits
+ * in its list object, is a definition list (which has no list
+ * object: the kind alone claims it), or is a continuation of
+ * the item above it. A block that left its list keeps a stale
+ * kind but no list object and no continuation role, so it reads
+ * back as a plain paragraph and carries no gear.
+ * @param Block The block.
+ * @return True when the block is part of a list.
+ */
+static bool IsListBlock(const QTextBlock& Block)
+{
+    QString Kind =
+        Block.blockFormat().property(DocListKindProperty).toString();
+    if (Kind.isEmpty()) {
+        return false;
+    }
+    if (Kind == QLatin1String("dl")) {
+        return true;
+    }
+    if (Block.textList() != nullptr) {
+        return true;
+    }
+    return ListRoleOf(Block) == QLatin1String("continuation");
+}
+
+/**
+ * @brief True when a block is a blank plain block (Bug 464).
+ *
+ * Such a block is the blank line typed between list items: it
+ * keeps no list properties, belongs to no list itself, but does
+ * not split the list around it. The first-block walk steps
+ * over it. A blank list item is not one: it sits in its list
+ * object, or carries the list kind, so it is a list block.
+ * @param Block The block.
+ * @return True when the block is a blank line between items.
+ */
+static bool IsBlankPlainBlock(const QTextBlock& Block)
+{
+    if (!Block.isValid() || !Block.text().trimmed().isEmpty()) {
+        return false;
+    }
+    QTextBlockFormat Format = Block.blockFormat();
+    if (IsSourceCodeBlock(Block) ||
+        Format.property(DocListKindProperty).isValid() ||
+        Format.property(DocFigureKindProperty).isValid() ||
+        Format.property(DocTableKindProperty).isValid() ||
+        Block.textList() != nullptr ||
+        ListRoleOf(Block) == QLatin1String("continuation")) {
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief True when two blocks belong to the same list (Bug 464).
+ *
+ * Lists group by kind, group number, and attributes, the same
+ * grouping the read-back uses: consecutive blocks sharing all
+ * three are one list node.
+ * @param A The first block.
+ * @param B The second block.
+ * @return True when both are blocks of one list.
+ */
+static bool SameListAs(const QTextBlock& A, const QTextBlock& B)
+{
+    return A.blockFormat().property(DocListKindProperty) ==
+               B.blockFormat().property(DocListKindProperty) &&
+           A.blockFormat().property(DocListGroupProperty) ==
+               B.blockFormat().property(DocListGroupProperty) &&
+           A.blockFormat().property(DocListProperty) ==
+               B.blockFormat().property(DocListProperty);
+}
+
+/**
+ * @brief True when a block is the first block of its list (Bug 464).
+ *
+ * A block is first when it belongs to a list and the block
+ * above it -- stepping over blank lines between items, which
+ * do not split the list -- is no block of the same list.
+ * @param Block The block.
+ * @return True when the block starts its list.
+ */
+static bool IsFirstListBlock(const QTextBlock& Block)
+{
+    if (!IsListBlock(Block)) {
+        return false;
+    }
+    QTextBlock Previous = Block.previous();
+    while (Previous.isValid() && IsBlankPlainBlock(Previous)) {
+        Previous = Previous.previous();
+    }
+    if (!Previous.isValid() || !IsListBlock(Previous)) {
+        return true;
+    }
+    return !SameListAs(Previous, Block);
+}
+
+/**
+ * @brief The first block of the list a block belongs to (Bug 464).
+ *
+ * Walks up while the block above -- stepping over blank lines
+ * between items -- is a block of the same list.
+ * @param Block A block of the list.
+ * @return The list's first block.
+ */
+static QTextBlock FirstListBlock(const QTextBlock& Block)
+{
+    QTextBlock First = Block;
+    while (true) {
+        QTextBlock Previous = First.previous();
+        while (Previous.isValid() && IsBlankPlainBlock(Previous)) {
+            Previous = Previous.previous();
+        }
+        if (!Previous.isValid() || !IsListBlock(Previous) ||
+            !SameListAs(Previous, First)) {
+            break;
+        }
+        First = Previous;
     }
     return First;
 }
@@ -6170,11 +7040,548 @@ static QVariant MarkerAtPosition(QTextDocument* Document, int Pos)
     return QVariant();
 }
 
+/**
+ * @brief The text range of the link holding a position (Bug 514 v2).
+ *
+ * A reference's visible text is read-only: typing or deleting
+ * inside it breaks the reference, so the editor blocks those
+ * keys and offers Rename instead. This finds the link's whole
+ * text range, so the read-only check and the rename both know
+ * what the link covers. A link's text normally sits in one
+ * block; the range stops at the block's edge.
+ * @param Document The document.
+ * @param Pos A position in the link's text.
+ * @param Start Receives the link's first character.
+ * @param End Receives the position just past its last character.
+ * @param LinkName Receives the link tag name.
+ * @param LinkEntry Receives the link entry.
+ * @return False when no link holds the position.
+ */
+static bool LinkRangeAt(QTextDocument* Document, int Pos, int& Start,
+                        int& End, QString& LinkName,
+                        DocTagEntry& LinkEntry)
+{
+    if (Document == nullptr || Pos < 0) {
+        return false;
+    }
+    QTextBlock Block = Document->findBlock(Pos);
+    if (!Block.isValid()) {
+        return false;
+    }
+    // The fragment holding the position, and its link entry.
+    QTextBlock::iterator At = Block.end();
+    DocTagStack First;
+    DocTagEntry FoundEntry;
+    QString FoundName;
+    bool FoundIt = false;
+    for (QTextBlock::iterator It = Block.begin(); !It.atEnd(); ++It) {
+        QTextFragment Fragment = It.fragment();
+        if (Pos >= Fragment.position() &&
+            Pos < Fragment.position() + Fragment.length()) {
+            At = It;
+            First = StackOf(Fragment.charFormat());
+            for (const QString& Name :
+                 {QStringLiteral("xref"), QStringLiteral("eref"),
+                  QStringLiteral("relref"), QStringLiteral("cref")}) {
+                for (const DocTagEntry& Entry : First) {
+                    if (Entry.Name == Name) {
+                        FoundName = Name;
+                        FoundEntry = Entry;
+                        FoundIt = true;
+                        break;
+                    }
+                }
+                if (FoundIt) {
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    if (!FoundIt) {
+        return false;
+    }
+    LinkName = FoundName;
+    LinkEntry = FoundEntry;
+    // Expand to the link's edges: neighbouring fragments hold
+    // the same link entry while the link runs on.
+    Start = At.fragment().position();
+    End = Start + At.fragment().length();
+    QTextBlock::iterator It = At;
+    while (It != Block.begin()) {
+        --It;
+        QTextFragment Fragment = It.fragment();
+        DocTagStack Stack = StackOf(Fragment.charFormat());
+        const DocTagEntry* Entry = nullptr;
+        for (const DocTagEntry& E : Stack) {
+            if (E.Name == LinkName) {
+                Entry = &E;
+                break;
+            }
+        }
+        if (Entry == nullptr || !(*Entry == LinkEntry)) {
+            break;
+        }
+        Start = Fragment.position();
+    }
+    It = At;
+    ++It;
+    while (!It.atEnd()) {
+        QTextFragment Fragment = It.fragment();
+        DocTagStack Stack = StackOf(Fragment.charFormat());
+        const DocTagEntry* Entry = nullptr;
+        for (const DocTagEntry& E : Stack) {
+            if (E.Name == LinkName) {
+                Entry = &E;
+                break;
+            }
+        }
+        if (Entry == nullptr || !(*Entry == LinkEntry)) {
+            break;
+        }
+        End = Fragment.position() + Fragment.length();
+        ++It;
+    }
+    return true;
+}
+
+/**
+ * @brief Whether a cursor would change a reference's text
+ *        (Bug 514 v2).
+ *
+ * A reference's visible text is read-only. The caret touches
+ * it when it sits in [link start, link end): at the link start
+ * and inside it, but not just after it, where typing is plain
+ * text after the link. A selection touches it when it overlaps
+ * the link's text at all. Deleting a selection that covers a
+ * whole link is the one exception: it removes the reference,
+ * which is a deliberate delete, not an edit of its text.
+ * @param Document The document.
+ * @param Cursor The cursor.
+ * @param LinkStart Receives the touched link's first character.
+ * @return True when the cursor would change a link's text.
+ */
+static bool CursorTouchesLinkText(QTextDocument* Document,
+                                  const QTextCursor& Cursor,
+                                  int& LinkStart)
+{
+    if (Document == nullptr) {
+        return false;
+    }
+    if (Cursor.hasSelection()) {
+        int Start = Cursor.selectionStart();
+        int End = Cursor.selectionEnd();
+        QTextBlock Block = Document->findBlock(Start);
+        while (Block.isValid() && Block.position() < End) {
+            for (QTextBlock::iterator It = Block.begin();
+                 !It.atEnd(); ++It) {
+                QTextFragment Fragment = It.fragment();
+                int FragStart = Fragment.position();
+                int FragEnd = FragStart + Fragment.length();
+                if (FragEnd <= Start || FragStart >= End) {
+                    continue;
+                }
+                DocTagStack Stack = StackOf(Fragment.charFormat());
+                for (const QString& Name :
+                     {QStringLiteral("xref"), QStringLiteral("eref"),
+                      QStringLiteral("relref"),
+                      QStringLiteral("cref")}) {
+                    if (!StackHolds(Stack, Name)) {
+                        continue;
+                    }
+                    int LS, LE;
+                    QString LN;
+                    DocTagEntry LE2;
+                    if (LinkRangeAt(Document, FragStart, LS, LE, LN,
+                                    LE2)) {
+                        LinkStart = LS;
+                        return true;
+                    }
+                }
+            }
+            Block = Block.next();
+        }
+        return false;
+    }
+    int Start, End;
+    QString LinkName;
+    DocTagEntry LinkEntry;
+    if (LinkRangeAt(Document, Cursor.position(), Start, End, LinkName,
+                    LinkEntry)) {
+        LinkStart = Start;
+        return true;
+    }
+    return false;
+}
+
+/**
+ * @brief Whether a Backspace/Delete would break a reference
+ *        (Bug 514 v2).
+ *
+ * Deleting a character inside a reference's text breaks it.
+ * Deleting a selection that covers one or more whole links
+ * removes those references, which is a deliberate delete, so
+ * it still goes through. Anything less -- a caret inside a
+ * link, or a selection covering only part of one -- is
+ * refused.
+ * @param Document The document.
+ * @param Cursor The cursor.
+ * @param Code Qt::Key_Backspace or Qt::Key_Delete.
+ * @param LinkStart Receives the broken link's first character.
+ * @return True when the key would break a link.
+ */
+static bool DeletionBreaksLink(QTextDocument* Document,
+                               const QTextCursor& Cursor, int Code,
+                               int& LinkStart)
+{
+    if (Document == nullptr) {
+        return false;
+    }
+    if (Cursor.hasSelection()) {
+        int Start = Cursor.selectionStart();
+        int End = Cursor.selectionEnd();
+        QTextBlock Block = Document->findBlock(Start);
+        while (Block.isValid() && Block.position() < End) {
+            for (QTextBlock::iterator It = Block.begin();
+                 !It.atEnd(); ++It) {
+                QTextFragment Fragment = It.fragment();
+                int FragStart = Fragment.position();
+                int FragEnd = FragStart + Fragment.length();
+                if (FragEnd <= Start || FragStart >= End) {
+                    continue;
+                }
+                int LS, LE;
+                QString LN;
+                DocTagEntry LE2;
+                if (!LinkRangeAt(Document, FragStart, LS, LE, LN, LE2)) {
+                    continue;
+                }
+                // This link is overlapped. It is fully covered
+                // only when the selection spans its whole range.
+                if (Start > LS || End < LE) {
+                    LinkStart = LS;
+                    return true;
+                }
+            }
+            Block = Block.next();
+        }
+        return false;
+    }
+    // Backspace takes the character before the caret; Delete
+    // takes the character at the caret.
+    int Take = (Code == Qt::Key_Backspace)
+                   ? Cursor.position() - 1
+                   : Cursor.position();
+    if (Take < 0) {
+        return false;
+    }
+    int LS, LE;
+    QString LN;
+    DocTagEntry LE2;
+    if (LinkRangeAt(Document, Take, LS, LE, LN, LE2)) {
+        LinkStart = LS;
+        return true;
+    }
+    return false;
+}
+
+/**
+ * @brief The text range of the index entry marker holding a position (Bug 503).
+ *
+ * An index entry is a marker: a single glyph carrying an iref
+ * entry in its marker property. Its text is read-only, like a
+ * reference's (Bug 514), so the editor blocks keys that would
+ * change it and offers Edit index entry instead. This finds
+ * the marker's whole range, so the read-only check and the
+ * edit both know what the marker covers. A marker normally
+ * sits in one block; the range stops at the block's edge.
+ * @param Document The document.
+ * @param Pos A position in the marker's text.
+ * @param Start Receives the marker's first character.
+ * @param End Receives the position just past its last character.
+ * @param IrefEntry Receives the marker entry.
+ * @return False when no index entry marker holds the position.
+ */
+static bool IrefRangeAt(QTextDocument* Document, int Pos, int& Start,
+                        int& End, DocTagEntry& IrefEntry)
+{
+    if (Document == nullptr || Pos < 0) {
+        return false;
+    }
+    QTextBlock Block = Document->findBlock(Pos);
+    if (!Block.isValid()) {
+        return false;
+    }
+    QTextBlock::iterator At = Block.end();
+    DocTagEntry FoundEntry;
+    bool FoundIt = false;
+    for (QTextBlock::iterator It = Block.begin(); !It.atEnd(); ++It) {
+        QTextFragment Fragment = It.fragment();
+        if (Pos >= Fragment.position() &&
+            Pos < Fragment.position() + Fragment.length()) {
+            At = It;
+            QVariant MarkerValue =
+                Fragment.charFormat().property(DocMarkerProperty);
+            if (!MarkerValue.isValid()) {
+                break;
+            }
+            DocTagEntry Entry = EntryFromVariant(MarkerValue);
+            if (Entry.Name != QLatin1String("iref")) {
+                break;
+            }
+            FoundEntry = Entry;
+            FoundIt = true;
+            break;
+        }
+    }
+    if (!FoundIt) {
+        return false;
+    }
+    IrefEntry = FoundEntry;
+    Start = At.fragment().position();
+    End = Start + At.fragment().length();
+    QTextBlock::iterator It = At;
+    while (It != Block.begin()) {
+        --It;
+        QTextFragment Fragment = It.fragment();
+        QVariant MarkerValue =
+            Fragment.charFormat().property(DocMarkerProperty);
+        if (!MarkerValue.isValid()) {
+            break;
+        }
+        if (!(EntryFromVariant(MarkerValue) == IrefEntry)) {
+            break;
+        }
+        Start = Fragment.position();
+    }
+    It = At;
+    ++It;
+    while (!It.atEnd()) {
+        QTextFragment Fragment = It.fragment();
+        QVariant MarkerValue =
+            Fragment.charFormat().property(DocMarkerProperty);
+        if (!MarkerValue.isValid()) {
+            break;
+        }
+        if (!(EntryFromVariant(MarkerValue) == IrefEntry)) {
+            break;
+        }
+        End = Fragment.position() + Fragment.length();
+        ++It;
+    }
+    return true;
+}
+
+/**
+ * @brief Whether a caret or selection would change an index
+ *        entry marker's text (Bug 503).
+ *
+ * The marker is a single glyph; typing or deleting inside it
+ * breaks the index entry, so the key is refused and the hint
+ * says to Edit index entry instead. A caret at the marker's
+ * start touches it; a caret just after it does not, where
+ * typing is plain text after the marker. A selection touches
+ * it when it overlaps the marker at all. Deleting a selection
+ * that covers a whole marker is the one exception: it removes
+ * the index entry, which is a deliberate delete, not an edit
+ * of its text.
+ * @param Document The document.
+ * @param Cursor The cursor.
+ * @param IrefStart Receives the touched marker's first character.
+ * @return True when the cursor would change a marker's text.
+ */
+static bool CursorTouchesIref(QTextDocument* Document,
+                              const QTextCursor& Cursor, int& IrefStart)
+{
+    if (Document == nullptr) {
+        return false;
+    }
+    if (Cursor.hasSelection()) {
+        int Start = Cursor.selectionStart();
+        int End = Cursor.selectionEnd();
+        QTextBlock Block = Document->findBlock(Start);
+        while (Block.isValid() && Block.position() < End) {
+            for (QTextBlock::iterator It = Block.begin();
+                 !It.atEnd(); ++It) {
+                QTextFragment Fragment = It.fragment();
+                int FragStart = Fragment.position();
+                int FragEnd = FragStart + Fragment.length();
+                if (FragEnd <= Start || FragStart >= End) {
+                    continue;
+                }
+                int IS, IE;
+                DocTagEntry IE2;
+                if (IrefRangeAt(Document, FragStart, IS, IE, IE2)) {
+                    IrefStart = IS;
+                    return true;
+                }
+            }
+            Block = Block.next();
+        }
+        return false;
+    }
+    int Start, End;
+    DocTagEntry IrefEntry;
+    if (IrefRangeAt(Document, Cursor.position(), Start, End, IrefEntry)) {
+        IrefStart = Start;
+        return true;
+    }
+    return false;
+}
+
+/**
+ * @brief Whether a Backspace/Delete would break an index entry
+ *        marker (Bug 503).
+ *
+ * Deleting a character inside a marker breaks the index entry.
+ * Deleting a selection that covers a whole marker removes it,
+ * which is a deliberate delete, so it still goes through.
+ * Anything less -- a caret inside a marker, or a selection
+ * covering only part of one -- is refused.
+ * @param Document The document.
+ * @param Cursor The cursor.
+ * @param Code Qt::Key_Backspace or Qt::Key_Delete.
+ * @param IrefStart Receives the broken marker's first character.
+ * @return True when the key would break a marker.
+ */
+static bool DeletionBreaksIref(QTextDocument* Document,
+                               const QTextCursor& Cursor, int Code,
+                               int& IrefStart)
+{
+    if (Document == nullptr) {
+        return false;
+    }
+    if (Cursor.hasSelection()) {
+        int Start = Cursor.selectionStart();
+        int End = Cursor.selectionEnd();
+        QTextBlock Block = Document->findBlock(Start);
+        while (Block.isValid() && Block.position() < End) {
+            for (QTextBlock::iterator It = Block.begin();
+                 !It.atEnd(); ++It) {
+                QTextFragment Fragment = It.fragment();
+                int FragStart = Fragment.position();
+                int FragEnd = FragStart + Fragment.length();
+                if (FragEnd <= Start || FragStart >= End) {
+                    continue;
+                }
+                int IS, IE;
+                DocTagEntry IE2;
+                if (!IrefRangeAt(Document, FragStart, IS, IE, IE2)) {
+                    continue;
+                }
+                // This marker is overlapped. It is fully covered
+                // only when the selection spans its whole range.
+                if (Start > IS || End < IE) {
+                    IrefStart = IS;
+                    return true;
+                }
+            }
+            Block = Block.next();
+        }
+        return false;
+    }
+    // Backspace takes the character before the caret; Delete
+    // takes the character at the caret.
+    int Take = (Code == Qt::Key_Backspace)
+                   ? Cursor.position() - 1
+                   : Cursor.position();
+    if (Take < 0) {
+        return false;
+    }
+    int IS, IE;
+    DocTagEntry IE2;
+    if (IrefRangeAt(Document, Take, IS, IE, IE2)) {
+        IrefStart = IS;
+        return true;
+    }
+    return false;
+}
+
+/**
+ * @brief The character format of a selection that sits entirely
+ *        inside one link, or an invalid format when it does not.
+ *
+ * Typing over a selection takes the format of the character
+ * before the cursor, which is plain text when the selection was
+ * made right-to-left, so the replacement text loses the link
+ * and the reference is destroyed (Bug 514). The format returned
+ * here is the link's own format, so the replacement is inserted
+ * with it and stays a link.
+ * @param Document The document.
+ * @param Cursor The cursor carrying the selection.
+ * @return The link's format, or an invalid format.
+ */
+static QTextCharFormat LinkFormatForSelection(QTextDocument* Document,
+                                              const QTextCursor& Cursor)
+{
+    QTextCharFormat None;
+    if (Document == nullptr || !Cursor.hasSelection()) {
+        return None;
+    }
+    int Start = Cursor.selectionStart();
+    int End = Cursor.selectionEnd();
+    DocTagStack First = StackAtPosition(Document, Start);
+    QString Link;
+    const DocTagEntry* LinkEntry = nullptr;
+    for (const QString& Name :
+         {QStringLiteral("xref"), QStringLiteral("eref"),
+          QStringLiteral("relref"), QStringLiteral("cref")}) {
+        for (const DocTagEntry& Entry : First) {
+            if (Entry.Name == Name) {
+                Link = Name;
+                LinkEntry = &Entry;
+                break;
+            }
+        }
+        if (!Link.isEmpty()) {
+            break;
+        }
+    }
+    if (Link.isEmpty() || LinkEntry == nullptr) {
+        return None;
+    }
+    // Every fragment in the range must hold the same link entry:
+    // a selection spanning a link boundary is not one link.
+    QTextBlock Block = Document->findBlock(Start);
+    QTextCharFormat LinkFormat;
+    while (Block.isValid() && Block.position() < End) {
+        for (QTextBlock::iterator It = Block.begin(); !It.atEnd(); ++It) {
+            QTextFragment Fragment = It.fragment();
+            int FragStart = Fragment.position();
+            int FragEnd = FragStart + Fragment.length();
+            if (FragEnd <= Start || FragStart >= End) {
+                continue;
+            }
+            DocTagStack Stack = StackOf(Fragment.charFormat());
+            const DocTagEntry* Entry = nullptr;
+            for (const DocTagEntry& E : Stack) {
+                if (E.Name == Link) {
+                    Entry = &E;
+                    break;
+                }
+            }
+            if (Entry == nullptr || !(*Entry == *LinkEntry)) {
+                return None;
+            }
+            if (!LinkFormat.isValid()) {
+                LinkFormat = Fragment.charFormat();
+            }
+        }
+        Block = Block.next();
+    }
+    return LinkFormat;
+}
+
 TextEditor::TextEditor(QWidget* Parent)
     : QWidget(Parent)
     , _Tabs(nullptr)
     , _TextEdit(nullptr)
     , _XmlEdit(nullptr)
+    , _XmlPage(nullptr)
+    , _XmlReadOnlyCheck(nullptr)
+    , _XmlPreservedNote(nullptr)
+    , _XmlDirty(false)
+    , _AllowSubsections(false)
     , _BulletedButton(nullptr)
     , _NumberedButton(nullptr)
     , _DefinitionButton(nullptr)
@@ -6186,9 +7593,12 @@ TextEditor::TextEditor(QWidget* Parent)
     , _DiagMarkersShown(false)
     , _DiagMarkersBlocks(0)
     , _DiagMarkersSourceFirst(0)
+    , _DiagMarkersListFirst(0)
     , _DiagMarkersGearsInserted(0)
     , _DiagMarkersGearsRemoved(0)
     , _SrcPlaceholderHintBlock(-1)
+    , _LinkReadOnlyHintPos(-1)
+    , _IrefReadOnlyHintPos(-1)
     , _SpellChecker(nullptr)
     , _Document(nullptr)
     , _BibCache(nullptr)
@@ -6222,6 +7632,33 @@ TextEditor::TextEditor(QWidget* Parent)
     _XmlEdit->setReadOnly(true);
     _XmlEdit->setToolTip(tr("The raw XML of the text, for reading. "
                             "Edit on the Text tab."));
+    connect(_XmlEdit, &QPlainTextEdit::textChanged,
+            this, &TextEditor::OnXmlTextChanged);
+
+    // Bug 520: the XML tab carries a Read-only checkbox at the
+    // top, checked by default. Unchecking it makes the pane
+    // editable, so XML can be pasted and edited directly instead
+    // of hand-editing the file outside the editor.
+    _XmlReadOnlyCheck = new QCheckBox(tr("Read-only"), this);
+    _XmlReadOnlyCheck->setChecked(true);
+    _XmlReadOnlyCheck->setToolTip(
+        tr("Uncheck to edit the XML directly. Re-checking applies "
+           "the edits: the XML is re-parsed and the text rebuilt "
+           "from it. A parse error keeps the box unchecked so the "
+           "XML can be fixed, and the document is untouched."));
+    connect(_XmlReadOnlyCheck, &QCheckBox::toggled,
+            this, &TextEditor::OnXmlReadOnlyToggled);
+    _XmlPreservedNote = new QLabel(this);
+    _XmlPreservedNote->setVisible(false);
+    _XmlPage = new QWidget(this);
+    QVBoxLayout* XmlLayout = new QVBoxLayout(_XmlPage);
+    QHBoxLayout* XmlTopRow = new QHBoxLayout();
+    XmlTopRow->addWidget(_XmlReadOnlyCheck);
+    XmlTopRow->addWidget(_XmlPreservedNote);
+    XmlTopRow->addStretch();
+    XmlLayout->addLayout(XmlTopRow);
+    XmlLayout->addWidget(_XmlEdit);
+    XmlLayout->setContentsMargins(0, 0, 0, 0);
 
     _BulletedButton = new QPushButton(tr("Bulleted list"), this);
     _NumberedButton = new QPushButton(tr("Numbered list"), this);
@@ -6295,7 +7732,8 @@ TextEditor::TextEditor(QWidget* Parent)
     // The markers checkbox shows or hides the gear markers
     // that open a block's options. Its setting is shared by
     // every text editor pane and remembered across runs.
-    _ShowMarkersCheck = new QCheckBox(tr("Show option markers"), this);
+    _ShowMarkersCheck = new QCheckBox(
+        tr("Show option markers") + QStringLiteral(" ") + OptionGlyph, this);
     _ShowMarkersCheck->setToolTip(
         tr("Show the gear markers that open a block's options."));
     _ShowMarkersCheck->setChecked(OptionMarkersShown());
@@ -6321,7 +7759,7 @@ TextEditor::TextEditor(QWidget* Parent)
 
     _Tabs = new QTabWidget(this);
     _Tabs->addTab(TextPage, tr("Text"));
-    _Tabs->addTab(_XmlEdit, tr("XML"));
+    _Tabs->addTab(_XmlPage, tr("XML"));
     connect(_Tabs, &QTabWidget::currentChanged,
             this, &TextEditor::OnTabChanged);
 
@@ -6411,6 +7849,70 @@ void TextEditor::ShowSrcPlaceholderHint(int BlockPos)
            "edited. To add text after it, move to the next line."));
 }
 
+void TextEditor::ShowLinkReadOnlyHint(int LinkStart)
+{
+    if (LinkStart == _LinkReadOnlyHintPos) {
+        return;
+    }
+    _LinkReadOnlyHintPos = LinkStart;
+    QMessageBox::information(
+        _TextEdit, tr("Reference text"),
+        tr("This text is part of a reference and cannot be edited "
+           "directly. Right-click the reference and choose Rename "
+           "to change it, or select the whole reference and press "
+           "Delete to remove it."));
+}
+
+void TextEditor::ShowIrefReadOnlyHint(int IrefStart)
+{
+    if (IrefStart == _IrefReadOnlyHintPos) {
+        return;
+    }
+    _IrefReadOnlyHintPos = IrefStart;
+    QMessageBox::information(
+        _TextEdit, tr("Index entry"),
+        tr("This is an index entry marker and cannot be edited "
+           "directly. Right-click it and choose Edit index entry "
+           "to change it, or select the whole marker and press "
+           "Delete to remove it."));
+}
+
+QString TextEditor::ResolvedXrefTip(const QTextCursor& At,
+                                    const QString& Fallback) const
+{
+    if (_Document == nullptr) {
+        return Fallback;
+    }
+    int Start, End;
+    QString LinkName;
+    DocTagEntry LinkEntry;
+    if (!LinkRangeAt(_TextEdit->document(), At.position(), Start, End,
+                     LinkName, LinkEntry)) {
+        return Fallback;
+    }
+    if (LinkName != QLatin1String("xref")) {
+        return Fallback;
+    }
+    QString Target =
+        AttributeOf(LinkEntry.Attributes, QStringLiteral("target"));
+    if (Target.isEmpty()) {
+        return Fallback;
+    }
+    for (const DocDocument::InternalTarget& Found :
+         _Document->InternalTargets()) {
+        if (Found.Anchor != Target) {
+            continue;
+        }
+        QString Text = QStringLiteral("Cross-reference to ") + Found.Kind;
+        if (!Found.Number.isEmpty()) {
+            Text += QStringLiteral(" ") + Found.Number;
+        }
+        Text += QStringLiteral(": ") + Found.Title;
+        return Text;
+    }
+    return Fallback;
+}
+
 bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
 {
     if (Watched == _TextEdit->viewport() &&
@@ -6422,6 +7924,10 @@ bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
         QTextCursor At = _TextEdit->cursorForPosition(Help->pos());
         QString Tip = At.charFormat().toolTip();
         if (!Tip.isEmpty()) {
+            // Bug 515: a cross-reference hover shows the section
+            // it points to, not just its anchor, so it stays
+            // right when sections are renumbered.
+            Tip = ResolvedXrefTip(At, Tip);
             QToolTip::showText(Help->globalPos(), Tip, _TextEdit);
             return true;
         }
@@ -6449,6 +7955,27 @@ bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
     int Code = Key->key();
     bool ControlHeld = Held == Qt::ControlModifier;
     if (Code == Qt::Key_Backspace || Code == Qt::Key_Delete) {
+        // Bug 514 v2: a reference's visible text is read-only.
+        // Deleting inside it breaks the reference, so the key
+        // is swallowed and the hint says to Rename instead.
+        // Deleting a selection that covers a whole link removes
+        // the reference, which is a deliberate delete, so it
+        // still goes through.
+        int BreakLinkStart = -1;
+        if (DeletionBreaksLink(_TextEdit->document(), Cursor, Code,
+                               BreakLinkStart)) {
+            ShowLinkReadOnlyHint(BreakLinkStart);
+            return true;
+        }
+        // Bug 503: an index entry marker is read-only the same
+        // way. Deleting inside it breaks the entry; deleting a
+        // selection that covers the whole marker removes it.
+        int BreakIrefStart = -1;
+        if (DeletionBreaksIref(_TextEdit->document(), Cursor, Code,
+                               BreakIrefStart)) {
+            ShowIrefReadOnlyHint(BreakIrefStart);
+            return true;
+        }
         if (!Cursor.hasSelection()) {
             // The empty paragraph after a trailing sourcecode
             // block is where the writer types after the code:
@@ -6546,6 +8073,24 @@ bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
             return true;
         }
     } else if (!Key->text().isEmpty() && (Plain || ShiftOnly)) {
+        // Bug 514 v2: a reference's visible text is read-only.
+        // Typing into it breaks the reference, so the key is
+        // swallowed and the hint says to Rename instead.
+        int LinkStart = -1;
+        if (CursorTouchesLinkText(_TextEdit->document(), Cursor,
+                                  LinkStart)) {
+            ShowLinkReadOnlyHint(LinkStart);
+            return true;
+        }
+        // Bug 503: an index entry marker is read-only the same
+        // way. Typing into it breaks the entry, so the key is
+        // swallowed and the hint says to Edit index entry.
+        int IrefStart = -1;
+        if (CursorTouchesIref(_TextEdit->document(), Cursor,
+                              IrefStart)) {
+            ShowIrefReadOnlyHint(IrefStart);
+            return true;
+        }
         if (Cursor.hasSelection() &&
             (SelectionCoversOptionMarker(_TextEdit->document(),
                                          Cursor) ||
@@ -6596,6 +8141,25 @@ bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
                     : FormatForStack(StackOf(CharFormat));
             Cursor.setCharFormat(Fixed);
             _TextEdit->setTextCursor(Cursor);
+        }
+        // Bug 514: typing over a selection that sits entirely
+        // inside one link must keep the link. The default insert
+        // takes the format of the character before the cursor,
+        // which is plain text when the selection was made
+        // right-to-left, so the replacement text loses the link
+        // and the reference is destroyed. Insert it here with
+        // the link's own format instead.
+        if (Cursor.hasSelection()) {
+            QTextCharFormat LinkFormat = LinkFormatForSelection(
+                _TextEdit->document(), Cursor);
+            if (LinkFormat.isValid()) {
+                Cursor.beginEditBlock();
+                Cursor.removeSelectedText();
+                Cursor.insertText(Key->text(), LinkFormat);
+                Cursor.endEditBlock();
+                _TextEdit->setTextCursor(Cursor);
+                return true;
+            }
         }
     }
     // A deletion key that was not swallowed by a branch above
@@ -7107,8 +8671,15 @@ void TextEditor::SetBodyNodes(const QVector<xmlNodePtr>& Nodes)
         }
     }
     EnsureTrailingPlainParagraph();
-    UpdateOptionMarkers();
     Cursor.endEditBlock();
+    // Bug 517: the sweep runs after the edit block closes.
+    // A table inserted inside an open edit block has no
+    // frame yet for QTextCursor::currentTable(), so the sweep
+    // could not find any cell's row and column and skipped
+    // every cell gear, leaving only the caption gear. Once
+    // the block closes, currentTable() answers, and the cell
+    // gears are inserted too.
+    UpdateOptionMarkers();
     Cursor.setPosition(0);
     _TextEdit->setTextCursor(Cursor);
     _SettingParagraphs = false;
@@ -7129,6 +8700,83 @@ void TextEditor::SetPreservedNodes(const QVector<DocPreservedItem>& Items)
         _PreservedNodes.append(Copy);
     }
     RefreshXmlTab();
+}
+
+void TextEditor::SetAllowSubsections(bool Allow)
+{
+    _AllowSubsections = Allow;
+}
+
+bool TextEditor::XmlEditsPending() const
+{
+    return _XmlDirty;
+}
+
+bool TextEditor::ApplyXmlEdits()
+{
+    if (!XmlEditsPending()) {
+        return true;
+    }
+    QVector<xmlNodePtr> Parsed;
+    QString Error;
+    if (!ParseXmlFragment(_XmlEdit->toPlainText(), Parsed, Error)) {
+        // The error is shown and the box stays unchecked, so the
+        // XML can be fixed; the model is untouched, so a bad
+        // paste cannot corrupt the document or drop edits.
+        QMessageBox::warning(
+            this, tr("XML error"),
+            tr("The XML could not be applied:\n%1\n\nFix the XML "
+               "and re-check Read-only to try again. The document "
+               "is unchanged.").arg(Error));
+        for (xmlNodePtr Node : Parsed) {
+            xmlFreeNode(Node);
+        }
+        return false;
+    }
+    QVector<xmlNodePtr> Body;
+    QVector<xmlNodePtr> Sections;
+    for (xmlNodePtr Node : Parsed) {
+        QString Name = QString::fromUtf8(
+            reinterpret_cast<const char*>(Node->name));
+        if (Name == QLatin1String("section")) {
+            Sections.append(Node);
+        } else {
+            Body.append(Node);
+        }
+    }
+    if (!Sections.isEmpty() && !_AllowSubsections) {
+        QMessageBox::warning(
+            this, tr("Sections cannot be pasted here"),
+            tr("A <section> cannot be pasted into this XML view. "
+               "Sections belong in a section body, not here. "
+               "Nothing was applied."));
+        for (xmlNodePtr Node : Parsed) {
+            xmlFreeNode(Node);
+        }
+        return false;
+    }
+    SetBodyNodes(Body);
+    if (!Sections.isEmpty()) {
+        // The owner copies the sections into the document
+        // synchronously; the editor frees its copies after the
+        // signal returns.
+        emit SubsectionsPasted(Sections);
+    }
+    for (xmlNodePtr Node : Parsed) {
+        xmlFreeNode(Node);
+    }
+    _XmlDirty = false;
+    if (_XmlReadOnlyCheck != nullptr) {
+        QSignalBlocker Blocker(_XmlReadOnlyCheck);
+        _XmlReadOnlyCheck->setChecked(true);
+    }
+    _XmlEdit->setReadOnly(true);
+    // SetBodyNodes fills without sending TextChanged, so the
+    // edit is announced here: the owner writes the new body
+    // into the document and marks it modified.
+    emit TextChanged();
+    RefreshXmlTab();
+    return true;
 }
 
 QVector<xmlNodePtr> TextEditor::BodyNodes() const
@@ -7436,6 +9084,17 @@ void TextEditor::Clear()
     _SettingParagraphs = true;
     _TextEdit->clear();
     _XmlEdit->clear();
+    // Bug 520: a fresh fill starts read-only, with no pending
+    // XML edits.
+    _XmlDirty = false;
+    if (_XmlReadOnlyCheck != nullptr) {
+        QSignalBlocker CheckBlocker(_XmlReadOnlyCheck);
+        _XmlReadOnlyCheck->setChecked(true);
+    }
+    if (_XmlPreservedNote != nullptr) {
+        _XmlPreservedNote->setVisible(false);
+    }
+    _XmlEdit->setReadOnly(true);
     FreeOwnedNodes();
     _SettingParagraphs = false;
 }
@@ -7451,12 +9110,14 @@ int TextEditor::BlockCount() const
 QString TextEditor::MarkerSweepReport() const
 {
     return tr("Markers: setting %1, blocks scanned %2, first source "
-              "blocks %3, gears inserted %4, gears removed %5.")
+              "blocks %3, gears inserted %4, gears removed %5, first "
+              "list blocks %6.")
         .arg(_DiagMarkersShown ? tr("on") : tr("off"))
         .arg(_DiagMarkersBlocks)
         .arg(_DiagMarkersSourceFirst)
         .arg(_DiagMarkersGearsInserted)
-        .arg(_DiagMarkersGearsRemoved);
+        .arg(_DiagMarkersGearsRemoved)
+        .arg(_DiagMarkersListFirst);
 }
 
 void TextEditor::OnTextDocumentChanged()
@@ -7475,8 +9136,47 @@ void TextEditor::OnTextDocumentChanged()
 
 void TextEditor::OnTabChanged(int Index)
 {
-    if (_Tabs->widget(Index) == _XmlEdit) {
+    if (_Tabs->widget(Index) == _XmlPage) {
         RefreshXmlTab();
+        return;
+    }
+    // Switching to the Text tab applies pending XML edits, so
+    // the Text tab shows the pasted content and a later save
+    // cannot lose it. On a parse error the switch is refused
+    // and the user stays on the XML tab to fix the XML (Bug 520).
+    if (XmlEditsPending() && !ApplyXmlEdits()) {
+        QSignalBlocker Blocker(_Tabs);
+        _Tabs->setCurrentWidget(_XmlPage);
+    }
+}
+
+void TextEditor::OnXmlReadOnlyToggled(bool Checked)
+{
+    if (Checked) {
+        // Re-checking applies the edits. On a parse error the
+        // box is left unchecked so the XML can be fixed (Bug 520).
+        if (!ApplyXmlEdits()) {
+            QSignalBlocker Blocker(_XmlReadOnlyCheck);
+            _XmlReadOnlyCheck->setChecked(false);
+        }
+        return;
+    }
+    // Unchecking opens the pane for editing: it becomes
+    // editable and shows only the body nodes, so the re-parse
+    // has no preserved content to separate out. Preserved
+    // content is kept, and reappears when the box is re-checked.
+    _XmlEdit->setReadOnly(false);
+    _XmlDirty = false;
+    RefreshXmlTab();
+    _XmlEdit->setFocus();
+}
+
+void TextEditor::OnXmlTextChanged()
+{
+    // Programmatic fills block this signal; only a user edit
+    // while the pane is editable marks the XML dirty (Bug 520).
+    if (_XmlReadOnlyCheck != nullptr && !_XmlReadOnlyCheck->isChecked()) {
+        _XmlDirty = true;
     }
 }
 
@@ -7488,6 +9188,7 @@ void TextEditor::UpdateOptionMarkers()
     _DiagMarkersShown = Shown;
     _DiagMarkersBlocks = 0;
     _DiagMarkersSourceFirst = 0;
+    _DiagMarkersListFirst = 0;
     _DiagMarkersGearsInserted = 0;
     _DiagMarkersGearsRemoved = 0;
     // The sweep's own edits must not re-enter the change
@@ -7504,13 +9205,62 @@ void TextEditor::UpdateOptionMarkers()
     for (QTextBlock Block = Document->lastBlock(); Block.isValid();
          Block = Block.previous()) {
         int BlockPos = Block.position();
-        bool First = IsFirstSourceBlock(Block);
+        // The gears this block should carry, in order, each with
+        // the format it wants. A sourcecode or list block carries
+        // one; a table caption carries one; a table cell's first
+        // block carries up to three, outer part first: section,
+        // row, cell (Bug 448). A sourcecode block is never also
+        // a list block, so the sourcecode check comes first.
+        QVector<DocWantedGear> WantedGears;
+        QVector<QPair<QString, QString>> Attributes;
+        bool FirstSource = IsFirstSourceBlock(Block);
+        bool FirstList = false;
+        QString ListKind;
+        if (!FirstSource && IsFirstListBlock(Block)) {
+            ListKind = Block.blockFormat()
+                           .property(DocListKindProperty)
+                           .toString();
+            // Every list kind gets a gear now (Bug 464 v2):
+            // "list", "ul", "ol", and "dl" all carry options.
+            FirstList = true;
+        }
+        if (FirstSource) {
+            Attributes = AttributesFromVariant(
+                Block.blockFormat().property(DocSourceProperty));
+            DocWantedGear Gear;
+            Gear.Kind = QStringLiteral("sourcecode");
+            Gear.Attributes = Attributes;
+            WantedGears.append(Gear);
+        } else if (FirstList) {
+            Attributes = AttributesFromVariant(
+                Block.blockFormat().property(DocListProperty));
+            DocWantedGear Gear;
+            Gear.Kind = ListKind;
+            Gear.Attributes = Attributes;
+            WantedGears.append(Gear);
+        } else {
+            WantedGears = TableGearsForBlock(Document, Block);
+        }
+        bool First = !WantedGears.isEmpty();
         ++_DiagMarkersBlocks;
-        if (First) {
+        if (FirstSource) {
             ++_DiagMarkersSourceFirst;
         }
+        if (FirstList) {
+            ++_DiagMarkersListFirst;
+        }
         bool ShowGear = Shown && First;
-        QVector<int> Gears;
+        int WantedCount = ShowGear ? WantedGears.size() : 0;
+        // The gears already in the block, with their kinds.
+        // A gear is a gear character carrying the marker
+        // property; its kind is the property's value.
+        struct FoundGear {
+            int Pos;
+            QString Kind;
+            QString ToolTip;
+            bool Pure;
+        };
+        QVector<FoundGear> Found;
         for (QTextBlock::iterator It = Block.begin(); !It.atEnd(); ++It) {
             QTextFragment Fragment = It.fragment();
             if (!Fragment.charFormat()
@@ -7521,76 +9271,73 @@ void TextEditor::UpdateOptionMarkers()
             QString Text = Fragment.text();
             for (int i = 0; i < Text.size(); ++i) {
                 if (Text.at(i) == OptionGlyph) {
-                    Gears.append(Fragment.position() + i);
+                    FoundGear Gear;
+                    Gear.Pos = Fragment.position() + i;
+                    Gear.Kind = Fragment.charFormat()
+                                    .property(DocOptionMarkerProperty)
+                                    .toString();
+                    Gear.ToolTip = Fragment.charFormat().toolTip();
+                    Gear.Pure = Text == QString(OptionGlyph);
+                    Found.append(Gear);
                 }
             }
         }
-        // Every gear past the first character goes, and every
-        // gear goes when no marker belongs here. Last first,
-        // so the positions stay valid.
-        for (int i = Gears.size() - 1; i >= 0; --i) {
-            if (ShowGear && Gears[i] == BlockPos) {
-                continue;
-            }
-            Sweep.setPosition(Gears[i]);
-            Sweep.setPosition(Gears[i] + 1, QTextCursor::KeepAnchor);
-            Sweep.removeSelectedText();
-            ++_DiagMarkersGearsRemoved;
-            if (CursorPos > Gears[i]) {
-                --CursorPos;
-            }
-            if (CursorAnchor > Gears[i]) {
-                --CursorAnchor;
-            }
-            MovedText = true;
-        }
-        QVector<QPair<QString, QString>> Attributes =
-            AttributesFromVariant(
-                Block.blockFormat().property(DocSourceProperty));
-        if (ShowGear) {
-            QTextCharFormat Wanted = FormatForOptionMarker(Attributes);
-            if (!Gears.contains(BlockPos)) {
-                Sweep.setPosition(BlockPos);
-                Sweep.insertText(QString(OptionGlyph), Wanted);
-                ++_DiagMarkersGearsInserted;
-                if (CursorPos > BlockPos) {
-                    ++CursorPos;
-                }
-                if (CursorAnchor > BlockPos) {
-                    ++CursorAnchor;
-                }
-                MovedText = true;
-            } else {
-                // A marker is here: make sure it is exactly the
-                // gear, with the current hover text. When the gear
-                // shares its fragment with other text, the gear
-                // takes its own format here, and the pass below
-                // clears the marker property off the rest.
-                for (QTextBlock::iterator It = Block.begin(); !It.atEnd();
-                     ++It) {
-                    QTextFragment Fragment = It.fragment();
-                    if (BlockPos < Fragment.position() ||
-                        BlockPos >=
-                            Fragment.position() + Fragment.length()) {
-                        continue;
-                    }
-                    bool Pure =
-                        Fragment.text() == QString(OptionGlyph);
-                    if (!Pure ||
-                        Fragment.charFormat().toolTip() !=
-                            Wanted.toolTip()) {
-                        Sweep.setPosition(BlockPos);
-                        Sweep.setPosition(BlockPos + 1,
-                                          QTextCursor::KeepAnchor);
-                        Sweep.setCharFormat(Wanted);
-                    }
+        // The block is already right when its gears sit exactly
+        // where the wanted gears belong, each with the right kind
+        // and hover text, each alone in its fragment, and no
+        // other gear hides anywhere in the block.
+        bool GearsRight = Found.size() == WantedCount;
+        if (GearsRight) {
+            for (int i = 0; i < WantedCount; ++i) {
+                QTextCharFormat Wanted = FormatForGear(WantedGears[i]);
+                if (Found[i].Pos != BlockPos + i ||
+                    Found[i].Kind != WantedGears[i].Kind ||
+                    Found[i].ToolTip != Wanted.toolTip() ||
+                    !Found[i].Pure) {
+                    GearsRight = false;
                     break;
                 }
             }
-            // Any other text in the block that took the gear's
+        }
+        if (!GearsRight) {
+            // Wrong gears go, last first, so the positions stay
+            // valid; then the wanted gears go in, first first,
+            // each at its own position.
+            for (int i = Found.size() - 1; i >= 0; --i) {
+                Sweep.setPosition(Found[i].Pos);
+                Sweep.setPosition(Found[i].Pos + 1,
+                                  QTextCursor::KeepAnchor);
+                Sweep.removeSelectedText();
+                ++_DiagMarkersGearsRemoved;
+                if (CursorPos > Found[i].Pos) {
+                    --CursorPos;
+                }
+                if (CursorAnchor > Found[i].Pos) {
+                    --CursorAnchor;
+                }
+                MovedText = true;
+            }
+            for (int i = 0; i < WantedCount; ++i) {
+                int Pos = BlockPos + i;
+                Sweep.setPosition(Pos);
+                Sweep.insertText(QString(OptionGlyph),
+                                 FormatForGear(WantedGears[i]));
+                ++_DiagMarkersGearsInserted;
+                if (CursorPos > Pos) {
+                    ++CursorPos;
+                }
+                if (CursorAnchor > Pos) {
+                    ++CursorAnchor;
+                }
+                MovedText = true;
+            }
+        }
+        if (ShowGear) {
+            // Any other text in the block that took a gear's
             // format keeps its text but loses the marker property
             // and the hover text, so it reads back as plain text
-            // and can take tags again.
+            // and can take tags again. The wanted gears sit at
+            // the block start, so only text past them is cleared.
             for (QTextBlock::iterator It = Block.begin(); !It.atEnd(); ++It) {
                 QTextFragment Fragment = It.fragment();
                 if (!Fragment.charFormat()
@@ -7601,17 +9348,14 @@ void TextEditor::UpdateOptionMarkers()
                 QString Text = Fragment.text();
                 int From = Fragment.position();
                 int To = From + Text.size();
-                if (From == BlockPos && !Text.isEmpty() &&
-                    Text.at(0) == OptionGlyph) {
-                    From += 1;
-                }
-                if (From >= To) {
+                int ClearFrom = qMax(From, BlockPos + WantedCount);
+                if (ClearFrom >= To) {
                     continue;
                 }
                 QTextCharFormat Fixed = Fragment.charFormat();
                 Fixed.clearProperty(DocOptionMarkerProperty);
                 Fixed.setToolTip(QString());
-                Sweep.setPosition(From);
+                Sweep.setPosition(ClearFrom);
                 Sweep.setPosition(To, QTextCursor::KeepAnchor);
                 Sweep.setCharFormat(Fixed);
             }
@@ -7628,7 +9372,7 @@ void TextEditor::UpdateOptionMarkers()
             First && !Src.isEmpty() &&
             !SourceElementHasContent(Document, BlockPos);
         QString WantedText = SrcPlaceholderText(Src);
-        int WantedStart = BlockPos + (ShowGear ? 1 : 0);
+        int WantedStart = BlockPos + WantedCount;
         QVector<QPair<int, int>> StaleRanges;
         for (QTextBlock::iterator It = Block.begin(); !It.atEnd(); ++It) {
             QTextFragment Fragment = It.fragment();
@@ -7782,8 +9526,12 @@ void TextEditor::OnContextMenuRequested(const QPoint& Pos)
     Menu->addSeparator();
     AddSpellActions(Menu, At);
     AddSourceOptionsActions(Menu, At);
+    AddListOptionsActions(Menu, At);
+    AddTableOptionsActions(Menu, At);
     AddTagActions(Menu);
     AddReferenceActions(Menu);
+    AddRenameLinkAction(Menu, At);
+    AddEditIrefAction(Menu, At);
     bool CoveredMarkers = SelectionCoversOptionMarker(
         _TextEdit->document(), _TextEdit->textCursor());
     Menu->exec(_TextEdit->viewport()->mapToGlobal(At));
@@ -7797,23 +9545,53 @@ void TextEditor::OnContextMenuRequested(const QPoint& Pos)
 
 void TextEditor::RefreshXmlTab()
 {
+    // While the pane holds unapplied edits, a refresh must not
+    // overwrite the user's text (Bug 520).
+    if (_XmlDirty) {
+        return;
+    }
     QVector<xmlNodePtr> Nodes = BodyNodes();
     QStringList Parts;
+    // While the pane is editable it shows only the body nodes:
+    // preserved content is kept but hidden, so the re-parse has
+    // no preserved content to separate out, and nothing
+    // preserved can be lost by an edit. In read-only mode the
+    // pane shows body and preserved nodes, as before.
+    bool Editing = _XmlReadOnlyCheck != nullptr &&
+                   !_XmlReadOnlyCheck->isChecked();
     int PreservedIndex = 0;
     for (int Index = 0; Index < Nodes.size(); ++Index) {
-        while (PreservedIndex < _PreservedNodes.size() &&
-               _PreservedNodes[PreservedIndex].AfterNodes <= Index) {
+        if (!Editing) {
+            while (PreservedIndex < _PreservedNodes.size() &&
+                   _PreservedNodes[PreservedIndex].AfterNodes <= Index) {
+                Parts.append(
+                    SerializeNode(_PreservedNodes[PreservedIndex].Node));
+                ++PreservedIndex;
+            }
+        }
+        Parts.append(SerializeNode(Nodes[Index]));
+    }
+    if (!Editing) {
+        while (PreservedIndex < _PreservedNodes.size()) {
             Parts.append(
                 SerializeNode(_PreservedNodes[PreservedIndex].Node));
             ++PreservedIndex;
         }
-        Parts.append(SerializeNode(Nodes[Index]));
     }
-    while (PreservedIndex < _PreservedNodes.size()) {
-        Parts.append(SerializeNode(_PreservedNodes[PreservedIndex].Node));
-        ++PreservedIndex;
+    if (_XmlPreservedNote != nullptr) {
+        bool HasPreserved = !_PreservedNodes.isEmpty();
+        _XmlPreservedNote->setVisible(Editing && HasPreserved);
+        if (Editing && HasPreserved) {
+            _XmlPreservedNote->setText(
+                tr("Preserved content is hidden while editing; "
+                   "it is kept and shown again when Read-only is "
+                   "re-checked."));
+        }
     }
-    _XmlEdit->setPlainText(Parts.join(QLatin1Char('\n')));
+    {
+        QSignalBlocker Blocker(_XmlEdit);
+        _XmlEdit->setPlainText(Parts.join(QLatin1Char('\n')));
+    }
     for (xmlNodePtr Node : Nodes) {
         xmlFreeNode(Node);
     }
@@ -8021,6 +9799,185 @@ static QVector<QPair<QString, QString>> ReferenceListEntries(
         Entries.append(qMakePair(Anchor, Anchor));
     }
     return Entries;
+}
+
+/**
+ * @brief Adds a Rename action for the reference under the click
+ *        (Bug 514 v2).
+ *
+ * A reference's visible text is read-only, so it cannot be
+ * typed into; this is the way to change it. Right-clicking on
+ * a reference offers Rename, which prompts for the new text
+ * prefilled with the current one, then replaces the link's
+ * text while keeping the reference itself: same target, same
+ * underline and colour. Clearing the text is refused, since
+ * an empty reference has nothing to show.
+ * @param Menu The context menu.
+ * @param Pos The click position, in the text edit's coordinates.
+ */
+void TextEditor::AddRenameLinkAction(QMenu* Menu, const QPoint& Pos)
+{
+    if (_Document == nullptr) {
+        return;
+    }
+    QTextCursor At = _TextEdit->cursorForPosition(Pos);
+    int Start, End;
+    QString LinkName;
+    DocTagEntry LinkEntry;
+    if (!LinkRangeAt(_TextEdit->document(), At.position(), Start, End,
+                     LinkName, LinkEntry)) {
+        return;
+    }
+    // The reference's current visible text, for the prompt.
+    QTextCursor Range(_TextEdit->document());
+    Range.setPosition(Start);
+    Range.setPosition(End, QTextCursor::KeepAnchor);
+    QString Current = Range.selectedText();
+    QString Label = (LinkName == QLatin1String("xref"))
+                        ? tr("Rename reference...")
+                        : tr("Rename link...");
+    QAction* Action = Menu->addAction(Label);
+    connect(Action, &QAction::triggered, this,
+            [this, Start, End, Current, LinkName, LinkEntry]() {
+        bool Ok = false;
+        QString NewText = QInputDialog::getText(
+            this, tr("Rename reference"), tr("Text:"),
+            QLineEdit::Normal, Current, &Ok);
+        if (!Ok) {
+            return;
+        }
+        if (NewText.isEmpty()) {
+            QMessageBox::information(
+                this, tr("Rename reference"),
+                tr("A reference needs some text to show. "
+                   "To remove it, select the whole reference "
+                   "and press Delete."));
+            return;
+        }
+        if (NewText == Current) {
+            return;
+        }
+        QTextCursor Cursor(_TextEdit->document());
+        Cursor.setPosition(Start);
+        Cursor.setPosition(End, QTextCursor::KeepAnchor);
+        QTextCharFormat LinkFormat =
+            LinkFormatForSelection(_TextEdit->document(), Cursor);
+        if (!LinkFormat.isValid()) {
+            return;
+        }
+        Cursor.beginEditBlock();
+        Cursor.removeSelectedText();
+        Cursor.insertText(NewText, LinkFormat);
+        // Bug 514 reopened: the rename changed the text but the
+        // saved XML lost the <xref> -- insertText with a format
+        // does not reliably carry the custom stack property
+        // through to the new fragments, so the renamed text can
+        // come out as plain text. Re-apply the link's stack
+        // explicitly, via the same setCharFormat mechanism that
+        // wraps a selection in a link. When the insert already
+        // kept the stack, ChangeStacks sees it and does nothing;
+        // when the insert dropped it, this puts it back. Either
+        // way the renamed text keeps its reference.
+        ChangeStacks(Start, Start + NewText.length(), LinkName,
+                     &LinkEntry);
+        Cursor.endEditBlock();
+        _TextEdit->setTextCursor(Cursor);
+    });
+}
+
+void TextEditor::AddEditIrefAction(QMenu* Menu, const QPoint& Pos)
+{
+    if (_Document == nullptr) {
+        return;
+    }
+    QTextCursor At = _TextEdit->cursorForPosition(Pos);
+    int Start, End;
+    DocTagEntry IrefEntry;
+    if (!IrefRangeAt(_TextEdit->document(), At.position(), Start, End,
+                     IrefEntry)) {
+        return;
+    }
+    // The marker's current item and sub-item, for the prompts.
+    QString CurrentItem =
+        AttributeOf(IrefEntry.Attributes, QStringLiteral("item"));
+    QString CurrentSubitem =
+        AttributeOf(IrefEntry.Attributes, QStringLiteral("subitem"));
+    QAction* Action = Menu->addAction(tr("Edit index entry..."));
+    connect(Action, &QAction::triggered, this,
+            [this, Start, End, IrefEntry, CurrentItem, CurrentSubitem]() {
+        bool Ok = false;
+        QString NewItem = QInputDialog::getText(
+            this, tr("Edit index entry"),
+            tr("Item (the word or phrase to index):"),
+            QLineEdit::Normal, CurrentItem, &Ok);
+        if (!Ok) {
+            return;
+        }
+        if (NewItem.trimmed().isEmpty()) {
+            QMessageBox::information(
+                this, tr("Edit index entry"),
+                tr("An index entry needs an item. To remove it, "
+                   "select the whole marker and press Delete."));
+            return;
+        }
+        QString NewSubitem = QInputDialog::getText(
+            this, tr("Edit index entry"),
+            tr("Sub-item (a narrower term under the item, optional):"),
+            QLineEdit::Normal, CurrentSubitem, &Ok);
+        if (!Ok) {
+            return;
+        }
+        if (NewItem.trimmed() == CurrentItem &&
+            NewSubitem.trimmed() == CurrentSubitem) {
+            return;
+        }
+        // Update the marker entry's attributes on every
+        // fragment the marker covers, keeping each fragment's
+        // own stack and visuals. The marker text stays the
+        // glyph; the item lives in the attributes, and the
+        // save reads it from there (Bug 503).
+        DocTagEntry Updated = IrefEntry;
+        SetTagAttribute(Updated.Attributes, QStringLiteral("item"),
+                        NewItem.trimmed());
+        SetTagAttribute(Updated.Attributes, QStringLiteral("subitem"),
+                        NewSubitem.trimmed());
+        QTextDocument* Document = _TextEdit->document();
+        QTextCursor Cursor(Document);
+        Cursor.beginEditBlock();
+        QTextBlock Block = Document->findBlock(Start);
+        while (Block.isValid() && Block.position() < End) {
+            for (QTextBlock::iterator It = Block.begin();
+                 !It.atEnd(); ++It) {
+                QTextFragment Fragment = It.fragment();
+                int FragStart = Fragment.position();
+                int FragEnd = FragStart + Fragment.length();
+                if (FragEnd <= Start || FragStart >= End) {
+                    continue;
+                }
+                QTextCharFormat Format = Fragment.charFormat();
+                QVariant MarkerValue =
+                    Format.property(DocMarkerProperty);
+                if (!MarkerValue.isValid()) {
+                    continue;
+                }
+                if (!(EntryFromVariant(MarkerValue) == IrefEntry)) {
+                    continue;
+                }
+                Format.setProperty(DocMarkerProperty,
+                                   EntryToVariant(Updated));
+                ApplyMarkerVisuals(Format, Updated);
+                QTextCursor FragCursor(Document);
+                int From = FragStart > Start ? FragStart : Start;
+                int To = FragEnd < End ? FragEnd : End;
+                FragCursor.setPosition(From);
+                FragCursor.setPosition(To, QTextCursor::KeepAnchor);
+                FragCursor.setCharFormat(Format);
+            }
+            Block = Block.next();
+        }
+        Cursor.endEditBlock();
+        _TextEdit->setTextCursor(Cursor);
+    });
 }
 
 void TextEditor::AddReferenceActions(QMenu* Menu)
@@ -8559,6 +10516,162 @@ static QVector<QPair<QString, QString>> SourceAttributesAt(
 }
 
 /**
+ * @brief Returns the list attributes at a position (Bug 464).
+ * @param Document The document.
+ * @param Pos A position in the list.
+ * @return The list element's attributes, or empty when the
+ *         position is in no list.
+ */
+static QVector<QPair<QString, QString>> ListAttributesAt(
+    QTextDocument* Document, int Pos)
+{
+    QTextBlock Block = Document->findBlock(Pos);
+    if (!IsListBlock(Block)) {
+        return QVector<QPair<QString, QString>>();
+    }
+    return AttributesFromVariant(
+        Block.blockFormat().property(DocListProperty));
+}
+
+/**
+ * @brief Returns the table's own attributes from a block of it
+ *        (Bug 448).
+ * @param Document The document.
+ * @param Pos A position in a block of the table.
+ * @return The table's attributes, empty when the block carries
+ *         no table payload.
+ */
+static QVector<QPair<QString, QString>> TableAttributesAt(
+    QTextDocument* Document, int Pos)
+{
+    QTextBlock Block = Document->findBlock(Pos);
+    xmlNodePtr Shell = nullptr;
+    QVector<DocTableRowMark> Marks;
+    if (!TablePayloadOf(Block, Shell, Marks)) {
+        return QVector<QPair<QString, QString>>();
+    }
+    QVector<QPair<QString, QString>> Attributes = NodeAttributes(Shell);
+    xmlFreeNode(Shell);
+    return Attributes;
+}
+
+/**
+ * @brief Returns one section's attributes from a block of its
+ *        table (Bug 448).
+ * @param Document The document.
+ * @param Pos A position in a block of the table.
+ * @param Section The section: "thead", "tbody", or "tfoot".
+ * @return The section's attributes, empty when the block carries
+ *         no table payload.
+ */
+static QVector<QPair<QString, QString>> TableSectionAttributesAt(
+    QTextDocument* Document, int Pos, const QString& Section)
+{
+    QTextBlock Block = Document->findBlock(Pos);
+    xmlNodePtr Shell = nullptr;
+    QVector<DocTableRowMark> Marks;
+    if (!TablePayloadOf(Block, Shell, Marks)) {
+        return QVector<QPair<QString, QString>>();
+    }
+    xmlNodePtr SectionNode = nullptr;
+    if (Section == QLatin1String("thead")) {
+        SectionNode = DocDocument::ChildElement(Shell, "thead");
+    } else if (Section == QLatin1String("tfoot")) {
+        SectionNode = DocDocument::ChildElement(Shell, "tfoot");
+    } else {
+        SectionNode = DocDocument::ChildElement(Shell, "tbody");
+    }
+    QVector<QPair<QString, QString>> Attributes =
+        NodeAttributes(SectionNode);
+    xmlFreeNode(Shell);
+    return Attributes;
+}
+
+/**
+ * @brief Returns one row's attributes from its first cell's
+ *        first block (Bug 448).
+ *
+ * The row's anchor rides in the mark alongside its other
+ * attributes, so it is folded back in here.
+ * @param Document The document.
+ * @param Pos A position in the row's first cell's first block.
+ * @return The row's attributes, empty when the block carries
+ *         no table payload or is in no row.
+ */
+static QVector<QPair<QString, QString>> TableRowAttributesAt(
+    QTextDocument* Document, int Pos)
+{
+    QTextBlock Block = Document->findBlock(Pos);
+    xmlNodePtr Shell = nullptr;
+    QVector<DocTableRowMark> Marks;
+    if (!TablePayloadOf(Block, Shell, Marks)) {
+        return QVector<QPair<QString, QString>>();
+    }
+    xmlFreeNode(Shell);
+    int Row = -1;
+    int Column = -1;
+    if (!TableCellOfBlock(Document, Block, Row, Column) || Row < 0 ||
+        Row >= Marks.size()) {
+        return QVector<QPair<QString, QString>>();
+    }
+    QVector<QPair<QString, QString>> Attributes = Marks[Row].Attributes;
+    if (!Marks[Row].Anchor.isEmpty()) {
+        Attributes.append(QPair<QString, QString>(
+            QStringLiteral("anchor"), Marks[Row].Anchor));
+    }
+    return Attributes;
+}
+
+/**
+ * @brief Returns one cell's attributes from its first block
+ *        (Bug 448).
+ * @param Document The document.
+ * @param Pos A position in the cell's first block.
+ * @return The cell's attributes, empty when the block carries
+ *         no cell property.
+ */
+static QVector<QPair<QString, QString>> TableCellAttributesAt(
+    QTextDocument* Document, int Pos)
+{
+    QTextBlock Block = Document->findBlock(Pos);
+    xmlNodePtr CellNode = nullptr;
+    if (!TableCellFromVariant(
+            Block.blockFormat().property(DocTableCellProperty),
+            CellNode)) {
+        return QVector<QPair<QString, QString>>();
+    }
+    QVector<QPair<QString, QString>> Attributes =
+        NodeAttributes(CellNode);
+    xmlFreeNode(CellNode);
+    return Attributes;
+}
+
+/**
+ * @brief Returns every block of one table, by its group number
+ *        (Bug 448).
+ *
+ * The payload lives on the caption block and on every cell's
+ * first block, so restamping it means touching all of them.
+ * @param Document The document.
+ * @param Group The table's group number.
+ * @return The blocks, in document order.
+ */
+static QVector<QTextBlock> TableBlocksOfGroup(QTextDocument* Document,
+                                              int Group)
+{
+    QVector<QTextBlock> Blocks;
+    for (QTextBlock Block = Document->begin(); Block.isValid();
+         Block = Block.next()) {
+        if (Block.blockFormat()
+                .property(DocTableGroupProperty)
+                .toInt() == Group) {
+            Blocks.append(Block);
+        }
+    }
+    return Blocks;
+}
+
+/**
  * @brief True when a sourcecode element holds any non-blank content.
  *
  * The marker characters do not count: a block holding only its
@@ -8597,7 +10710,10 @@ void TextEditor::AddSourceOptionsActions(QMenu* Menu, const QPoint& Pos)
         !HasSrcPlaceholderAt(Document, ClickPos - 1)) {
         return;
     }
-    QTextBlock Block = Document->findBlock(ClickPos);
+    // Bug 464 v9: the block comes from the gear itself, not
+    // from the click position, which can land in the block
+    // above at a boundary.
+    QTextBlock Block = GearBlockAt(Document, ClickPos);
     if (!IsSourceCodeBlock(Block)) {
         return;
     }
@@ -8618,6 +10734,30 @@ void TextEditor::AddSourceOptionsActions(QMenu* Menu, const QPoint& Pos)
     QVector<QPair<QString, QString>> Attributes =
         SourceAttributesAt(Document, FirstBlockPos);
     QMenu* Options = Menu->addMenu(tr("Source code options"));
+    // Bug 464 v7: the anchor is settable from the gear menu,
+    // so an element without one can gain one. First in the
+    // menu (alphabetical). Prefilled with the current anchor;
+    // empty clears it.
+    QAction* AnchorAction = Options->addAction(tr("Anchor..."));
+    connect(AnchorAction, &QAction::triggered, this, [this, FirstBlockPos]() {
+        QVector<QPair<QString, QString>> Current =
+            SourceAttributesAt(_TextEdit->document(), FirstBlockPos);
+        bool Ok = false;
+        QString Value = QInputDialog::getText(
+            this, tr("Source code options"), tr("Anchor:"),
+            QLineEdit::Normal,
+            AttributeOf(Current, QStringLiteral("anchor")), &Ok);
+        if (!Ok) {
+            return;
+        }
+        // Bug 464 v8: the editor asks the owner to change the
+        // anchor. The owner refuses a delete when the anchor
+        // is cited, renames the cross-references when it
+        // changes, and calls SetElementAnchor to set it.
+        emit AnchorChangeRequested(
+            AttributeOf(Current, QStringLiteral("anchor")),
+            Value.trimmed(), FirstBlockPos, true, QString());
+    });
     QAction* MarkersAction = Options->addAction(tr("Markers"));
     MarkersAction->setCheckable(true);
     MarkersAction->setChecked(
@@ -8743,6 +10883,768 @@ void TextEditor::AddSourceOptionsActions(QMenu* Menu, const QPoint& Pos)
     Menu->addSeparator();
 }
 
+/**
+ * @brief Adds a Spacing submenu to a list options menu
+ *        (Bug 464 v2).
+ *
+ * The spacing values (v3.rng): normal or compact, plus
+ * None to remove the attribute. Shared by the <ul>, <ol>,
+ * and <dl> menus: all three carry spacing.
+ * @param Options The menu to add the submenu to.
+ * @param Attributes The list's attributes, for the current
+ *        value.
+ * @param FirstBlockPos The position of the list's first
+ *        block.
+ */
+void TextEditor::AddSpacingActions(
+    QMenu* Options,
+    const QVector<QPair<QString, QString>>& Attributes,
+    int FirstBlockPos)
+{
+    QMenu* SpacingMenu = Options->addMenu(tr("Spacing"));
+    // The spacing values (v3.rng): normal or compact, in
+    // alphabetical order, as in the Style submenu.
+    static const char* Spacings[] = {
+        "compact", "normal",
+    };
+    QString CurrentSpacing =
+        AttributeOf(Attributes, QStringLiteral("spacing"));
+    for (const char* Spacing : Spacings) {
+        QString SpacingName = QString::fromLatin1(Spacing);
+        QAction* SpacingAction = SpacingMenu->addAction(SpacingName);
+        SpacingAction->setCheckable(true);
+        SpacingAction->setChecked(SpacingName == CurrentSpacing);
+        connect(SpacingAction, &QAction::triggered, this,
+                [this, FirstBlockPos, SpacingName]() {
+                    QVector<QPair<QString, QString>> Current =
+                        ListAttributesAt(_TextEdit->document(),
+                                         FirstBlockPos);
+                    SetAttribute(Current, QStringLiteral("spacing"),
+                                 SpacingName);
+                    ApplyListAttributes(FirstBlockPos, Current);
+                });
+    }
+    SpacingMenu->addSeparator();
+    QAction* SpacingNoneAction = SpacingMenu->addAction(tr("None"));
+    connect(SpacingNoneAction, &QAction::triggered, this,
+            [this, FirstBlockPos]() {
+                QVector<QPair<QString, QString>> Current =
+                    ListAttributesAt(_TextEdit->document(),
+                                     FirstBlockPos);
+                RemoveAttribute(Current, QStringLiteral("spacing"));
+                ApplyListAttributes(FirstBlockPos, Current);
+            });
+}
+
+void TextEditor::AddListOptionsActions(QMenu* Menu, const QPoint& Pos)
+{
+    QTextCursor Clicked = _TextEdit->cursorForPosition(Pos);
+    int ClickPos = Clicked.position();
+    QTextDocument* Document = _TextEdit->document();
+    if (!HasOptionMarkerAt(Document, ClickPos) &&
+        !HasOptionMarkerAt(Document, ClickPos - 1)) {
+        return;
+    }
+    // Bug 464 v9: the block comes from the gear itself, not
+    // from the click position, which can land in the block
+    // above at a boundary.
+    QTextBlock Block = GearBlockAt(Document, ClickPos);
+    if (!IsListBlock(Block)) {
+        return;
+    }
+    QString Kind =
+        Block.blockFormat().property(DocListKindProperty).toString();
+    // Every list kind carries options now (Bug 464 v2):
+    // "list", "ul", "ol", and "dl". Nothing is added for any
+    // other kind.
+    if (Kind != QLatin1String("list") && Kind != QLatin1String("ul") &&
+        Kind != QLatin1String("ol") && Kind != QLatin1String("dl")) {
+        return;
+    }
+    // Walk up to the list's first block: blank lines between
+    // items do not split the list, and the options belong to
+    // the list, not the block clicked.
+    QTextBlock First = FirstListBlock(Block);
+    // Bug 464 v9: the gear is on the first block, so the walk
+    // up must not cross into the previous list. A bulleted or
+    // numbered list carries its own QTextList object, so when
+    // the first block found and the clicked block sit in
+    // different list objects, the walk crossed a boundary and
+    // the clicked block is the first block.
+    if (Kind != QLatin1String("dl") && First.textList() != nullptr &&
+        Block.textList() != nullptr &&
+        First.textList() != Block.textList()) {
+        First = Block;
+    }
+    int FirstBlockPos = First.position();
+    QVector<QPair<QString, QString>> Attributes =
+        ListAttributesAt(Document, FirstBlockPos);
+    QMenu* Options = Menu->addMenu(tr("List options"));
+    // Bug 464 v7: the anchor is settable from the gear menu,
+    // so a list without one can gain one. It sits first in
+    // every kind's menu (alphabetical), ahead of the kind's
+    // own options. Prefilled with the current anchor; empty
+    // clears it.
+    QAction* AnchorAction = Options->addAction(tr("Anchor..."));
+    connect(AnchorAction, &QAction::triggered, this, [this, FirstBlockPos]() {
+        QVector<QPair<QString, QString>> Current =
+            ListAttributesAt(_TextEdit->document(), FirstBlockPos);
+        bool Ok = false;
+        QString Value = QInputDialog::getText(
+            this, tr("List options"), tr("Anchor:"),
+            QLineEdit::Normal,
+            AttributeOf(Current, QStringLiteral("anchor")), &Ok);
+        if (!Ok) {
+            return;
+        }
+        // Bug 464 v8: the editor asks the owner to change the
+        // anchor. The owner refuses a delete when the anchor
+        // is cited, renames the cross-references when it
+        // changes, and calls SetElementAnchor to set it.
+        emit AnchorChangeRequested(
+            AttributeOf(Current, QStringLiteral("anchor")),
+            Value.trimmed(), FirstBlockPos, false, QString());
+    });
+    if (Kind == QLatin1String("list")) {
+        // The options in alphabetical order, as in the
+        // sourcecode menu: Counter, Hang indent, Style.
+        QAction* CounterAction = Options->addAction(tr("Counter..."));
+        connect(CounterAction, &QAction::triggered, this,
+                [this, FirstBlockPos]() {
+                    QVector<QPair<QString, QString>> Current =
+                        ListAttributesAt(_TextEdit->document(),
+                                         FirstBlockPos);
+                    bool Ok = false;
+                    QString Value = QInputDialog::getText(
+                        this, tr("List options"), tr("Counter:"),
+                        QLineEdit::Normal,
+                        AttributeOf(Current, QStringLiteral("counter")),
+                        &Ok);
+                    if (!Ok) {
+                        return;
+                    }
+                    QString Trimmed = Value.trimmed();
+                    if (Trimmed.isEmpty()) {
+                        RemoveAttribute(Current,
+                                        QStringLiteral("counter"));
+                    } else {
+                        SetAttribute(Current, QStringLiteral("counter"),
+                                     Trimmed);
+                    }
+                    ApplyListAttributes(FirstBlockPos, Current);
+                });
+        QAction* HangIndentAction =
+            Options->addAction(tr("Hang indent..."));
+        connect(HangIndentAction, &QAction::triggered, this,
+                [this, FirstBlockPos]() {
+                    QVector<QPair<QString, QString>> Current =
+                        ListAttributesAt(_TextEdit->document(),
+                                         FirstBlockPos);
+                    bool Ok = false;
+                    QString Value = QInputDialog::getText(
+                        this, tr("List options"), tr("Hang indent:"),
+                        QLineEdit::Normal,
+                        AttributeOf(Current,
+                                    QStringLiteral("hangIndent")),
+                        &Ok);
+                    if (!Ok) {
+                        return;
+                    }
+                    QString Trimmed = Value.trimmed();
+                    if (Trimmed.isEmpty()) {
+                        RemoveAttribute(Current,
+                                        QStringLiteral("hangIndent"));
+                    } else {
+                        SetAttribute(Current,
+                                     QStringLiteral("hangIndent"),
+                                     Trimmed);
+                    }
+                    ApplyListAttributes(FirstBlockPos, Current);
+                });
+        QMenu* StyleMenu = Options->addMenu(tr("Style"));
+        // The plain style values (RFC 7991 section 3.4 maps
+        // them onto <dl>, <ul>, and <ol>), in alphabetical
+        // order. A format string such as "format (%d)" goes
+        // through Custom.
+        static const char* Styles[] = {
+            "counter", "empty", "hanging", "letters", "numbers",
+            "symbols",
+        };
+        QString CurrentStyle =
+            AttributeOf(Attributes, QStringLiteral("style"));
+        for (const char* Style : Styles) {
+            QString StyleName = QString::fromLatin1(Style);
+            QAction* StyleAction = StyleMenu->addAction(StyleName);
+            StyleAction->setCheckable(true);
+            StyleAction->setChecked(StyleName == CurrentStyle);
+            connect(StyleAction, &QAction::triggered, this,
+                    [this, FirstBlockPos, StyleName]() {
+                        QVector<QPair<QString, QString>> Current =
+                            ListAttributesAt(_TextEdit->document(),
+                                             FirstBlockPos);
+                        SetAttribute(Current, QStringLiteral("style"),
+                                     StyleName);
+                        ApplyListAttributes(FirstBlockPos, Current);
+                    });
+        }
+        StyleMenu->addSeparator();
+        QAction* CustomAction = StyleMenu->addAction(tr("Custom..."));
+        connect(CustomAction, &QAction::triggered, this,
+                [this, FirstBlockPos]() {
+                    QVector<QPair<QString, QString>> Current =
+                        ListAttributesAt(_TextEdit->document(),
+                                         FirstBlockPos);
+                    bool Ok = false;
+                    QString Value = QInputDialog::getText(
+                        this, tr("List options"), tr("Style:"),
+                        QLineEdit::Normal,
+                        AttributeOf(Current, QStringLiteral("style")),
+                        &Ok);
+                    if (!Ok) {
+                        return;
+                    }
+                    QString Trimmed = Value.trimmed();
+                    if (Trimmed.isEmpty()) {
+                        RemoveAttribute(Current,
+                                        QStringLiteral("style"));
+                    } else {
+                        SetAttribute(Current, QStringLiteral("style"),
+                                     Trimmed);
+                    }
+                    ApplyListAttributes(FirstBlockPos, Current);
+                });
+        QAction* NoneAction = StyleMenu->addAction(tr("None"));
+        connect(NoneAction, &QAction::triggered, this,
+                [this, FirstBlockPos]() {
+                    QVector<QPair<QString, QString>> Current =
+                        ListAttributesAt(_TextEdit->document(),
+                                         FirstBlockPos);
+                    RemoveAttribute(Current, QStringLiteral("style"));
+                    ApplyListAttributes(FirstBlockPos, Current);
+                });
+    } else if (Kind == QLatin1String("ul")) {
+        // A <ul>: its bare and empty switches, indent, and
+        // spacing, in alphabetical order.
+        QAction* BareAction = Options->addAction(tr("Bare"));
+        BareAction->setCheckable(true);
+        BareAction->setChecked(
+            AttributeOf(Attributes, QStringLiteral("bare")) ==
+            QLatin1String("true"));
+        connect(BareAction, &QAction::triggered, this,
+                [this, FirstBlockPos](bool Checked) {
+                    QVector<QPair<QString, QString>> Current =
+                        ListAttributesAt(_TextEdit->document(),
+                                         FirstBlockPos);
+                    if (Checked) {
+                        // Bare sits inside empty's group in the
+                        // schema: a file with bare but no empty
+                        // fails validation, so turning on bare
+                        // writes empty alongside it (Bug 312
+                        // ruling 11).
+                        SetAttribute(Current, QStringLiteral("bare"),
+                                     QStringLiteral("true"));
+                        SetAttribute(Current, QStringLiteral("empty"),
+                                     QStringLiteral("true"));
+                    } else {
+                        RemoveAttribute(Current,
+                                        QStringLiteral("bare"));
+                    }
+                    ApplyListAttributes(FirstBlockPos, Current);
+                });
+        QAction* EmptyAction = Options->addAction(tr("Empty"));
+        EmptyAction->setCheckable(true);
+        EmptyAction->setChecked(
+            AttributeOf(Attributes, QStringLiteral("empty")) ==
+            QLatin1String("true"));
+        connect(EmptyAction, &QAction::triggered, this,
+                [this, FirstBlockPos](bool Checked) {
+                    QVector<QPair<QString, QString>> Current =
+                        ListAttributesAt(_TextEdit->document(),
+                                         FirstBlockPos);
+                    if (Checked) {
+                        SetAttribute(Current, QStringLiteral("empty"),
+                                     QStringLiteral("true"));
+                    } else {
+                        RemoveAttribute(Current,
+                                        QStringLiteral("empty"));
+                    }
+                    ApplyListAttributes(FirstBlockPos, Current);
+                });
+        // Bug 464 v2: indent is free text (v3.rng gives no
+        // enumerated values, default "3"). Bug 464 v3: prefilled
+        // with the current value, or the default "3" when unset;
+        // empty clears the attribute, as with Counter and Hang
+        // indent.
+        QAction* IndentAction = Options->addAction(tr("Indent..."));
+        connect(IndentAction, &QAction::triggered, this,
+                [this, FirstBlockPos]() {
+                    QVector<QPair<QString, QString>> Current =
+                        ListAttributesAt(_TextEdit->document(),
+                                         FirstBlockPos);
+                    bool Ok = false;
+                    QString Value = QInputDialog::getText(
+                        this, tr("List options"), tr("Indent:"),
+                        QLineEdit::Normal,
+                        PrefillAttribute(Current, QStringLiteral("indent"), QStringLiteral("3")),
+                        &Ok);
+                    if (!Ok) {
+                        return;
+                    }
+                    QString Trimmed = Value.trimmed();
+                    if (Trimmed.isEmpty()) {
+                        RemoveAttribute(Current,
+                                        QStringLiteral("indent"));
+                    } else {
+                        SetAttribute(Current, QStringLiteral("indent"),
+                                     Trimmed);
+                    }
+                    ApplyListAttributes(FirstBlockPos, Current);
+                });
+        AddSpacingActions(Options, Attributes, FirstBlockPos);
+    } else if (Kind == QLatin1String("ol")) {
+        // An <ol>: its type, start, group, spacing, and
+        // indent, in alphabetical order (Bug 464 v2). The
+        // schema gives no enumerated values for type (default
+        // "1"), so type is free text, as are start, group,
+        // and indent. Bug 464 v3: each is prefilled with its
+        // current value, or its schema default when unset
+        // (type "1", start "1", indent "adaptive"; group has
+        // no default); empty clears it.
+        QAction* GroupAction = Options->addAction(tr("Group..."));
+        connect(GroupAction, &QAction::triggered, this,
+                [this, FirstBlockPos]() {
+                    QVector<QPair<QString, QString>> Current =
+                        ListAttributesAt(_TextEdit->document(),
+                                         FirstBlockPos);
+                    bool Ok = false;
+                    QString Value = QInputDialog::getText(
+                        this, tr("List options"), tr("Group:"),
+                        QLineEdit::Normal,
+                        AttributeOf(Current, QStringLiteral("group")),
+                        &Ok);
+                    if (!Ok) {
+                        return;
+                    }
+                    QString Trimmed = Value.trimmed();
+                    if (Trimmed.isEmpty()) {
+                        RemoveAttribute(Current,
+                                        QStringLiteral("group"));
+                    } else {
+                        SetAttribute(Current, QStringLiteral("group"),
+                                     Trimmed);
+                    }
+                    ApplyListAttributes(FirstBlockPos, Current);
+                });
+        QAction* IndentAction = Options->addAction(tr("Indent..."));
+        connect(IndentAction, &QAction::triggered, this,
+                [this, FirstBlockPos]() {
+                    QVector<QPair<QString, QString>> Current =
+                        ListAttributesAt(_TextEdit->document(),
+                                         FirstBlockPos);
+                    bool Ok = false;
+                    QString Value = QInputDialog::getText(
+                        this, tr("List options"), tr("Indent:"),
+                        QLineEdit::Normal,
+                        PrefillAttribute(Current, QStringLiteral("indent"), QStringLiteral("adaptive")),
+                        &Ok);
+                    if (!Ok) {
+                        return;
+                    }
+                    QString Trimmed = Value.trimmed();
+                    if (Trimmed.isEmpty()) {
+                        RemoveAttribute(Current,
+                                        QStringLiteral("indent"));
+                    } else {
+                        SetAttribute(Current, QStringLiteral("indent"),
+                                     Trimmed);
+                    }
+                    ApplyListAttributes(FirstBlockPos, Current);
+                });
+        AddSpacingActions(Options, Attributes, FirstBlockPos);
+        QAction* StartAction = Options->addAction(tr("Start..."));
+        connect(StartAction, &QAction::triggered, this,
+                [this, FirstBlockPos]() {
+                    QVector<QPair<QString, QString>> Current =
+                        ListAttributesAt(_TextEdit->document(),
+                                         FirstBlockPos);
+                    bool Ok = false;
+                    QString Value = QInputDialog::getText(
+                        this, tr("List options"), tr("Start:"),
+                        QLineEdit::Normal,
+                        PrefillAttribute(Current, QStringLiteral("start"), QStringLiteral("1")),
+                        &Ok);
+                    if (!Ok) {
+                        return;
+                    }
+                    QString Trimmed = Value.trimmed();
+                    if (Trimmed.isEmpty()) {
+                        RemoveAttribute(Current,
+                                        QStringLiteral("start"));
+                    } else {
+                        SetAttribute(Current, QStringLiteral("start"),
+                                     Trimmed);
+                    }
+                    ApplyListAttributes(FirstBlockPos, Current);
+                });
+        QAction* TypeAction = Options->addAction(tr("Type..."));
+        connect(TypeAction, &QAction::triggered, this,
+                [this, FirstBlockPos]() {
+                    QVector<QPair<QString, QString>> Current =
+                        ListAttributesAt(_TextEdit->document(),
+                                         FirstBlockPos);
+                    bool Ok = false;
+                    QString Value = QInputDialog::getText(
+                        this, tr("List options"), tr("Type:"),
+                        QLineEdit::Normal,
+                        PrefillAttribute(Current, QStringLiteral("type"), QStringLiteral("1")),
+                        &Ok);
+                    if (!Ok) {
+                        return;
+                    }
+                    QString Trimmed = Value.trimmed();
+                    if (Trimmed.isEmpty()) {
+                        RemoveAttribute(Current,
+                                        QStringLiteral("type"));
+                    } else {
+                        SetAttribute(Current, QStringLiteral("type"),
+                                     Trimmed);
+                    }
+                    ApplyListAttributes(FirstBlockPos, Current);
+                });
+    } else {
+        // A <dl>: its spacing, newline, and indent, in
+        // alphabetical order (Bug 464 v2).
+        QAction* IndentAction = Options->addAction(tr("Indent..."));
+        connect(IndentAction, &QAction::triggered, this,
+                [this, FirstBlockPos]() {
+                    QVector<QPair<QString, QString>> Current =
+                        ListAttributesAt(_TextEdit->document(),
+                                         FirstBlockPos);
+                    bool Ok = false;
+                    QString Value = QInputDialog::getText(
+                        this, tr("List options"), tr("Indent:"),
+                        QLineEdit::Normal,
+                        PrefillAttribute(Current, QStringLiteral("indent"), QStringLiteral("3")),
+                        &Ok);
+                    if (!Ok) {
+                        return;
+                    }
+                    QString Trimmed = Value.trimmed();
+                    if (Trimmed.isEmpty()) {
+                        RemoveAttribute(Current,
+                                        QStringLiteral("indent"));
+                    } else {
+                        SetAttribute(Current, QStringLiteral("indent"),
+                                     Trimmed);
+                    }
+                    ApplyListAttributes(FirstBlockPos, Current);
+                });
+        QAction* NewlineAction = Options->addAction(tr("Newline"));
+        NewlineAction->setCheckable(true);
+        // Bug 464 v10: xml2rfc puts a bare <dl> definition on
+        // the next line, so an absent newline reads as on, not
+        // off. The box shows the effective value: checked
+        // unless the attribute is explicitly "false".
+        NewlineAction->setChecked(
+            AttributeOf(Attributes, QStringLiteral("newline")) !=
+            QLatin1String("false"));
+        connect(NewlineAction, &QAction::triggered, this,
+                [this, FirstBlockPos](bool Checked) {
+                    QVector<QPair<QString, QString>> Current =
+                        ListAttributesAt(_TextEdit->document(),
+                                         FirstBlockPos);
+                    // Bug 464 v10: always write the value
+                    // explicitly, true or false. Removing it on
+                    // uncheck would fall back to the next-line
+                    // default, the opposite of what unchecking
+                    // means, and xml2rfc mishandles the absent
+                    // and "false" cases (issue 1045).
+                    SetAttribute(Current, QStringLiteral("newline"),
+                                 Checked ? QStringLiteral("true")
+                                         : QStringLiteral("false"));
+                    ApplyListAttributes(FirstBlockPos, Current);
+                });
+        AddSpacingActions(Options, Attributes, FirstBlockPos);
+    }
+    Menu->addSeparator();
+}
+
+void TextEditor::AddTableAlignActions(
+    QMenu* Options,
+    const QVector<QPair<QString, QString>>& Attributes,
+    int FirstBlockPos, const QString& PartKind)
+{
+    QMenu* AlignMenu = Options->addMenu(tr("Align"));
+    // The align values (v3.rng): left, center, or right, in
+    // alphabetical order, as in the Style submenu.
+    static const char* Aligns[] = {
+        "center", "left", "right",
+    };
+    QString CurrentAlign =
+        AttributeOf(Attributes, QStringLiteral("align"));
+    for (const char* Align : Aligns) {
+        QString AlignName = QString::fromLatin1(Align);
+        QAction* AlignAction = AlignMenu->addAction(AlignName);
+        AlignAction->setCheckable(true);
+        AlignAction->setChecked(AlignName == CurrentAlign);
+        connect(AlignAction, &QAction::triggered, this,
+                [this, FirstBlockPos, PartKind, AlignName]() {
+                    QVector<QPair<QString, QString>> Current;
+                    if (PartKind == QLatin1String("table")) {
+                        Current = TableAttributesAt(
+                            _TextEdit->document(), FirstBlockPos);
+                    } else {
+                        Current = TableCellAttributesAt(
+                            _TextEdit->document(), FirstBlockPos);
+                    }
+                    SetAttribute(Current, QStringLiteral("align"),
+                                 AlignName);
+                    if (PartKind == QLatin1String("table")) {
+                        ApplyTableAttributes(FirstBlockPos, Current);
+                    } else {
+                        ApplyTableCellAttributes(FirstBlockPos, Current);
+                    }
+                });
+    }
+    AlignMenu->addSeparator();
+    QAction* NoneAction = AlignMenu->addAction(tr("None"));
+    connect(NoneAction, &QAction::triggered, this,
+            [this, FirstBlockPos, PartKind]() {
+                QVector<QPair<QString, QString>> Current;
+                if (PartKind == QLatin1String("table")) {
+                    Current = TableAttributesAt(_TextEdit->document(),
+                                                FirstBlockPos);
+                } else {
+                    Current = TableCellAttributesAt(
+                        _TextEdit->document(), FirstBlockPos);
+                }
+                RemoveAttribute(Current, QStringLiteral("align"));
+                if (PartKind == QLatin1String("table")) {
+                    ApplyTableAttributes(FirstBlockPos, Current);
+                } else {
+                    ApplyTableCellAttributes(FirstBlockPos, Current);
+                }
+            });
+}
+
+/**
+ * @brief Adds one table part's submenu to a gear menu (Bug 448 v2).
+ *
+ * One submenu per part: its Anchor... action first, then the
+ * part's own options (Align for a table or a cell, Caption for
+ * the table). A combined cell gear calls this once per part it
+ * covers, outer part first, so the header gear shows the Table
+ * head, Row, and Header cell submenus, a row gear shows the Row
+ * and Cell submenus, and a plain cell gear shows only its own.
+ * @param Menu The menu being built.
+ * @param PartKind The part: "table", "thead", "tbody", "tfoot",
+ *        "tr", "td", or "th".
+ * @param Attributes The part's attributes, for the current values.
+ * @param FirstBlockPos A block of the table.
+ */
+void TextEditor::AddTablePartSubmenu(
+    QMenu* Menu, const QString& PartKind,
+    const QVector<QPair<QString, QString>>& Attributes,
+    int FirstBlockPos)
+{
+    QString MenuTitle;
+    if (PartKind == QLatin1String("table")) {
+        MenuTitle = tr("Table options");
+    } else if (PartKind == QLatin1String("thead")) {
+        MenuTitle = tr("Table head options");
+    } else if (PartKind == QLatin1String("tbody")) {
+        MenuTitle = tr("Table body options");
+    } else if (PartKind == QLatin1String("tfoot")) {
+        MenuTitle = tr("Table foot options");
+    } else if (PartKind == QLatin1String("tr")) {
+        MenuTitle = tr("Row options");
+    } else if (PartKind == QLatin1String("th")) {
+        MenuTitle = tr("Header cell options");
+    } else {
+        MenuTitle = tr("Cell options");
+    }
+    QMenu* Options = Menu->addMenu(MenuTitle);
+    // Bug 464 v7: the anchor is settable from the gear menu,
+    // so a part without one can gain one. It sits first in
+    // every part's menu (alphabetical), ahead of the part's
+    // own options. Prefilled with the current anchor; empty
+    // clears it.
+    QAction* AnchorAction = Options->addAction(tr("Anchor..."));
+    connect(AnchorAction, &QAction::triggered, this,
+            [this, FirstBlockPos, PartKind, MenuTitle]() {
+                QVector<QPair<QString, QString>> Current;
+                if (PartKind == QLatin1String("table")) {
+                    Current = TableAttributesAt(_TextEdit->document(),
+                                                FirstBlockPos);
+                } else if (PartKind == QLatin1String("thead") ||
+                           PartKind == QLatin1String("tbody") ||
+                           PartKind == QLatin1String("tfoot")) {
+                    Current = TableSectionAttributesAt(
+                        _TextEdit->document(), FirstBlockPos, PartKind);
+                } else if (PartKind == QLatin1String("tr")) {
+                    Current = TableRowAttributesAt(
+                        _TextEdit->document(), FirstBlockPos);
+                } else {
+                    Current = TableCellAttributesAt(
+                        _TextEdit->document(), FirstBlockPos);
+                }
+                bool Ok = false;
+                QString Value = QInputDialog::getText(
+                    this, MenuTitle, tr("Anchor:"), QLineEdit::Normal,
+                    AttributeOf(Current, QStringLiteral("anchor")),
+                    &Ok);
+                if (!Ok) {
+                    return;
+                }
+                // Bug 464 v8: the editor asks the owner to change
+                // the anchor. The owner refuses a delete when the
+                // anchor is cited, renames the cross-references
+                // when it changes, and calls SetTablePartAnchor
+                // to set it.
+                emit AnchorChangeRequested(
+                    AttributeOf(Current, QStringLiteral("anchor")),
+                    Value.trimmed(), FirstBlockPos, false, PartKind);
+            });
+    if (PartKind == QLatin1String("table")) {
+        // The table's own options, in alphabetical order after
+        // the anchor: Align, then Caption.
+        AddTableAlignActions(Options, Attributes, FirstBlockPos,
+                             PartKind);
+        QAction* CaptionAction = Options->addAction(tr("Caption..."));
+        connect(CaptionAction, &QAction::triggered, this,
+                [this, FirstBlockPos]() {
+                    QTextDocument* Document = _TextEdit->document();
+                    QTextBlock Caption =
+                        Document->findBlock(FirstBlockPos);
+                    if (!IsTableCaptionBlock(Caption)) {
+                        return;
+                    }
+                    // The current caption, without the gear.
+                    QString Current = Caption.text();
+                    bool HasGear = HasOptionMarkerAt(
+                        Document, Caption.position());
+                    if (HasGear && Current.startsWith(OptionGlyph)) {
+                        Current.remove(0, 1);
+                    }
+                    bool Ok = false;
+                    QString Value = QInputDialog::getText(
+                        this, tr("Table options"), tr("Caption:"),
+                        QLineEdit::Normal, Current, &Ok);
+                    if (!Ok) {
+                        return;
+                    }
+                    // The caption lives in the caption block's
+                    // text: replace it after the gear, keeping
+                    // the caption's bold. An empty caption writes
+                    // no <name>. The read-back carries it into
+                    // the model.
+                    QTextCursor Cursor(Document);
+                    Cursor.beginEditBlock();
+                    int Start = Caption.position() +
+                                (HasGear ? 1 : 0);
+                    int End = Caption.position() +
+                              Caption.length() - 1;
+                    Cursor.setPosition(Start);
+                    if (End > Start) {
+                        Cursor.setPosition(End,
+                                           QTextCursor::KeepAnchor);
+                    }
+                    QTextCharFormat Bold;
+                    Bold.setFontWeight(QFont::Bold);
+                    Cursor.insertText(Value.trimmed(), Bold);
+                    Cursor.endEditBlock();
+                    _TextEdit->setFocus();
+                });
+    } else if (PartKind == QLatin1String("td") ||
+               PartKind == QLatin1String("th")) {
+        // A cell's own option, after the anchor: Align.
+        AddTableAlignActions(Options, Attributes, FirstBlockPos,
+                             PartKind);
+    }
+}
+
+void TextEditor::AddTableOptionsActions(QMenu* Menu, const QPoint& Pos)
+{
+    QTextCursor Clicked = _TextEdit->cursorForPosition(Pos);
+    int ClickPos = Clicked.position();
+    QTextDocument* Document = _TextEdit->document();
+    QString Kind = TableGearKindAt(Document, ClickPos);
+    if (Kind.isEmpty()) {
+        Kind = TableGearKindAt(Document, ClickPos - 1);
+    }
+    if (Kind.isEmpty()) {
+        return;
+    }
+    // Bug 464 v9: the block comes from the gear itself, not
+    // from the click position, which can land in the block
+    // above at a boundary.
+    QTextBlock Block = GearBlockAt(Document, ClickPos);
+    if (!IsTableBlock(Block)) {
+        return;
+    }
+    int FirstBlockPos = Block.position();
+    if (Kind == QLatin1String("table")) {
+        // The caption gear: the table's own submenu only.
+        AddTablePartSubmenu(Menu, Kind,
+                            TableAttributesAt(Document, FirstBlockPos),
+                            FirstBlockPos);
+    } else if (Kind == QLatin1String("th") ||
+               Kind == QLatin1String("td")) {
+        // Bug 448 v2: one gear covers the cell and its row and
+        // section, so the menu holds a submenu for each part
+        // that applies here, outer part first.
+        int Row = -1;
+        int Column = -1;
+        if (!TableCellOfBlock(Document, Block, Row, Column)) {
+            return;
+        }
+        xmlNodePtr Shell = nullptr;
+        QVector<DocTableRowMark> Marks;
+        if (!TablePayloadOf(Block, Shell, Marks)) {
+            return;
+        }
+        QTextTable* Frame = TableOfBlock(Document, Block);
+        int Rows = Frame != nullptr ? Frame->rows() : 0;
+        QString Section = SectionOfRow(Marks, Row);
+        bool FirstOfSection =
+            Column == 0 &&
+            Row == FirstRowOfSection(Marks, Rows, Section);
+        xmlFreeNode(Shell);
+        if (FirstOfSection) {
+            AddTablePartSubmenu(
+                Menu, Section,
+                TableSectionAttributesAt(Document, FirstBlockPos, Section),
+                FirstBlockPos);
+        }
+        if (Column == 0 && Row >= 0) {
+            AddTablePartSubmenu(
+                Menu, QStringLiteral("tr"),
+                TableRowAttributesAt(Document, FirstBlockPos),
+                FirstBlockPos);
+        }
+        AddTablePartSubmenu(
+            Menu, Kind,
+            TableCellAttributesAt(Document, FirstBlockPos),
+            FirstBlockPos);
+    } else if (Kind == QLatin1String("thead") ||
+               Kind == QLatin1String("tbody") ||
+               Kind == QLatin1String("tfoot")) {
+        // A section gear on its own (a build that still wrote
+        // one per part): its own submenu only.
+        AddTablePartSubmenu(
+            Menu, Kind,
+            TableSectionAttributesAt(Document, FirstBlockPos, Kind),
+            FirstBlockPos);
+    } else if (Kind == QLatin1String("tr")) {
+        // A row gear on its own: its own submenu only.
+        AddTablePartSubmenu(
+            Menu, Kind,
+            TableRowAttributesAt(Document, FirstBlockPos),
+            FirstBlockPos);
+    }
+    Menu->addSeparator();
+}
+
 void TextEditor::AddSpellActions(QMenu* Menu, const QPoint& Pos)
 {
     if (_SpellChecker == nullptr || !_SpellChecker->IsAvailable()) {
@@ -8853,7 +11755,446 @@ void TextEditor::ApplySourceAttributes(
     _TextEdit->setFocus();
 }
 
-bool TextEditor::PromptForTag(const QString& Name, DocTagEntry& Entry)
+void TextEditor::SetElementAnchor(int FirstBlockPos, bool IsSourceCode,
+                                  const QString& Anchor)
+{
+    // Bug 464 v8: the owner calls this after checking the old
+    // anchor is not cited and updating the cross-references.
+    // An empty anchor clears it.
+    QTextDocument* Document = _TextEdit->document();
+    QVector<QPair<QString, QString>> Current;
+    if (IsSourceCode) {
+        Current = SourceAttributesAt(Document, FirstBlockPos);
+    } else {
+        Current = ListAttributesAt(Document, FirstBlockPos);
+    }
+    QString Trimmed = Anchor.trimmed();
+    if (Trimmed.isEmpty()) {
+        RemoveAttribute(Current, QStringLiteral("anchor"));
+    } else {
+        SetAttribute(Current, QStringLiteral("anchor"), Trimmed);
+    }
+    if (IsSourceCode) {
+        ApplySourceAttributes(FirstBlockPos, Current);
+    } else {
+        ApplyListAttributes(FirstBlockPos, Current);
+    }
+}
+
+void TextEditor::RestoreSelection(int Start, int End)
+{
+    QTextDocument* Document = _TextEdit->document();
+    if (Document == nullptr) {
+        return;
+    }
+    int Max = Document->characterCount() - 1;
+    if (Max < 0) {
+        Max = 0;
+    }
+    int From = qBound(0, Start, Max);
+    int To = qBound(0, End, Max);
+    QTextCursor Cursor(Document);
+    Cursor.setPosition(From);
+    Cursor.setPosition(To, QTextCursor::KeepAnchor);
+    _TextEdit->setTextCursor(Cursor);
+}
+
+void TextEditor::ApplyListAttributes(
+    int FirstBlockPos,
+    const QVector<QPair<QString, QString>>& Attributes)
+{
+    QTextDocument* Document = _TextEdit->document();
+    QTextBlock First = FirstListBlock(Document->findBlock(FirstBlockPos));
+    if (!IsListBlock(First)) {
+        return;
+    }
+    QString Kind =
+        First.blockFormat().property(DocListKindProperty).toString();
+    // Bug 464 v9: the walk up must not cross into the previous
+    // list. A bulleted or numbered list carries its own
+    // QTextList object, so when the first block found and the
+    // block at the given position sit in different list
+    // objects, the walk crossed a boundary and the given block
+    // is the one to use.
+    QTextBlock Given = Document->findBlock(FirstBlockPos);
+    if (Kind != QLatin1String("dl") && First.textList() != nullptr &&
+        Given.textList() != nullptr &&
+        First.textList() != Given.textList()) {
+        First = Given;
+        Kind = First.blockFormat().property(DocListKindProperty).toString();
+    }
+    QVariant GroupValue =
+        First.blockFormat().property(DocListGroupProperty);
+    QVariant Shared = First.blockFormat().property(DocListProperty);
+    // Collect every block of the list before restamping any of
+    // them: restamping changes the attributes the grouping
+    // reads. Blank lines between items are stepped over, not
+    // collected, so the list does not split around them.
+    QVector<QTextBlock> Blocks;
+    QTextBlock Block = First;
+    while (Block.isValid()) {
+        if (!IsListBlock(Block) ||
+            Block.blockFormat().property(DocListKindProperty).toString() !=
+                Kind ||
+            Block.blockFormat().property(DocListGroupProperty) !=
+                GroupValue ||
+            Block.blockFormat().property(DocListProperty) != Shared) {
+            if (IsBlankPlainBlock(Block)) {
+                QTextBlock Next = Block.next();
+                while (Next.isValid() && IsBlankPlainBlock(Next)) {
+                    Next = Next.next();
+                }
+                if (Next.isValid() && IsListBlock(Next) &&
+                    Next.blockFormat()
+                            .property(DocListKindProperty)
+                            .toString() == Kind &&
+                    Next.blockFormat().property(DocListGroupProperty) ==
+                        GroupValue &&
+                    Next.blockFormat().property(DocListProperty) ==
+                        Shared) {
+                    Block = Next;
+                    continue;
+                }
+            }
+            break;
+        }
+        Blocks.append(Block);
+        Block = Block.next();
+    }
+    QTextCursor Cursor(Document);
+    Cursor.beginEditBlock();
+    QTextList* List = nullptr;
+    for (const QTextBlock& Target : Blocks) {
+        if (List == nullptr) {
+            List = Target.textList();
+        }
+        // Each block keeps its own role: an item stays an
+        // item, a term stays a term, a continuation stays a
+        // continuation.
+        QString Role = ListRoleOf(Target);
+        Cursor.setPosition(Target.position());
+        SetListProperties(Cursor, Kind, GroupValue.toInt(), Attributes,
+                          Role);
+    }
+    // A style change re-labels the list: numbers become
+    // numbers, letters become letters, the rest show bullets.
+    // The list object holds the display format, so it is
+    // restamped too. Only an inline <list> is driven by its
+    // style; a <ul> is always bullets. An <ol> is restamped
+    // too, so a Start change takes effect at once (Bug 464
+    // v5); its format carries the start attribute.
+    if (List != nullptr &&
+        (Kind == QLatin1String("list") ||
+         Kind == QLatin1String("ol"))) {
+        List->setFormat(ListFormatForKind(Kind, Attributes));
+    }
+    UpdateOptionMarkers();
+    Cursor.endEditBlock();
+    _TextEdit->setFocus();
+}
+
+/**
+ * @brief Reads a table payload variant map from a block (Bug 448).
+ * @param Block The block.
+ * @param Map Receives the map.
+ * @return False when the block carries no table payload.
+ */
+static bool TablePayloadMapOf(const QTextBlock& Block, QVariantMap& Map)
+{
+    QVariant Value =
+        Block.blockFormat().property(DocTablePayloadProperty);
+    if (!Value.isValid()) {
+        return false;
+    }
+    Map = Value.toMap();
+    return Map.contains(QStringLiteral("rows"));
+}
+
+/**
+ * @brief Writes one table payload variant onto every block of
+ *        the table (Bug 448).
+ *
+ * Only the payload property changes: each block keeps its kind,
+ * group, role, and cell property.
+ * @param Document The document.
+ * @param Group The table's group number.
+ * @param Payload The payload variant to write.
+ */
+static void RestampTablePayload(QTextDocument* Document, int Group,
+                                const QVariant& Payload)
+{
+    QTextCursor Cursor(Document);
+    for (const QTextBlock& Block : TableBlocksOfGroup(Document, Group)) {
+        QTextBlockFormat Format = Block.blockFormat();
+        Format.setProperty(DocTablePayloadProperty, Payload);
+        Cursor.setPosition(Block.position());
+        Cursor.setBlockFormat(Format);
+    }
+}
+
+/**
+ * @brief Sets the alignment on every block of one cell
+ *        (Bug 448).
+ *
+ * A cell's text alignment is a display property: the model
+ * carries the align attribute in the cell property, and the
+ * blocks show it. Only the first block carries the property,
+ * so the cell is found from it.
+ * @param Document The document.
+ * @param FirstBlock The cell's first block.
+ * @param Align The align value, empty for none (left).
+ */
+static void SetCellBlockAlignment(QTextDocument* Document,
+                                  const QTextBlock& FirstBlock,
+                                  const QString& Align)
+{
+    int Row = -1;
+    int Column = -1;
+    if (!TableCellOfBlock(Document, FirstBlock, Row, Column)) {
+        return;
+    }
+    QTextTable* Frame = TableOfBlock(Document, FirstBlock);
+    if (Frame == nullptr) {
+        return;
+    }
+    QTextTableCell Cell = Frame->cellAt(Row, Column);
+    if (!Cell.isValid()) {
+        return;
+    }
+    Qt::Alignment Wanted = AlignmentForAlignValue(Align);
+    QTextCursor Cursor(Document);
+    QTextBlock Block = Cell.firstCursorPosition().block();
+    QTextBlock Last = Cell.lastCursorPosition().block();
+    while (Block.isValid()) {
+        QTextBlockFormat Format = Block.blockFormat();
+        if (Format.alignment() != Wanted) {
+            Format.setAlignment(Wanted);
+            Cursor.setPosition(Block.position());
+            Cursor.setBlockFormat(Format);
+        }
+        if (Block == Last) {
+            break;
+        }
+        Block = Block.next();
+    }
+}
+
+void TextEditor::ApplyTableAttributes(
+    int FirstBlockPos,
+    const QVector<QPair<QString, QString>>& Attributes)
+{
+    QTextDocument* Document = _TextEdit->document();
+    QTextBlock Block = Document->findBlock(FirstBlockPos);
+    if (!IsTableBlock(Block)) {
+        return;
+    }
+    int Group = Block.blockFormat()
+                    .property(DocTableGroupProperty)
+                    .toInt();
+    QVariantMap Map;
+    if (!TablePayloadMapOf(Block, Map)) {
+        return;
+    }
+    Map[QStringLiteral("attrs")] = AttributesToVariant(Attributes);
+    QTextCursor Cursor(Document);
+    Cursor.beginEditBlock();
+    RestampTablePayload(Document, Group, Map);
+    UpdateOptionMarkers();
+    Cursor.endEditBlock();
+    _TextEdit->setFocus();
+}
+
+void TextEditor::ApplyTableSectionAttributes(
+    int FirstBlockPos, const QString& Section,
+    const QVector<QPair<QString, QString>>& Attributes)
+{
+    QTextDocument* Document = _TextEdit->document();
+    QTextBlock Block = Document->findBlock(FirstBlockPos);
+    if (!IsTableBlock(Block)) {
+        return;
+    }
+    int Group = Block.blockFormat()
+                    .property(DocTableGroupProperty)
+                    .toInt();
+    QVariantMap Map;
+    if (!TablePayloadMapOf(Block, Map)) {
+        return;
+    }
+    QString Key;
+    if (Section == QLatin1String("thead")) {
+        Key = QStringLiteral("headattrs");
+    } else if (Section == QLatin1String("tfoot")) {
+        Key = QStringLiteral("footattrs");
+    } else {
+        Key = QStringLiteral("bodyattrs");
+    }
+    Map[Key] = AttributesToVariant(Attributes);
+    QTextCursor Cursor(Document);
+    Cursor.beginEditBlock();
+    RestampTablePayload(Document, Group, Map);
+    UpdateOptionMarkers();
+    Cursor.endEditBlock();
+    _TextEdit->setFocus();
+}
+
+void TextEditor::ApplyTableRowAttributes(
+    int FirstBlockPos,
+    const QVector<QPair<QString, QString>>& Attributes)
+{
+    QTextDocument* Document = _TextEdit->document();
+    QTextBlock Block = Document->findBlock(FirstBlockPos);
+    if (!IsTableCellBlock(Block)) {
+        return;
+    }
+    int Group = Block.blockFormat()
+                    .property(DocTableGroupProperty)
+                    .toInt();
+    int Row = -1;
+    int Column = -1;
+    if (!TableCellOfBlock(Document, Block, Row, Column)) {
+        return;
+    }
+    QVariantMap Map;
+    if (!TablePayloadMapOf(Block, Map)) {
+        return;
+    }
+    QVariantList Rows = Map.value(QStringLiteral("rows")).toList();
+    if (Row < 0) {
+        return;
+    }
+    // A row the grid gained since the last load has no mark
+    // yet: extend the marks to it, in the section the grid
+    // reads it as (the last mark's section), so the anchor has
+    // a mark to land on.
+    while (Rows.size() <= Row) {
+        QVariantMap RowMap;
+        QString Section = QStringLiteral("tbody");
+        if (!Rows.isEmpty()) {
+            QString LastSection = Rows.last()
+                                      .toMap()
+                                      .value(QStringLiteral("section"))
+                                      .toString();
+            if (LastSection == QLatin1String("thead") ||
+                LastSection == QLatin1String("tfoot")) {
+                Section = LastSection;
+            }
+        }
+        RowMap[QStringLiteral("section")] = Section;
+        RowMap[QStringLiteral("anchor")] = QString();
+        RowMap[QStringLiteral("attrs")] = QVariantList();
+        Rows.append(RowMap);
+    }
+    // The row's anchor rides in the mark alongside its other
+    // attributes, so it is split back out here.
+    QString Anchor = AttributeOf(Attributes, QStringLiteral("anchor"));
+    QVector<QPair<QString, QString>> Kept;
+    for (const QPair<QString, QString>& Attribute : Attributes) {
+        if (Attribute.first != QLatin1String("anchor")) {
+            Kept.append(Attribute);
+        }
+    }
+    QVariantMap RowMap = Rows[Row].toMap();
+    RowMap[QStringLiteral("anchor")] = Anchor;
+    RowMap[QStringLiteral("attrs")] = AttributesToVariant(Kept);
+    Rows[Row] = RowMap;
+    Map[QStringLiteral("rows")] = Rows;
+    QTextCursor Cursor(Document);
+    Cursor.beginEditBlock();
+    RestampTablePayload(Document, Group, Map);
+    UpdateOptionMarkers();
+    Cursor.endEditBlock();
+    _TextEdit->setFocus();
+}
+
+void TextEditor::ApplyTableCellAttributes(
+    int FirstBlockPos,
+    const QVector<QPair<QString, QString>>& Attributes)
+{
+    QTextDocument* Document = _TextEdit->document();
+    QTextBlock Block = Document->findBlock(FirstBlockPos);
+    if (!IsTableCellBlock(Block)) {
+        return;
+    }
+    xmlNodePtr CurrentNode = nullptr;
+    if (!TableCellFromVariant(
+            Block.blockFormat().property(DocTableCellProperty),
+            CurrentNode)) {
+        return;
+    }
+    // A fresh node takes exactly the new list: SetNodeAttributes
+    // only sets, so building fresh is the replacement.
+    xmlNodePtr CellNode = NewNode(
+        DocDocument::NodeNameEquals(CurrentNode, "th") ? "th" : "td");
+    xmlFreeNode(CurrentNode);
+    SetNodeAttributes(CellNode, Attributes);
+    QVariant CellValue = TableCellToVariant(CellNode);
+    QString Align = AttributeOf(Attributes, QStringLiteral("align"));
+    xmlFreeNode(CellNode);
+    QTextCursor Cursor(Document);
+    Cursor.beginEditBlock();
+    QTextBlockFormat Format = Block.blockFormat();
+    Format.setProperty(DocTableCellProperty, CellValue);
+    Cursor.setPosition(Block.position());
+    Cursor.setBlockFormat(Format);
+    SetCellBlockAlignment(Document, Block, Align);
+    UpdateOptionMarkers();
+    Cursor.endEditBlock();
+    _TextEdit->setFocus();
+}
+
+void TextEditor::SetTablePartAnchor(int FirstBlockPos,
+                                    const QString& PartKind,
+                                    const QString& Anchor)
+{
+    // Bug 448: the owner calls this after checking the old
+    // anchor is not cited and updating the cross-references.
+    // An empty anchor clears it.
+    QTextDocument* Document = _TextEdit->document();
+    QString Trimmed = Anchor.trimmed();
+    if (PartKind == QLatin1String("table")) {
+        QVector<QPair<QString, QString>> Current =
+            TableAttributesAt(Document, FirstBlockPos);
+        if (Trimmed.isEmpty()) {
+            RemoveAttribute(Current, QStringLiteral("anchor"));
+        } else {
+            SetAttribute(Current, QStringLiteral("anchor"), Trimmed);
+        }
+        ApplyTableAttributes(FirstBlockPos, Current);
+    } else if (PartKind == QLatin1String("thead") ||
+               PartKind == QLatin1String("tbody") ||
+               PartKind == QLatin1String("tfoot")) {
+        QVector<QPair<QString, QString>> Current =
+            TableSectionAttributesAt(Document, FirstBlockPos, PartKind);
+        if (Trimmed.isEmpty()) {
+            RemoveAttribute(Current, QStringLiteral("anchor"));
+        } else {
+            SetAttribute(Current, QStringLiteral("anchor"), Trimmed);
+        }
+        ApplyTableSectionAttributes(FirstBlockPos, PartKind, Current);
+    } else if (PartKind == QLatin1String("tr")) {
+        QVector<QPair<QString, QString>> Current =
+            TableRowAttributesAt(Document, FirstBlockPos);
+        if (Trimmed.isEmpty()) {
+            RemoveAttribute(Current, QStringLiteral("anchor"));
+        } else {
+            SetAttribute(Current, QStringLiteral("anchor"), Trimmed);
+        }
+        ApplyTableRowAttributes(FirstBlockPos, Current);
+    } else if (PartKind == QLatin1String("td") ||
+               PartKind == QLatin1String("th")) {
+        QVector<QPair<QString, QString>> Current =
+            TableCellAttributesAt(Document, FirstBlockPos);
+        if (Trimmed.isEmpty()) {
+            RemoveAttribute(Current, QStringLiteral("anchor"));
+        } else {
+            SetAttribute(Current, QStringLiteral("anchor"), Trimmed);
+        }
+        ApplyTableCellAttributes(FirstBlockPos, Current);
+    }
+}
+
+bool TextEditor::PromptForTag(const QString& Name, DocTagEntry& Entry,
+                              const QString& Prefill)
 {
     Entry.Name = Name;
     Entry.Attributes.clear();
@@ -8874,11 +12215,18 @@ bool TextEditor::PromptForTag(const QString& Name, DocTagEntry& Entry)
         Entry.Attributes.append(
             QPair<QString, QString>(QStringLiteral("target"), Value.trimmed()));
     } else if (Name == QLatin1String("iref")) {
+        // Bug 503: the Item is prefilled with the highlighted
+        // word (the word being indexed), and the prompts say
+        // what they want. A sub-item is a narrower term filed
+        // under the item, e.g. item "RTT", sub-item
+        // "Round Trip Time".
         QString Item;
         while (true) {
             bool Ok = false;
-            Item = QInputDialog::getText(this, LabelFor(Name), tr("Item:"),
-                                         QLineEdit::Normal, QString(), &Ok);
+            Item = QInputDialog::getText(
+                this, LabelFor(Name),
+                tr("Item (the word or phrase to index):"),
+                QLineEdit::Normal, Prefill, &Ok);
             if (!Ok) {
                 return false;
             }
@@ -8889,9 +12237,10 @@ bool TextEditor::PromptForTag(const QString& Name, DocTagEntry& Entry)
         Entry.Attributes.append(
             QPair<QString, QString>(QStringLiteral("item"), Item.trimmed()));
         bool Ok = false;
-        QString Subitem = QInputDialog::getText(this, LabelFor(Name),
-                                                tr("Sub-item (optional):"),
-                                                QLineEdit::Normal, QString(), &Ok);
+        QString Subitem = QInputDialog::getText(
+            this, LabelFor(Name),
+            tr("Sub-item (a narrower term under the item, optional):"),
+            QLineEdit::Normal, QString(), &Ok);
         if (Ok && !Subitem.trimmed().isEmpty()) {
             Entry.Attributes.append(
                 QPair<QString, QString>(QStringLiteral("subitem"), Subitem.trimmed()));
@@ -8913,6 +12262,17 @@ bool TextEditor::PromptForTag(const QString& Name, DocTagEntry& Entry)
 void TextEditor::InsertTag(const QString& Name)
 {
     QTextCursor Cursor = _TextEdit->textCursor();
+    // Bug 503: capture the highlighted word before collapsing
+    // the selection -- it prefills the index entry's Item.
+    // A multi-line highlight becomes one line in the prompt.
+    QString Highlight;
+    if (Cursor.hasSelection()) {
+        Highlight = Cursor.selectedText();
+        Highlight.replace(QChar(0x2029), QLatin1Char(' '));
+        Highlight.replace(QLatin1Char('\n'), QLatin1Char(' '));
+        Highlight.replace(QLatin1Char('\r'), QLatin1Char(' '));
+        Highlight = Highlight.trimmed();
+    }
     Cursor.beginEditBlock();
     if (Cursor.hasSelection()) {
         Cursor.setPosition(Cursor.selectionStart());
@@ -8940,7 +12300,7 @@ void TextEditor::InsertTag(const QString& Name)
         return;
     }
     DocTagEntry Entry;
-    if (!PromptForTag(Name, Entry)) {
+    if (!PromptForTag(Name, Entry, Highlight)) {
         Cursor.endEditBlock();
         return;
     }
@@ -11356,7 +14716,7 @@ void TextEditor::WrapSelection(const QString& Name)
         return;
     }
     DocTagEntry Entry;
-    if (!PromptForTag(Name, Entry)) {
+    if (!PromptForTag(Name, Entry, Cursor.selectedText())) {
         return;
     }
     int End = Cursor.selectionEnd();

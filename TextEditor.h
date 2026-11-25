@@ -76,10 +76,12 @@
 class QEvent;
 class QCheckBox;
 class QComboBox;
+class QLabel;
 class QMenu;
 class QPlainTextEdit;
 class QPushButton;
 class QTabWidget;
+class QTextCursor;
 class QTextEdit;
 class QToolButton;
 
@@ -194,6 +196,46 @@ public:
     void SetBodyNodes(const QVector<xmlNodePtr>& Nodes);
 
     /**
+     * @brief Sets the anchor on a list or sourcecode element.
+     *
+     * Called by the owner after it has checked the old anchor
+     * is not cited and updated the cross-references. An empty
+     * anchor clears it. The change syncs to the model through
+     * the usual TextChanged path.
+     * @param FirstBlockPos The first block of the element.
+     * @param IsSourceCode True for sourcecode, false for a list.
+     * @param Anchor The anchor to set, empty to clear it.
+     */
+    void SetElementAnchor(int FirstBlockPos, bool IsSourceCode,
+                          const QString& Anchor);
+
+    /**
+     * @brief Sets the anchor on one part of a table (Bug 448).
+     *
+     * The owner calls this after checking the old anchor is not
+     * cited and updating the cross-references. An empty anchor
+     * clears it. The change syncs to the model through the usual
+     * TextChanged path.
+     * @param FirstBlockPos A block of the table: the caption block
+     *        for the table itself, the first cell's first block
+     *        of the first row of a section for a section, the
+     *        first cell's first block of a row for a row, or a
+     *        cell's first block for a cell.
+     * @param PartKind The part: "table", "thead", "tbody",
+     *        "tfoot", "tr", "td", or "th".
+     * @param Anchor The anchor to set, empty to clear it.
+     */
+    void SetTablePartAnchor(int FirstBlockPos, const QString& PartKind,
+                            const QString& Anchor);
+
+    /**
+     * @brief Moves the cursor to a range, clamped to the document.
+     * @param Start The first character of the range.
+     * @param End The character after the range.
+     */
+    void RestoreSelection(int Start, int End);
+
+    /**
      * @brief Sets the preserved nodes the XML tab shows.
      *
      * The nodes are deep-copied: the editor owns its copies
@@ -219,6 +261,46 @@ public:
      * @return The body nodes.
      */
     QVector<xmlNodePtr> BodyNodes() const;
+
+    /**
+     * @brief Whether pasted <section> nodes may become
+     *        subsections (Bug 520).
+     *
+     * True for the section body editor, false for the abstract
+     * and the settings note, which hold no sections. When false
+     * and the XML tab's edited XML holds a <section>,
+     * ApplyXmlEdits refuses it instead of applying anything.
+     * @param Allow True to allow subsections.
+     */
+    void SetAllowSubsections(bool Allow);
+
+    /**
+     * @brief Applies the XML tab's edited XML, if any (Bug 520).
+     *
+     * When the Read-only box is unchecked and the pane text has
+     * changed, the text is re-parsed and the section's body
+     * nodes are rebuilt from it; pasted <section> nodes go to
+     * the owner through SubsectionsPasted. When the box is
+     * checked, or the text is unchanged, there is nothing to
+     * apply and this returns true. On a parse error the error
+     * is shown, the box stays unchecked, the edited text stays
+     * in the pane, and the model is untouched, so a bad paste
+     * cannot corrupt the document or silently drop edits.
+     * @return True when there was nothing to apply or the
+     *         edits applied; false on a parse error (or when
+     *         sections were pasted where they are not allowed).
+     */
+    bool ApplyXmlEdits();
+
+    /**
+     * @brief True when the XML tab holds edits that have not
+     *        been applied yet (Bug 520).
+     *
+     * The Read-only box is unchecked and the pane text has
+     * changed since it was last applied or refreshed.
+     * @return True when edits are pending.
+     */
+    bool XmlEditsPending() const;
 
     /**
      * @brief Clears both tabs, freeing the editor-owned node copies.
@@ -435,6 +517,40 @@ signals:
                                 const QString& Anchor,
                                 const QString& ListName);
 
+    /**
+     * @brief Sent when the gear menu asks to change an anchor.
+     *
+     * The editor shows the prompt but never writes the document
+     * itself. The owner checks whether the old anchor is cited,
+     * updates the cross-references when it changes, and calls
+     * SetElementAnchor with the value to set.
+     * @param OldAnchor The anchor now on the element, empty when none.
+     * @param NewAnchor The anchor the user entered, empty to clear it.
+     * @param FirstBlockPos The first block of the element, in the editor.
+     * @param IsSourceCode True for a sourcecode element, false for a list.
+     * @param PartKind The table part for a table gear ("table",
+     *        "thead", "tbody", "tfoot", "tr", "td", "th"), empty
+     *        for a sourcecode or list gear (Bug 448).
+     */
+    void AnchorChangeRequested(const QString& OldAnchor,
+                               const QString& NewAnchor,
+                               int FirstBlockPos, bool IsSourceCode,
+                               const QString& PartKind);
+
+    /**
+     * @brief Sent when the XML tab's edited XML holds new
+     *        subsections (Bug 520).
+     *
+     * The editor parses the XML tab and applies the body nodes
+     * itself, but a <section> child is a subsection, not a body
+     * node, so the owner adds it to the current section and
+     * rebuilds the outline. The nodes are borrowed: the owner
+     * must copy them into the document synchronously (the
+     * editor frees its copies when the signal returns).
+     * @param Sections The pasted <section> nodes; borrowed.
+     */
+    void SubsectionsPasted(const QVector<xmlNodePtr>& Sections);
+
 private slots:
     /**
      * @brief Refreshes the XML tab and reports the change.
@@ -446,6 +562,23 @@ private slots:
      * @param Index The newly shown tab.
      */
     void OnTabChanged(int Index);
+
+    /**
+     * @brief Applies or opens the XML tab for editing (Bug 520).
+     *
+     * Unchecking Read-only makes the XML pane editable and shows
+     * only the body nodes (preserved content is kept but hidden
+     * while editing). Re-checking it applies the edits: the pane
+     * text is re-parsed and the body nodes rebuilt. On a parse
+     * error the box stays unchecked so the XML can be fixed.
+     * @param Checked True when Read-only is checked.
+     */
+    void OnXmlReadOnlyToggled(bool Checked);
+
+    /**
+     * @brief Notes that the editable XML pane text changed (Bug 520).
+     */
+    void OnXmlTextChanged();
 
     /**
      * @brief Shows the standard menu plus the smart tag menu.
@@ -504,6 +637,19 @@ private:
     void AddReferenceActions(QMenu* Menu);
 
     /**
+     * @brief Adds a Rename action for the reference under the
+     *        click (Bug 514 v2).
+     *
+     * A reference's visible text is read-only, so it cannot be
+     * typed into; this is the way to change it. Nothing is
+     * added unless the click lands on a reference.
+     * @param Menu The menu being built.
+     * @param Pos The click position, in the text edit's coordinates.
+     */
+    void AddRenameLinkAction(QMenu* Menu, const QPoint& Pos);
+    void AddEditIrefAction(QMenu* Menu, const QPoint& Pos);
+
+    /**
      * @brief Adds the sourcecode options submenu when the click
      *        lands on an option marker (Bug 420).
      *
@@ -515,6 +661,95 @@ private:
      * @param Pos The click position, in viewport coordinates.
      */
     void AddSourceOptionsActions(QMenu* Menu, const QPoint& Pos);
+
+    /**
+     * @brief Adds the list options submenu when the click lands
+     *        on an option marker (Bug 464).
+     *
+     * The submenu offers the list's options: for an inline
+     * <list>, its style, hang indent, and counter; for a <ul>,
+     * its bare and empty switches plus spacing and indent; for
+     * an <ol>, its type, start, group, spacing, and indent;
+     * for a <dl>, its spacing, newline, and indent. No anchor
+     * or pn is offered: anchors are assigned automatically,
+     * never typed, and pn is prep-tool assigned. Nothing is
+     * added when the click is not on a marker.
+     * @param Menu The menu being built.
+     * @param Pos The click position, in viewport coordinates.
+     */
+    void AddListOptionsActions(QMenu* Menu, const QPoint& Pos);
+
+    /**
+     * @brief Adds the table options submenu when the click lands
+     *        on a table option marker (Bug 448).
+     *
+     * Each part of a table carries its own gear: the table, the
+     * head, body, and foot sections, each row, and each cell.
+     * The submenu offers the clicked part's options: the table
+     * offers its anchor, its alignment, and its caption; a
+     * section or a row offers only its anchor; a cell offers its
+     * anchor and its alignment. Nothing is added when the click
+     * is not on a table marker.
+     * @param Menu The menu being built.
+     * @param Pos The click position, in viewport coordinates.
+     */
+    void AddTableOptionsActions(QMenu* Menu, const QPoint& Pos);
+
+    /**
+     * @brief Adds one table part's submenu to a gear menu
+     *        (Bug 448 v2).
+     *
+     * One submenu per part: its Anchor... action first, then
+     * the part's own options (Align for a table or a cell,
+     * Caption for the table). A combined cell gear calls this
+     * once per part it covers, outer part first.
+     * @param Menu The menu being built.
+     * @param PartKind The part: "table", "thead", "tbody",
+     *        "tfoot", "tr", "td", or "th".
+     * @param Attributes The part's attributes, for the current
+     *        values.
+     * @param FirstBlockPos A block of the table.
+     */
+    void AddTablePartSubmenu(
+        QMenu* Menu, const QString& PartKind,
+        const QVector<QPair<QString, QString>>& Attributes,
+        int FirstBlockPos);
+
+    /**
+     * @brief Adds a Spacing submenu to a list options menu
+     *        (Bug 464 v2).
+     *
+     * The spacing values (v3.rng): normal or compact, plus
+     * None to remove the attribute. Shared by the <ul>, <ol>,
+     * and <dl> menus: all three carry spacing.
+     * @param Options The menu to add the submenu to.
+     * @param Attributes The list's attributes, for the current
+     *        value.
+     * @param FirstBlockPos The position of the list's first
+     *        block.
+     */
+    void AddSpacingActions(
+        QMenu* Options,
+        const QVector<QPair<QString, QString>>& Attributes,
+        int FirstBlockPos);
+
+    /**
+     * @brief Adds an Align submenu to a table options menu
+     *        (Bug 448).
+     *
+     * The align values (v3.rng): left, center, or right, plus
+     * None to remove the attribute. Shared by the table and cell
+     * menus: both carry align.
+     * @param Options The menu to add the submenu to.
+     * @param Attributes The part's attributes, for the current
+     *        value.
+     * @param FirstBlockPos A block of the table.
+     * @param PartKind The part: "table" or "td"/"th".
+     */
+    void AddTableAlignActions(
+        QMenu* Options,
+        const QVector<QPair<QString, QString>>& Attributes,
+        int FirstBlockPos, const QString& PartKind);
 
     /**
      * @brief Adds spelling suggestions and dictionary actions
@@ -547,6 +782,90 @@ private:
         const QVector<QPair<QString, QString>>& Attributes);
 
     /**
+     * @brief Writes one attribute list onto every block of the
+     *        list starting at a block (Bug 464).
+     *
+     * Attributes the new list does not carry are dropped from
+     * the list, so clearing an option removes its attribute.
+     * A style change re-labels the list, so the list object's
+     * display format is restamped too. The markers are
+     * refreshed afterwards, so the gear's hover text shows the
+     * new options.
+     * @param FirstBlockPos The position of the list's first block.
+     * @param Attributes The attribute list to write.
+     */
+    void ApplyListAttributes(
+        int FirstBlockPos,
+        const QVector<QPair<QString, QString>>& Attributes);
+
+    /**
+     * @brief Writes one attribute list onto the table itself
+     *        (Bug 448).
+     *
+     * The table's attributes live in the payload carried by
+     * every block of the table, so all of them are restamped.
+     * Attributes the new list does not carry are dropped from
+     * the table, so clearing an option removes its attribute.
+     * The markers are refreshed afterwards, so the gear's hover
+     * text shows the new options.
+     * @param FirstBlockPos A block of the table.
+     * @param Attributes The attribute list to write.
+     */
+    void ApplyTableAttributes(
+        int FirstBlockPos,
+        const QVector<QPair<QString, QString>>& Attributes);
+
+    /**
+     * @brief Writes one attribute list onto one section of a
+     *        table (Bug 448).
+     *
+     * The section's attributes live in the payload carried by
+     * every block of the table, so all of them are restamped.
+     * Attributes the new list does not carry are dropped from
+     * the section, so clearing an option removes its attribute.
+     * The markers are refreshed afterwards.
+     * @param FirstBlockPos A block of the table.
+     * @param Section The section: "thead", "tbody", or "tfoot".
+     * @param Attributes The attribute list to write.
+     */
+    void ApplyTableSectionAttributes(
+        int FirstBlockPos, const QString& Section,
+        const QVector<QPair<QString, QString>>& Attributes);
+
+    /**
+     * @brief Writes one attribute list onto one row of a table
+     *        (Bug 448).
+     *
+     * The row's attributes live in its mark in the payload
+     * carried by every block of the table, so all of them are
+     * restamped. Attributes the new list does not carry are
+     * dropped from the row, so clearing an option removes its
+     * attribute. The markers are refreshed afterwards.
+     * @param FirstBlockPos The first cell's first block of the row.
+     * @param Attributes The attribute list to write.
+     */
+    void ApplyTableRowAttributes(
+        int FirstBlockPos,
+        const QVector<QPair<QString, QString>>& Attributes);
+
+    /**
+     * @brief Writes one attribute list onto one cell of a table
+     *        (Bug 448).
+     *
+     * The cell's attributes live in the cell property on the
+     * cell's first block, so only that block is restamped. The
+     * cell's alignment is also applied to the cell's blocks, so
+     * the alignment shows at once. Attributes the new list does
+     * not carry are dropped from the cell, so clearing an option
+     * removes its attribute. The markers are refreshed afterwards.
+     * @param FirstBlockPos The cell's first block.
+     * @param Attributes The attribute list to write.
+     */
+    void ApplyTableCellAttributes(
+        int FirstBlockPos,
+        const QVector<QPair<QString, QString>>& Attributes);
+
+    /**
      * @brief Asks for the attributes a tag needs when inserted.
      *
      * Cross-references, external links, and relative links ask for
@@ -558,7 +877,8 @@ private:
      * @param Entry Filled with the tag name and its attributes.
      * @return False when the user cancelled.
      */
-    bool PromptForTag(const QString& Name, DocTagEntry& Entry);
+    bool PromptForTag(const QString& Name, DocTagEntry& Entry,
+                      const QString& Prefill = QString());
 
     /**
      * @brief Inserts an empty tag, a list, or a contact at the cursor.
@@ -987,9 +1307,53 @@ private:
      */
     void ShowSrcPlaceholderHint(int BlockPos);
 
+    /**
+     * @brief Shows the read-only reference hint once per link
+     *        (Bug 514 v2).
+     *
+     * A reference's visible text is read-only: typing or
+     * deleting inside it breaks the reference, so the key is
+     * swallowed and this says to right-click and Rename
+     * instead. Shown once per link, so holding a key down does
+     * not stack dialogs.
+     * @param LinkStart The link's first character.
+     */
+    void ShowLinkReadOnlyHint(int LinkStart);
+    void ShowIrefReadOnlyHint(int IrefStart);
+
+    /**
+     * @brief The hover text for a cross-reference, resolved to
+     *        the section, figure, or table it points at (Bug 515).
+     *
+     * The anchor is stable and does not change when sections
+     * are renumbered, so a hover that only shows the anchor
+     * ("S10") goes stale when Section 10 becomes Section 11.
+     * This resolves the anchor to the target's current number
+     * and title ("Cross-reference to Section 11: Versioning
+     * and Compatibility"). An anchor that does not point at a
+     * section, figure, or table keeps the fallback text.
+     * @param At The cursor at the hovered character.
+     * @param Fallback The hover text to keep when the anchor
+     *        does not resolve.
+     * @return The resolved hover text, or the fallback.
+     */
+    QString ResolvedXrefTip(const QTextCursor& At,
+                            const QString& Fallback) const;
+
     QTabWidget* _Tabs;
     QTextEdit* _TextEdit;
     QPlainTextEdit* _XmlEdit;
+    QWidget* _XmlPage;
+    QCheckBox* _XmlReadOnlyCheck;
+    QLabel* _XmlPreservedNote;
+    // Bug 520: true while the XML pane holds edits that have
+    // not been applied yet (the Read-only box is unchecked and
+    // the pane text changed).
+    bool _XmlDirty = false;
+    // Bug 520: true for the section body editor, which may
+    // take pasted <section> nodes as subsections; false for
+    // the abstract and the settings note.
+    bool _AllowSubsections = false;
     QVector<xmlNodePtr> _BodyNodes;
     QVector<DocPreservedItem> _PreservedNodes;
     QPushButton* _BulletedButton;
@@ -1004,9 +1368,12 @@ private:
     bool _DiagMarkersShown;
     int _DiagMarkersBlocks;
     int _DiagMarkersSourceFirst;
+    int _DiagMarkersListFirst;
     int _DiagMarkersGearsInserted;
     int _DiagMarkersGearsRemoved;
     int _SrcPlaceholderHintBlock;
+    int _LinkReadOnlyHintPos;
+    int _IrefReadOnlyHintPos;
     SpellChecker* _SpellChecker;
     const DocDocument* _Document;
     const BibCache* _BibCache;

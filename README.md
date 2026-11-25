@@ -20,7 +20,13 @@ the text of the document goes.
   Considerations), back (References). Sections add, insert, remove,
   and rearrange from the buttons under the outline.
 - File > Save writes the draft as RFCXML version 3, valid against the
-  v3.rng schema from the xml2rfc 3.35.0 distribution. The date
+  v3.rng schema from the xml2rfc 3.35.0 distribution. When the tool
+  created or modified the content, the file starts with a comment
+  naming it and its version ("InternetDraftEditor <version> was
+  used as an aid to create this document", with the project GitHub
+  address, Bug 505); a file merely opened and saved unchanged, that
+  never had the comment, gets none, and a file that already has it
+  keeps it. The date
   written is always the current date: a draft's date stays current
   until the draft is submitted (a draft expires 6 months after its
   date). A submit button, which seals the draft, comes later. The writer
@@ -31,8 +37,8 @@ the text of the document goes.
   output. The xml2rfc program path is remembered (File > Set xml2rfc
   Path...); it defaults to `xml2rfc` on the PATH.
 - File > Open reads back the subset this version writes. A file
-  holding content this version does not edit yet (appendices,
-  artwork, tables) opens with a warning, and saving
+  holding content this version does not edit yet (artwork,
+  tables) opens with a warning, and saving
   warns before dropping that content.
 
 ## Goal #2 (this version)
@@ -80,8 +86,27 @@ the text of the document goes.
 - Section bodies and the abstract edit in a two-tab editor: Text
   and XML. The Text tab is rich text: tags show as formatting, never
   as markup. The XML tab shows the raw `<t>` XML of the same
-  paragraphs, read-only, regenerated as the text changes. The title
+  paragraphs, regenerated as the text changes, formatted
+  with indentation for readability (Bug 516). The title
   stays a plain line: the schema allows it text plus a break only.
+- The XML tab has a Read-only checkbox at the top, checked by
+  default (Bug 520). Unchecking it makes the pane editable, so XML
+  can be pasted and edited directly instead of hand-editing the file
+  outside the editor. Re-checking it applies the edits: the XML is
+  re-parsed and the text rebuilt from it. Switching to the Text tab
+  or saving applies pending edits the same way. A pasted `<section>`
+  becomes a subsection of the current section, added after the
+  existing subsections; a pasted anchor that already exists in the
+  document is made unique (base-2, base-3, ...), and references
+  inside the pasted section that point at it are updated. While the
+  pane is editable it shows only the body nodes; preserved content
+  is kept but hidden, and shown again when Read-only is re-checked.
+  On a parse error the error is shown with its line, the box stays
+  unchecked, the edited XML stays in the pane, and the document is
+  untouched, so a bad paste cannot corrupt the document or drop
+  edits. A `<section>` pasted into the abstract or the settings
+  note is refused. An element the editor does not model renders
+  as plain text (its wrapper is dropped).
 - A right-click menu offers the 16 inline tags of `<t>` in the
   xml2rfc words, always alphabetical. With text selected, a tag
   wraps the selection. Without a selection, a tag starts or ends
@@ -94,7 +119,12 @@ the text of the document goes.
 - Line Break, Vertical Space, and Index Entry show as marker
   symbols (a Break glyph, a vertical-space glyph with its
   blank-line count, the index item text). Links and comments show
-  link-styled with hover tooltips saying what they point to.
+  link-styled with hover tooltips saying what they point to. A
+  cross-reference hover names the section, figure, or table it
+  points at by its current number and title ("Cross-reference to
+  Section 11: Versioning and Compatibility"), not just its anchor,
+  so it stays right when sections are renumbered (Bug 515); an
+  anchor that points elsewhere keeps the anchor text.
   Unicode text shows plain, with a Unicode hover note.
 - Cross-Reference, External Link, and Relative Reference ask for
   a target when inserted; an Index Entry asks for its item and an
@@ -122,9 +152,9 @@ the text of the document goes.
   A Remove action naming the kind turns a list back into
   paragraphs. A paragraph mixing a list with other text stays a
   preserved block. Nested lists stay preserved, untouched. List
-  options (numbering, spacing, and the like) are kept when a file
-  is read and written back, but not edited yet: all of them will
-  be supported later, since people wanted them.
+  options are edited through the list's gear marker: see Option
+  markers below. Figures and tables get their markers in later
+  builds.
 - A sourcecode block stands alone as its own lines: each line is
   a block, shown monospace and indented. The Blocks button above
   the text starts and stops one: its menu picks the kind of
@@ -154,35 +184,73 @@ the text of the document goes.
   lists, and preformatted blocks -- and drops the rest, keeping
   the text (Bug 430).
 
-## Option markers (Bug 420)
+## Option markers (Bug 420, lists Bug 464)
 
 - A structure with settable options shows one gear marker at the
-  start of its first line. In this build only sourcecode blocks
-  carry markers; lists, figures, and tables get theirs in later
-  builds. The gear shows plain: no underline, no special color.
-  It is display only: it never reaches the paragraphs, the XML
-  tab, or the file.
+  start of its first line. In this build sourcecode blocks, lists,
+  and tables carry markers; figures get theirs in a later build.
+  A table carries a gear per part: the table itself, its head,
+  body, and foot sections, each row, and each cell. A cell's
+  first line can carry up to three gears, outer part first:
+  section, row, cell. The gear shows plain: no underline, no
+  special color. It is display only: it never reaches the
+  paragraphs, the XML tab, or the file.
 - Hovering on the gear shows the block's currently selected
-  options: its name, type, markers state, and src, as set, plus
-  a hint that right-clicking changes them. The anchor never
-  shows: anchors are assigned automatically, and the writer
-  never types one.
-- Right-clicking the gear adds a "Source code options" submenu
-  to the menu, with the block's options in alphabetical order:
-  Markers (on or off), Name, Src, and Type. Type offers the
-  preferred values plus Custom and None. Clearing a value
-  removes its attribute. A src is refused while the block holds
-  content, since src and content cannot go together. No anchor
-  is offered in the menu. Options set on one line of a block
-  apply to the whole block, and the existing read-back and
-  writer carry them to the file.
+  options, as set, plus a hint that right-clicking changes
+  them. For sourcecode: its name, type, markers state, and
+  src. For a list: its style, hang indent, and counter, or its
+  empty and bare switches plus spacing and indent for a <ul>;
+  an <ol> shows its type, start, group, spacing, and indent,
+  and a <dl> its spacing, newline, and indent. For a table
+  part: a table or a cell shows its align when set; a section
+  or a row shows only its anchor. The anchor always shows, on
+  its own line, its value when the element has one and
+  "(none)" when it has none, and it is settable first in the
+  gear menu: renaming one updates the cross-references, and
+  deleting a cited one is refused. The pn never shows either:
+  it is prep-tool assigned.
+- Right-clicking the gear adds an options submenu to the menu,
+  with the block's options in alphabetical order. For
+  sourcecode: "Source code options" with Markers (on or off),
+  Name, Src, and Type. Type offers the preferred values plus
+  Custom and None. Clearing a value removes its attribute. A
+  src is refused while the block holds content, since src and
+  content cannot go together. No anchor is offered in the menu.
+  Options set on one line of a block apply to the whole block,
+  and the existing read-back and writer carry them to the file.
+- For an inline <list>, the gear adds a "List options" submenu
+  with Counter, Hang indent, and Style. Style offers the plain
+  values counter, empty, hanging, letters, numbers, and
+  symbols, plus Custom and None; a format string such as
+  "format (%d)" goes through Custom. Clearing a value removes
+  its attribute. A style change re-labels the list at once:
+  numbers show numbers, letters show letters, the rest show
+  bullets. For a <ul>, the submenu offers Bare, Empty, Indent,
+  and Spacing. Bare means the list renders with no bullets and
+  no indentation; turning it on also writes empty, because the
+  schema nests bare inside empty's group and a file with bare
+  but no empty fails validation. Turning bare off removes bare
+  and leaves empty as it was. Spacing offers normal or compact
+  plus None; Indent takes free text (the schema default is
+  "3"). For an <ol>, the submenu offers Group, Indent, Spacing,
+  Start, and Type, all free text except Spacing (normal or
+  compact); the schema gives no value list for type, so it is
+  typed in. For a <dl>, the submenu offers Indent, Newline, and
+  Spacing. Options set on one item apply to the whole list, and
+  the existing read-back and writer carry them to the file. A
+  blank line between items does not split the list, and the gear
+  stays on the first item.
 - The gear cannot be deleted: Backspace, Delete, and selection
   deletion refuse to take it, and cutting or typing over a
   selection covering it keeps the gear and takes the rest. The
   "Show option markers" checkbox at the right end of the button
   row turns the markers off and on; the choice is shared by
   every text editor pane and remembered across runs, and
-  toggling it never marks the document changed.
+  toggling it never marks the document changed. Table cell
+  gears show on startup as well as after a toggle (Bug 517):
+  the sweep that inserts them runs after the edit block that
+  built the table closes, so the table frame is there for it
+  to find each cell's row and column.
 - Copying a sourcecode block carries its option settings with
   it: pasting the copy makes a new block with the same options.
   The anchor never travels with a copy. Src travels when the
@@ -190,7 +258,11 @@ the text of the document goes.
   block pastes a block with the same src and its placeholder;
   a copy holding real content drops src, since src and content
   cannot go together. Pasting into a code block keeps the block
-  it lands in, and its options.
+  it lands in, and its options. Copying a list carries its
+  option settings with it too: pasting the copy makes a new
+  list with the same style, hang indent, counter, bare, and
+  empty, and the gear appears on its first item. The anchor
+  and pn never travel with a copy.
 - A sourcecode block with a src attribute and no content shows
   an italic placeholder in place of the missing text: a block
   with src "Examples/TestCode.cpp" shows
@@ -332,9 +404,20 @@ the text of the document goes.
   blocks just before the table. The deprecated texttable,
   ttcol, and c elements are preserved, never offered for
   creation (Bugs 394, 398, 403). Table, section, row, and
-  cell options (anchor, align, and the like) are kept when a
-  file is read and written back, but not edited yet: they
-  belong to Bug 448.
+  cell options are editable through the table gears (Bug 448):
+  the table gear offers its anchor, its alignment, and its
+  caption. A cell's first block carries ONE gear, whose menu
+  holds a submenu for every part that applies there: the
+  section when it is the first cell of the first row of its
+  section, the row when it is the first cell of its row, and
+  the cell itself, always. So the header gear shows the Table
+  head, Row, and Header cell submenus; a row gear shows the
+  Row and Cell submenus; a plain cell gear shows only its
+  own. A section or a row submenu offers only its anchor; a
+  cell submenu offers its anchor and its alignment. The
+  gear's hover text lists every part it covers. Colspan and
+  rowspan are not in the gears: they are already handled by
+  the grid editing.
 
 ## Output formats (Bug 320)
 
@@ -373,7 +456,9 @@ the text of the document goes.
   in the default browser. The first time the app starts, a
   one-time note points at Help > Feedback. About shows the version, a
   one-line description, the copyright, and the MIT license text,
-  in the same shape as the CoOp editor's About box.
+  in the same shape as the CoOp editor's About box, plus a
+  clickable link to the project page
+  (https://github.com/RiverExplorer/InternetDraftEditor, Bug 518).
 
 ## Author role (Bug 324)
 
@@ -510,9 +595,10 @@ the text of the document goes.
 ## Outline subsection menu (Bug 446)
 
 - Right-clicking a section in the outline shows a menu: Add
-  Subsection, Insert Subsection, Remove Subsection, Move
-  Subsection Up, Move Subsection Down, Promote Subsection,
-  Demote Subsection. The clicked section is selected first,
+  Subsection, Insert Subsection, Remove, Move Up, Move Down,
+  Promote Subsection, Demote Subsection. The move and remove
+  items say Section for a top-level section and Subsection for
+  one below it (Bug 512). The clicked section is selected first,
   so the menu always acts on what was clicked, and the menu
   appears only on section items. The Add, Insert, Remove,
   Up, and Down buttons below the outline stay as they are.
@@ -523,15 +609,15 @@ the text of the document goes.
   removes the clicked section with its subsections, after
   the same confirm the Remove button uses, naming how many
   subsections go along. Move Subsection Up and Down are the
-  buttons' moves, including the rule that no move crosses a
-  required section. Promote Subsection makes the section the
-  sibling right after its parent; Demote Subsection makes it
-  the last child of its previous sibling. A section's own
-  children move with it. Promote is off at the top level;
-  Demote is off for the first section in a list and for a
-  top-level required section, which must stay at the top
-  level. There is no limit on nesting depth, and moving a
-  section never renames its anchor.
+  buttons' moves: a required section itself never moves, but
+  a free section may move past a required neighbour (Bug 512).
+  Promote Subsection makes the section the sibling right after
+  its parent; Demote Subsection makes it the last child of its
+  previous sibling. A section's own children move with it.
+  Promote is off at the top level; Demote is off for the first
+  section in a list and for a top-level required section, which
+  must stay at the top level. There is no limit on nesting
+  depth, and moving a section never renames its anchor.
 
 ## Enter in a paragraph (Bug 461)
 
@@ -679,7 +765,26 @@ the text of the document goes.
   from the tag menu. The caret keeps that behaviour whenever
   it lands just after a link — clicking at the end of the line
   or pressing End, for example — while a caret inside a link
-  still extends the link text when you type there. An RFC number (RFC4324, with or without spaces
+  is read-only: typing or deleting there is refused, and the
+  editor says to right-click the reference and choose Rename
+  instead (Bug 514 v2). Rename prompts for the new text,
+  prefilled with the current one, and replaces the link's
+  text while keeping the reference itself: same target, same
+  underline and colour. The reference is re-applied to the
+  new text explicitly (Bug 514 v3), so it survives in the
+  saved file: insertText alone does not reliably carry the
+  reference through in every Qt build. Selecting a whole reference and
+  pressing Delete still removes it. An index entry is a marker
+  the same way (Bug 503): it shows as a circled i (ⓘ) beside
+  the word being indexed, never the item text again, so the
+  word shows once. Highlighting a word and choosing Index
+  Entry prefills the Item prompt with it; a sub-item is a
+  narrower term filed under the item, e.g. item "RTT",
+  sub-item "Round Trip Time". The marker is read-only: typing
+  or deleting into it is refused, and the editor says to
+  right-click it and choose Edit index entry to change the
+  item or sub-item. Selecting the whole marker and pressing
+  Delete removes the entry. An RFC number (RFC4324, with or without spaces
   or brackets) is written as an xi:include under the picked
   list, with xmlns:xi declared on the root when missing:
   xml2rfc pulls the full reference from its database, so no
@@ -867,11 +972,31 @@ the text of the document goes.
   subsection with a matching title stays free.
 - When a required section is selected, its title field is
   disabled, the Remove, Up, and Down buttons are disabled, and
-  the page says the section is required. Up is also disabled
-  for the section just below a required section, and Down for
-  the section just above one, so no free section can move
-  across one. Add and Insert stay enabled: adding a section
-  never moves a required section relative to an existing one.
+  the page says the section is required. A free section may
+  move past a required neighbour (Bug 512): the required
+  sections keep their relative order, only their numbers shift
+  as free sections move past them. Add and Insert stay enabled:
+  adding a section never moves a required section relative to
+  an existing one, and Add with no section selected puts the
+  new section at the end of the free body sections, before the
+  required back-matter (Bug 512), so it lands where it can be
+  moved.
+
+## Appendices in the outline (Bug 513)
+
+- The appendix sections in `<back>` show in the outline under
+  Back, after References, like sections: "Appendix A" for the
+  first, "Appendix B" for the next, and "A.1" for a subsection
+  of Appendix A, matching what xml2rfc prints. Their
+  subsections nest under them.
+- An appendix edits, moves, and is added, inserted, removed,
+  promoted, and demoted like a section, against the back's own
+  list. A top-level appendix never locks as a required section,
+  whatever its title. Adding a section after a selected appendix
+  adds another appendix after it; Add with no section selected
+  still appends to the middle.
+- Appendix anchors are cross-reference targets too, lettered
+  (A, A.1) in the target list.
 - A section renamed to a required title locks at once. A draft
   missing a required section is not flagged: the locks are
   editor enforcement on recognized titles, not a save check.
