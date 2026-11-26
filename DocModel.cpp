@@ -5077,6 +5077,20 @@ static void UpdateWriteDefaults(xmlNodePtr Rfc)
     DocDocument::SetNodeAttribute(Rfc, "category",
                                   Category.isEmpty() ? QStringLiteral("std")
                                                      : Category);
+    // A Standards Track document requires IETF consensus:
+    // xml2rfc warns (and overrides the schema default of
+    // false) when consensus is unset, so an STD document
+    // carries consensus="true" explicitly and the warning
+    // never appears. Other categories are left alone:
+    // consensus is their author's choice. An explicitly set
+    // value is never overwritten.
+    QString Consensus = DocDocument::NodeAttribute(Rfc, "consensus").trimmed();
+    if (Consensus.isEmpty() &&
+        DocDocument::NodeAttribute(Rfc, "category").trimmed() ==
+            QLatin1String("std")) {
+        DocDocument::SetNodeAttribute(Rfc, "consensus",
+                                      QStringLiteral("true"));
+    }
     QString Ipr = DocDocument::NodeAttribute(Rfc, "ipr").trimmed();
     DocDocument::SetNodeAttribute(Rfc, "ipr",
                                   Ipr.isEmpty() ? QStringLiteral("trust200902")

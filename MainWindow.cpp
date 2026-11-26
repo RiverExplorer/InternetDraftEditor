@@ -110,6 +110,11 @@ static void EnsureDictionariesInstalled();
 // here first.
 static QString SectionNumberFromPath(const QString& Path);
 
+// The title-to-anchor helper is defined with the reference
+// code below; the section title and anchor handlers call it,
+// so it is declared here first.
+static QString SlugAnchor(const QString& Title);
+
 /**
  * @brief Casts a string literal to libxml2's xmlChar pointer type.
  * @param Text The text to cast.
@@ -949,6 +954,7 @@ MainWindow::MainWindow(QWidget* Parent)
     , _EditorRadio(nullptr)
     , _AuthorPreservedLabel(nullptr)
     , _SectionTitleEdit(nullptr)
+    , _SectionAnchorEdit(nullptr)
     , _SectionBodyEdit(nullptr)
     , _SectionPreservedLabel(nullptr)
     , _SectionRequiredLabel(nullptr)
@@ -1336,8 +1342,18 @@ MainWindow::MainWindow(QWidget* Parent)
             [this](const QString& OldAnchor, const QString& NewAnchor,
                    int FirstBlockPos, bool IsSourceCode,
                    const QString& PartKind) {
+                auto SetAnchor = [this, FirstBlockPos, IsSourceCode,
+                                  PartKind](const QString& Value) {
+                    if (!PartKind.isEmpty()) {
+                        _AbstractEdit->SetTablePartAnchor(FirstBlockPos,
+                                                          PartKind, Value);
+                    } else {
+                        _AbstractEdit->SetElementAnchor(FirstBlockPos,
+                                                        IsSourceCode, Value);
+                    }
+                };
                 HandleAnchorChange(_AbstractEdit, OldAnchor, NewAnchor,
-                                   FirstBlockPos, IsSourceCode, PartKind);
+                                   SetAnchor);
             });
     _AbstractPreservedLabel = new QLabel(AbstractPageWidget);
     _AbstractPreservedLabel->setWordWrap(true);
@@ -1367,6 +1383,14 @@ MainWindow::MainWindow(QWidget* Parent)
     _SectionTitleEdit = new QLineEdit(SectionPageWidget);
     _SectionTitleEdit->setToolTip(tr("The section title."));
     connect(_SectionTitleEdit, &QLineEdit::textEdited, this, &MainWindow::OnSectionTitleEdited);
+    // The section anchor, below the title: it defaults to a
+    // string derived from the section name and can be edited.
+    // It commits when editing finishes (Enter, or leaving the
+    // field), so a rename runs once on the final value rather
+    // than on every keystroke.
+    _SectionAnchorEdit = new QLineEdit(SectionPageWidget);
+    _SectionAnchorEdit->setToolTip(tr("The section anchor, used by cross-references."));
+    connect(_SectionAnchorEdit, &QLineEdit::editingFinished, this, &MainWindow::OnSectionAnchorEdited);
     _SectionBodyEdit = new TextEditor(SectionPageWidget);
     _SectionBodyEdit->SetSpellChecker(_SpellChecker.get());
     _SectionBodyEdit->SetDocument(&_Document);
@@ -1380,8 +1404,19 @@ MainWindow::MainWindow(QWidget* Parent)
             [this](const QString& OldAnchor, const QString& NewAnchor,
                    int FirstBlockPos, bool IsSourceCode,
                    const QString& PartKind) {
+                auto SetAnchor = [this, FirstBlockPos, IsSourceCode,
+                                  PartKind](const QString& Value) {
+                    if (!PartKind.isEmpty()) {
+                        _SectionBodyEdit->SetTablePartAnchor(FirstBlockPos,
+                                                             PartKind, Value);
+                    } else {
+                        _SectionBodyEdit->SetElementAnchor(FirstBlockPos,
+                                                           IsSourceCode,
+                                                           Value);
+                    }
+                };
                 HandleAnchorChange(_SectionBodyEdit, OldAnchor, NewAnchor,
-                                   FirstBlockPos, IsSourceCode, PartKind);
+                                   SetAnchor);
             });
     // Bug 520: pasted <section> nodes in the section body's XML
     // tab become subsections of the current section.
@@ -1399,6 +1434,8 @@ MainWindow::MainWindow(QWidget* Parent)
     QVBoxLayout* SectionLayout = new QVBoxLayout(SectionPageWidget);
     SectionLayout->addWidget(new QLabel(tr("Section title:"), SectionPageWidget));
     SectionLayout->addWidget(_SectionTitleEdit);
+    SectionLayout->addWidget(new QLabel(tr("Anchor:"), SectionPageWidget));
+    SectionLayout->addWidget(_SectionAnchorEdit);
     SectionLayout->addWidget(_SectionRequiredLabel);
     SectionLayout->addWidget(new QLabel(tr("Body:"), SectionPageWidget));
     SectionLayout->addWidget(_SectionBodyEdit);
@@ -1767,8 +1804,20 @@ MainWindow::MainWindow(QWidget* Parent)
             [this](const QString& OldAnchor, const QString& NewAnchor,
                    int FirstBlockPos, bool IsSourceCode,
                    const QString& PartKind) {
+                auto SetAnchor = [this, FirstBlockPos, IsSourceCode,
+                                  PartKind](const QString& Value) {
+                    if (!PartKind.isEmpty()) {
+                        _SettingsNoteEdit->SetTablePartAnchor(FirstBlockPos,
+                                                              PartKind,
+                                                              Value);
+                    } else {
+                        _SettingsNoteEdit->SetElementAnchor(FirstBlockPos,
+                                                            IsSourceCode,
+                                                            Value);
+                    }
+                };
                 HandleAnchorChange(_SettingsNoteEdit, OldAnchor, NewAnchor,
-                                   FirstBlockPos, IsSourceCode, PartKind);
+                                   SetAnchor);
             });
     QPushButton* RemoveNoteButton = new QPushButton(tr("Remove Note"), _SettingsNoteGroup);
     RemoveNoteButton->setToolTip(tr("Remove this note from the draft."));
@@ -5101,6 +5150,43 @@ void MainWindow::OnSectionTitleEdited(const QString& Text)
     // A section renamed to a required or recommended title locks
     // at once (Bugs 422, 427).
     RefreshSectionControls(Current);
+    // The anchor default is derived from the title, so while
+    // the section carries no stored anchor the field follows
+    // the title. Once an anchor is stored, it is independent
+    // of the title and is left alone.
+    if (DocDocument::NodeAttribute(Section, "anchor").trimmed().isEmpty()) {
+        QSignalBlocker BlockAnchor(_SectionAnchorEdit);
+        _SectionAnchorEdit->setText(SlugAnchor(Text));
+    }
+}
+
+void MainWindow::OnSectionAnchorEdited()
+{
+    xmlNodePtr Section = FindSection(_SectionPath);
+    if (Section == nullptr) {
+        return;
+    }
+    // The old anchor is the one stored on the section, not the
+    // value the field showed: the field shows the derived
+    // default while no anchor is stored, and no reference can
+    // cite a default that was never written.
+    QString Old = DocDocument::NodeAttribute(Section, "anchor").trimmed();
+    QString New = _SectionAnchorEdit->text().trimmed();
+    auto SetAnchor = [Section](const QString& Value) {
+        DocDocument::SetNodeAttribute(Section, "anchor", Value);
+    };
+    if (!HandleAnchorChange(_SectionBodyEdit, Old, New, SetAnchor)) {
+        // Refused (a duplicate, or a cited anchor that cannot
+        // be deleted): put the field back to the anchor in
+        // force, or the derived default when none is stored.
+        QSignalBlocker BlockAnchor(_SectionAnchorEdit);
+        if (Old.isEmpty()) {
+            _SectionAnchorEdit->setText(
+                SlugAnchor(DocDocument::SectionTitle(Section)));
+        } else {
+            _SectionAnchorEdit->setText(Old);
+        }
+    }
 }
 
 void MainWindow::OnSectionBodyEdited()
@@ -6755,39 +6841,30 @@ void MainWindow::HandleMakeReference(TextEditor* Editor, int Action,
     Editor->InsertXref(Wanted, Section, Form, SelectionStart, SelectionEnd);
 }
 
-void MainWindow::HandleAnchorChange(TextEditor* Editor,
+bool MainWindow::HandleAnchorChange(TextEditor* Editor,
                                     const QString& OldAnchor,
                                     const QString& NewAnchor,
-                                    int FirstBlockPos, bool IsSourceCode,
-                                    const QString& PartKind)
+                                    const std::function<void(const QString&)>& SetAnchor)
 {
     // Bug 464 v8: the gear menu asks the owner to change an
     // anchor, so the references move with it and a cited
-    // anchor cannot be deleted.
-    if (Editor == nullptr) {
-        return;
+    // anchor cannot be deleted. The section anchor field uses
+    // the same path, with a setter that writes the section
+    // node's anchor attribute.
+    if (Editor == nullptr || !SetAnchor) {
+        return false;
     }
     QString Old = OldAnchor.trimmed();
     QString New = NewAnchor.trimmed();
     if (Old == New) {
-        return;
+        return true;
     }
-    // The setter for this part: a table part goes through
-    // SetTablePartAnchor, a sourcecode or list element through
-    // SetElementAnchor (Bug 448).
-    auto SetAnchor = [&](const QString& Value) {
-        if (!PartKind.isEmpty()) {
-            Editor->SetTablePartAnchor(FirstBlockPos, PartKind, Value);
-        } else {
-            Editor->SetElementAnchor(FirstBlockPos, IsSourceCode, Value);
-        }
-    };
     if (New.isEmpty()) {
         // Deleting: refuse when the anchor is cited, or the
         // cross-references would dangle. The count covers
         // xrefs and relrefs.
         if (Old.isEmpty()) {
-            return;
+            return true;
         }
         int Count = DocDocument::CitationCountForAnchor(_Document.RfcNode(), Old);
         if (Count > 0) {
@@ -6795,11 +6872,11 @@ void MainWindow::HandleAnchorChange(TextEditor* Editor,
                 this, tr("Anchor in use"),
                 tr("This anchor is cited by %1 cross-reference(s). It cannot be deleted. Remove the cross-references first.")
                     .arg(Count));
-            return;
+            return false;
         }
         SetAnchor(QString());
         SetModified(true);
-        return;
+        return true;
     }
     // A new anchor must not collide with one already in use:
     // an anchor names one element.
@@ -6808,7 +6885,7 @@ void MainWindow::HandleAnchorChange(TextEditor* Editor,
             this, tr("Anchor in use"),
             tr("Another element already uses the anchor \"%1\". Pick a different one.")
                 .arg(New));
-        return;
+        return false;
     }
     int Cited = 0;
     if (!Old.isEmpty()) {
@@ -6825,6 +6902,7 @@ void MainWindow::HandleAnchorChange(TextEditor* Editor,
         ReloadEditorFromModel(Editor);
     }
     SetModified(true);
+    return true;
 }
 
 void MainWindow::ReloadEditorFromModel(TextEditor* Editor)
@@ -7457,16 +7535,28 @@ void MainWindow::OnReferenceAuthorRoleChanged()
 void MainWindow::FillSectionForm()
 {
     QSignalBlocker BlockTitle(_SectionTitleEdit);
+    QSignalBlocker BlockAnchor(_SectionAnchorEdit);
     QSignalBlocker BlockBody(_SectionBodyEdit);
     xmlNodePtr Section = FindSection(_SectionPath);
     if (Section == nullptr) {
         _SectionTitleEdit->clear();
+        _SectionAnchorEdit->clear();
         _SectionBodyEdit->Clear();
         _SectionPreservedLabel->hide();
         _SectionRequiredLabel->hide();
         return;
     }
     _SectionTitleEdit->setText(DocDocument::SectionTitle(Section));
+    // The anchor field shows the stored anchor, or the default
+    // derived from the title while none is stored. The default
+    // is only shown, not written: the section gains an anchor
+    // when the field is edited, or when a cross-reference is
+    // inserted to it.
+    QString Anchor = DocDocument::NodeAttribute(Section, "anchor").trimmed();
+    if (Anchor.isEmpty()) {
+        Anchor = SlugAnchor(DocDocument::SectionTitle(Section));
+    }
+    _SectionAnchorEdit->setText(Anchor);
     _SectionBodyEdit->SetBodyNodes(DocDocument::BodyNodes(Section));
     QVector<DocPreservedItem> Preserved =
         DocDocument::PreservedBodyNodes(Section);

@@ -7041,6 +7041,49 @@ static QVariant MarkerAtPosition(QTextDocument* Document, int Pos)
 }
 
 /**
+ * @brief The link entry a fragment's format carries, if it is a link.
+ *
+ * A link with visible text carries the link in its tag stack; a
+ * bare reference (an empty <xref/>, <eref/>, and so on) carries it
+ * as the fragment's marker instead, because the marker is the
+ * reference itself. Both count as a link here, so Rename and the
+ * read-only check work for bare references too (Bug 524).
+ * @param Format The fragment's character format.
+ * @param LinkName Receives the link tag name.
+ * @param LinkEntry Receives the link entry.
+ * @return True when the format carries a link.
+ */
+static bool LinkEntryOfFormat(const QTextCharFormat& Format,
+                              QString& LinkName, DocTagEntry& LinkEntry)
+{
+    DocTagStack Stack = StackOf(Format);
+    for (const QString& Name :
+         {QStringLiteral("xref"), QStringLiteral("eref"),
+          QStringLiteral("relref"), QStringLiteral("cref")}) {
+        for (const DocTagEntry& Entry : Stack) {
+            if (Entry.Name == Name) {
+                LinkName = Name;
+                LinkEntry = Entry;
+                return true;
+            }
+        }
+    }
+    QVariant MarkerValue = Format.property(DocMarkerProperty);
+    if (MarkerValue.isValid()) {
+        DocTagEntry Marker = EntryFromVariant(MarkerValue);
+        if (Marker.Name == QLatin1String("xref") ||
+            Marker.Name == QLatin1String("eref") ||
+            Marker.Name == QLatin1String("relref") ||
+            Marker.Name == QLatin1String("cref")) {
+            LinkName = Marker.Name;
+            LinkEntry = Marker;
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
  * @brief The text range of the link holding a position (Bug 514 v2).
  *
  * A reference's visible text is read-only: typing or deleting
@@ -7070,7 +7113,6 @@ static bool LinkRangeAt(QTextDocument* Document, int Pos, int& Start,
     }
     // The fragment holding the position, and its link entry.
     QTextBlock::iterator At = Block.end();
-    DocTagStack First;
     DocTagEntry FoundEntry;
     QString FoundName;
     bool FoundIt = false;
@@ -7079,22 +7121,8 @@ static bool LinkRangeAt(QTextDocument* Document, int Pos, int& Start,
         if (Pos >= Fragment.position() &&
             Pos < Fragment.position() + Fragment.length()) {
             At = It;
-            First = StackOf(Fragment.charFormat());
-            for (const QString& Name :
-                 {QStringLiteral("xref"), QStringLiteral("eref"),
-                  QStringLiteral("relref"), QStringLiteral("cref")}) {
-                for (const DocTagEntry& Entry : First) {
-                    if (Entry.Name == Name) {
-                        FoundName = Name;
-                        FoundEntry = Entry;
-                        FoundIt = true;
-                        break;
-                    }
-                }
-                if (FoundIt) {
-                    break;
-                }
-            }
+            FoundIt = LinkEntryOfFormat(Fragment.charFormat(),
+                                        FoundName, FoundEntry);
             break;
         }
     }
@@ -7111,15 +7139,13 @@ static bool LinkRangeAt(QTextDocument* Document, int Pos, int& Start,
     while (It != Block.begin()) {
         --It;
         QTextFragment Fragment = It.fragment();
-        DocTagStack Stack = StackOf(Fragment.charFormat());
-        const DocTagEntry* Entry = nullptr;
-        for (const DocTagEntry& E : Stack) {
-            if (E.Name == LinkName) {
-                Entry = &E;
-                break;
-            }
+        QString NeighbourName;
+        DocTagEntry NeighbourEntry;
+        if (!LinkEntryOfFormat(Fragment.charFormat(),
+                               NeighbourName, NeighbourEntry)) {
+            break;
         }
-        if (Entry == nullptr || !(*Entry == LinkEntry)) {
+        if (NeighbourName != LinkName || !(NeighbourEntry == LinkEntry)) {
             break;
         }
         Start = Fragment.position();
@@ -7128,15 +7154,13 @@ static bool LinkRangeAt(QTextDocument* Document, int Pos, int& Start,
     ++It;
     while (!It.atEnd()) {
         QTextFragment Fragment = It.fragment();
-        DocTagStack Stack = StackOf(Fragment.charFormat());
-        const DocTagEntry* Entry = nullptr;
-        for (const DocTagEntry& E : Stack) {
-            if (E.Name == LinkName) {
-                Entry = &E;
-                break;
-            }
+        QString NeighbourName;
+        DocTagEntry NeighbourEntry;
+        if (!LinkEntryOfFormat(Fragment.charFormat(),
+                               NeighbourName, NeighbourEntry)) {
+            break;
         }
-        if (Entry == nullptr || !(*Entry == LinkEntry)) {
+        if (NeighbourName != LinkName || !(NeighbourEntry == LinkEntry)) {
             break;
         }
         End = Fragment.position() + Fragment.length();
@@ -7181,22 +7205,22 @@ static bool CursorTouchesLinkText(QTextDocument* Document,
                 if (FragEnd <= Start || FragStart >= End) {
                     continue;
                 }
-                DocTagStack Stack = StackOf(Fragment.charFormat());
-                for (const QString& Name :
-                     {QStringLiteral("xref"), QStringLiteral("eref"),
-                      QStringLiteral("relref"),
-                      QStringLiteral("cref")}) {
-                    if (!StackHolds(Stack, Name)) {
-                        continue;
-                    }
-                    int LS, LE;
-                    QString LN;
-                    DocTagEntry LE2;
-                    if (LinkRangeAt(Document, FragStart, LS, LE, LN,
-                                    LE2)) {
-                        LinkStart = LS;
-                        return true;
-                    }
+                // Bug 524: a bare reference is a marker, not a
+                // stack entry, so the link check reads the
+                // fragment's format for either one.
+                QString FoundName;
+                DocTagEntry FoundEntry;
+                if (!LinkEntryOfFormat(Fragment.charFormat(),
+                                       FoundName, FoundEntry)) {
+                    continue;
+                }
+                int LS, LE;
+                QString LN;
+                DocTagEntry LE2;
+                if (LinkRangeAt(Document, FragStart, LS, LE, LN,
+                                LE2)) {
+                    LinkStart = LS;
+                    return true;
                 }
             }
             Block = Block.next();
@@ -10160,9 +10184,41 @@ void TextEditor::AddTagActions(QMenu* Menu)
     bool InTable = TouchesTable(_TextEdit->document(), Cursor);
     bool InTableCaption = TouchesTableCaption(_TextEdit->document(), Cursor);
 
+    // Bug 524: the block-level inserts (ASCII art, figures, source
+    // code, tables) share one alphabetical list with the tags, so
+    // ASCII art sorts before BCP 14 instead of after Vertical
+    // Space. They are added at their alphabetical points in the
+    // tag loop below: ASCII art before the first tag, Figure
+    // before Index Entry, Source code before Strong, Table before
+    // Teletype. The enablement matches the old block after the
+    // loop: offered wherever the cursor sits, but never where it
+    // already touches a list, a sourcecode block, a figure, or a
+    // table.
+    bool CanInsertBlock = ListKinds.isEmpty() && !InSource && !InFigure &&
+                          !InTable;
+    auto AddInsertAction = [&](const QString& Label,
+                               void (TextEditor::*Slot)()) {
+        QAction* Action = Menu->addAction(Label);
+        Action->setEnabled(CanInsertBlock);
+        connect(Action, &QAction::triggered, this, Slot);
+    };
+    AddInsertAction(tr("ASCII art"), &TextEditor::InsertArtwork);
+
     for (const DocTagInfo& Info : TagInfos) {
         QString Name = QString::fromLatin1(Info.Name);
         QString Label = QString::fromLatin1(Info.Label);
+        // Bug 524: the remaining inserts, at their alphabetical
+        // points. These run before any filtering below, so an
+        // insert is added (disabled when it does not apply) even
+        // when the tag at this point is skipped.
+        if (Name == QLatin1String("iref")) {
+            AddInsertAction(tr("Figure"), &TextEditor::InsertFigure);
+        } else if (Name == QLatin1String("strong")) {
+            AddInsertAction(tr("Source code"),
+                            &TextEditor::InsertSourceCode);
+        } else if (Name == QLatin1String("tt")) {
+            AddInsertAction(tr("Table"), &TextEditor::InsertTable);
+        }
         if (Name == QLatin1String("list")) {
             // The List entry opens a submenu with the three
             // section-level list kinds, alphabetical by label. A
@@ -10298,31 +10354,9 @@ void TextEditor::AddTagActions(QMenu* Menu)
         }
     }
 
-    // ASCII art, figures, source code, and tables are
-    // block-level changes like a list: offered wherever the
-    // cursor sits, but never where it already touches a list, a
-    // sourcecode block, a figure, or a table.
-    QAction* ArtworkAction = Menu->addAction(tr("ASCII art"));
-    ArtworkAction->setEnabled(ListKinds.isEmpty() && !InSource && !InFigure &&
-                              !InTable);
-    connect(ArtworkAction, &QAction::triggered, this,
-            &TextEditor::InsertArtwork);
-    QAction* FigureAction = Menu->addAction(tr("Figure"));
-    FigureAction->setEnabled(ListKinds.isEmpty() && !InSource && !InFigure &&
-                             !InTable);
-    connect(FigureAction, &QAction::triggered, this,
-            &TextEditor::InsertFigure);
-    QAction* SourceAction = Menu->addAction(tr("Source code"));
-    SourceAction->setEnabled(ListKinds.isEmpty() && !InSource && !InFigure &&
-                             !InTable);
-    connect(SourceAction, &QAction::triggered, this,
-            &TextEditor::InsertSourceCode);
-    QAction* TableAction = Menu->addAction(tr("Table"));
-    TableAction->setEnabled(ListKinds.isEmpty() && !InSource && !InFigure &&
-                            !InTable);
-    connect(TableAction, &QAction::triggered, this,
-            &TextEditor::InsertTable);
-
+    // (Bug 524: the block-level inserts are added inside the tag
+    // loop above, at their alphabetical points, so they are not
+    // repeated here.)
     if (InCell) {
         // Row, column, merge, and split operations for the
         // table the cursor sits in, plus setting the body row
@@ -11673,6 +11707,10 @@ void TextEditor::AddSpellActions(QMenu* Menu, const QPoint& Pos)
     int WordStart = Block.position() + Start;
     int WordEnd = Block.position() + End;
     QStringList Suggestions = _SpellChecker->Suggestions(Word);
+    // Bug 524: the suggestions read as one alphabetical list
+    // (case-insensitive, as a dictionary would), not in the
+    // spell checker's relevance order.
+    Suggestions.sort(Qt::CaseInsensitive);
     for (const QString& Suggestion : Suggestions) {
         QAction* Action = Menu->addAction(Suggestion);
         connect(Action, &QAction::triggered, this,

@@ -20,7 +20,7 @@
 <!-- If further character entities are required then they should be added to the DOCTYPE above.
      Use of an external entity file is not recommended. -->
 
-<rfc>
+<rfc consensus="true">
   <front>
     <title></title>
     <author></author>

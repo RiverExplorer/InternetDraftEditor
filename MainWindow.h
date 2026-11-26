@@ -38,6 +38,7 @@
 #include <QStringList>
 
 #include <memory>
+#include <functional>
 
 #include <libxml/tree.h>
 
@@ -276,26 +277,6 @@ private slots:
     void HandleMakeReference(TextEditor* Editor, int Action,
                              xmlNodePtr Target, const QString& Anchor,
                              const QString& ListName);
-
-    /**
-     * @brief Finishes changing an anchor from a gear menu.
-     *
-     * A delete is refused when the anchor is cited: the
-     * cross-references would dangle. A rename moves every
-     * cross-reference to the new anchor, and the asking editor
-     * is reloaded from the model so its markers match. A new
-     * anchor must not collide with one already in use.
-     * @param Editor The text editor that asked, borrowed.
-     * @param OldAnchor The anchor now on the element, empty when none.
-     * @param NewAnchor The anchor the user entered, empty to clear it.
-     * @param FirstBlockPos The first block of the element, in the editor.
-     * @param IsSourceCode True for a sourcecode element, false for a list.
-     * @param PartKind The table part for a table gear, empty for a
-     *        sourcecode or list gear (Bug 448).
-     */
-    void HandleAnchorChange(TextEditor* Editor, const QString& OldAnchor,
-                            const QString& NewAnchor, int FirstBlockPos,
-                            bool IsSourceCode, const QString& PartKind);
 
     /**
      * @brief Reloads an editor from the model, keeping the cursor.
@@ -685,6 +666,15 @@ private slots:
     void OnSectionTitleEdited(const QString& Text);
 
     /**
+     * @brief Writes the edited section anchor into the document.
+     *
+     * Renaming an anchor moves every cross-reference to the
+     * new anchor and refuses a duplicate; clearing it is
+     * refused while the anchor is cited.
+     */
+    void OnSectionAnchorEdited();
+
+    /**
      * @brief Writes the edited section body into the document.
      */
     void OnSectionBodyEdited();
@@ -715,6 +705,31 @@ private:
      *        selection where the selected part still exists.
      */
     void RebuildOutline();
+
+    /**
+     * @brief Finishes changing an anchor from a gear menu or the
+     *        section anchor field.
+     *
+     * A delete is refused when the anchor is cited: the
+     * cross-references would dangle. A rename moves every
+     * cross-reference to the new anchor, and the asking editor
+     * is reloaded from the model so its markers match. A new
+     * anchor must not collide with one already in use. This is
+     * a plain method, not a slot: moc cannot parse a
+     * std::function parameter, so it must not appear in the
+     * slots section.
+     * @param Editor The text editor that asked, borrowed.
+     * @param OldAnchor The anchor now on the element, empty when none.
+     * @param NewAnchor The anchor the user entered, empty to clear it.
+     * @param SetAnchor Writes the anchor (or clears it when the
+     *        value is empty) onto the element.
+     * @return False when the change was refused (a cited anchor
+     *         cannot be deleted, or the new anchor is in use);
+     *         true when it was applied, or nothing changed.
+     */
+    bool HandleAnchorChange(TextEditor* Editor, const QString& OldAnchor,
+                            const QString& NewAnchor,
+                            const std::function<void(const QString&)>& SetAnchor);
 
     /**
      * @brief Applies pending XML edits on the section, abstract,
@@ -1091,6 +1106,7 @@ private:
     QRadioButton* _EditorRadio;
     QLabel* _AuthorPreservedLabel;
     QLineEdit* _SectionTitleEdit;
+    QLineEdit* _SectionAnchorEdit;
     TextEditor* _SectionBodyEdit;
     QLabel* _SectionPreservedLabel;
     QLabel* _SectionRequiredLabel;
