@@ -502,6 +502,22 @@ signals:
     void TextChanged();
 
     /**
+     * @brief Sent when Ctrl+click follows a reference (Bug 529).
+     *
+     * A plain click only places the cursor; Ctrl+click on a
+     * link follows it. The owner decides what following means:
+     * an internal reference (xref, relref) navigates to the
+     * element carrying its anchor, and an external link (eref)
+     * asks before opening its URL in the browser. A comment
+     * reference (cref) has no target to follow, so it never
+     * sends this.
+     * @param LinkName The link tag: "xref", "relref", or "eref".
+     * @param Target The anchor for an internal reference, or the
+     *        URL for an external link.
+     */
+    void LinkActivated(const QString& LinkName, const QString& Target);
+
+    /**
      * @brief Sent when the References menu asks for a document write.
      *
      * The editor shows the menu, the name prompt, and the internal

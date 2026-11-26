@@ -679,6 +679,18 @@ private slots:
      */
     void OnSectionBodyEdited();
 
+    /**
+     * @brief Follows a reference the user Ctrl+clicked (Bug 529).
+     *
+     * An internal reference (xref, relref) navigates the editor
+     * to the element carrying its anchor. An external link
+     * (eref) asks before opening its URL in the browser.
+     * @param LinkName The link tag: "xref", "relref", or "eref".
+     * @param Target The anchor for an internal reference, or the
+     *        URL for an external link.
+     */
+    void OnLinkActivated(const QString& LinkName, const QString& Target);
+
 private:
     /**
      * @brief The kinds of outline item, stored in Qt::UserRole.
@@ -773,6 +785,27 @@ private:
      * @param Item The outline item, or nullptr for the empty pane.
      */
     void ShowDetailsFor(QTreeWidgetItem* Item);
+
+    /**
+     * @brief Selects the outline item for the element carrying an anchor (Bug 529).
+     *
+     * Ctrl+click on an internal reference navigates here: a
+     * section anchor selects its section, a reference entry
+     * anchor selects that entry, and anything else selects
+     * its containing section. An anchor no element carries
+     * selects nothing.
+     * @param Anchor The anchor to navigate to.
+     */
+    void NavigateToAnchor(const QString& Anchor);
+
+    /**
+     * @brief The outline key for the element carrying an anchor (Bug 529).
+     * @param Anchor The anchor to look for.
+     * @return The outline key ("section:0.1", "refentry:0.2", ...),
+     *         or empty when no element carries the anchor or it
+     *         has no outline item.
+     */
+    QString OutlineKeyForAnchor(const QString& Anchor) const;
 
     /**
      * @brief Fills the document settings form with the document's

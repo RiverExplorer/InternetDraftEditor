@@ -2559,6 +2559,31 @@ static bool TreeHasAnchor(xmlNodePtr Node, const QString& Anchor)
 }
 
 /**
+ * @brief The first element in this tree carrying the anchor (Bug 529).
+ * @param Node The tree to walk, borrowed.
+ * @param Anchor The anchor to look for.
+ * @return The element, borrowed, or null when none carries it.
+ */
+static xmlNodePtr TreeNodeByAnchor(xmlNodePtr Node, const QString& Anchor)
+{
+    if (Node == nullptr) {
+        return nullptr;
+    }
+    if (IsElementKind(Node) &&
+        DocDocument::NodeAttribute(Node, "anchor").trimmed() == Anchor) {
+        return Node;
+    }
+    for (xmlNodePtr Child = Node->children; Child != nullptr;
+         Child = Child->next) {
+        xmlNodePtr Found = TreeNodeByAnchor(Child, Anchor);
+        if (Found != nullptr) {
+            return Found;
+        }
+    }
+    return nullptr;
+}
+
+/**
  * @brief Adds the section targets under these sections, outline order.
  * @param Sections The sections to list, borrowed.
  * @param Targets The targets to add to.
@@ -2752,6 +2777,16 @@ bool DocDocument::DocumentHasAnchor(xmlNodePtr Root, const QString& Anchor)
         return false;
     }
     return TreeHasAnchor(Root, Wanted);
+}
+
+xmlNodePtr DocDocument::FindNodeByAnchor(xmlNodePtr Root,
+                                         const QString& Anchor)
+{
+    QString Wanted = Anchor.trimmed();
+    if (Root == nullptr || Wanted.isEmpty()) {
+        return nullptr;
+    }
+    return TreeNodeByAnchor(Root, Wanted);
 }
 
 /**

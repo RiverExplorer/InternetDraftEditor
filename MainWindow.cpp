@@ -1334,6 +1334,7 @@ MainWindow::MainWindow(QWidget* Parent)
     _AbstractEdit->SetDocument(&_Document);
     _AbstractEdit->SetBibCache(&_BibCache);
     connect(_AbstractEdit, &TextEditor::TextChanged, this, &MainWindow::OnAbstractEdited);
+    connect(_AbstractEdit, &TextEditor::LinkActivated, this, &MainWindow::OnLinkActivated);
     connect(_AbstractEdit, &TextEditor::MakeReferenceRequested, this,
             [this](int Action, xmlNodePtr Target, const QString& Anchor, const QString& ListName) {
                 HandleMakeReference(_AbstractEdit, Action, Target, Anchor, ListName);
@@ -1396,6 +1397,7 @@ MainWindow::MainWindow(QWidget* Parent)
     _SectionBodyEdit->SetDocument(&_Document);
     _SectionBodyEdit->SetBibCache(&_BibCache);
     connect(_SectionBodyEdit, &TextEditor::TextChanged, this, &MainWindow::OnSectionBodyEdited);
+    connect(_SectionBodyEdit, &TextEditor::LinkActivated, this, &MainWindow::OnLinkActivated);
     connect(_SectionBodyEdit, &TextEditor::MakeReferenceRequested, this,
             [this](int Action, xmlNodePtr Target, const QString& Anchor, const QString& ListName) {
                 HandleMakeReference(_SectionBodyEdit, Action, Target, Anchor, ListName);
@@ -1796,6 +1798,8 @@ MainWindow::MainWindow(QWidget* Parent)
     _SettingsNoteEdit->SetBibCache(&_BibCache);
     connect(_SettingsNoteEdit, &TextEditor::TextChanged,
             this, &MainWindow::OnSettingsNoteEdited);
+    connect(_SettingsNoteEdit, &TextEditor::LinkActivated, this,
+            &MainWindow::OnLinkActivated);
     connect(_SettingsNoteEdit, &TextEditor::MakeReferenceRequested, this,
             [this](int Action, xmlNodePtr Target, const QString& Anchor, const QString& ListName) {
                 HandleMakeReference(_SettingsNoteEdit, Action, Target, Anchor, ListName);
@@ -2035,6 +2039,24 @@ void MainWindow::OpenDraftFile(const QString& Path)
     // nothing). The abstract editor is not current for this file
     // until its page is filled.
     _AbstractEditCurrent = false;
+    // Bug 528 fix: the detail editors keep their displayed text
+    // across a reload -- they refill only when their page is
+    // re-selected -- so opening the same file again showed the
+    // discarded edits instead of the file's contents. Clear
+    // them here, so no discarded text survives the load; the
+    // outline rebuild below refills the shown page from the
+    // fresh document, and the rest refill when they are opened.
+    // Clear() blocks signals and sets _SettingParagraphs, so
+    // the empty editors do not sync back into the new document.
+    if (_SectionBodyEdit != nullptr) {
+        _SectionBodyEdit->Clear();
+    }
+    if (_AbstractEdit != nullptr) {
+        _AbstractEdit->Clear();
+    }
+    if (_SettingsNoteEdit != nullptr) {
+        _SettingsNoteEdit->Clear();
+    }
     _FilePath = Path;
     UpdateProjectDictionary();
     _SelectedKey = QStringLiteral("docset");
@@ -5198,6 +5220,226 @@ void MainWindow::OnSectionBodyEdited()
     _Document.SetSectionBody(Section, _SectionBodyEdit->BodyNodes(),
                              DocDocument::PreservedBodyNodes(Section));
     SetModified(true);
+}
+
+/**
+ * @brief The outline path of a section node (Bug 529).
+ * @param Wanted The section node to find, borrowed.
+ * @param Sections The sections to search, borrowed.
+ * @param Prefix The path prefix ("back:" for appendices, empty otherwise).
+ * @param Path Receives the path ("0.1", "back:0").
+ * @return True when the node is among these sections.
+ */
+static bool FindSectionPath(xmlNodePtr Wanted,
+                            const QVector<xmlNodePtr>& Sections,
+                            const QString& Prefix, QString& Path)
+{
+    for (int i = 0; i < Sections.size(); ++i) {
+        QString Here = Prefix + QString::number(i);
+        if (Sections[i] == Wanted) {
+            Path = Here;
+            return true;
+        }
+        if (FindSectionPath(Wanted,
+                            DocDocument::ChildSectionNodes(Sections[i]),
+                            Here + QStringLiteral("."), Path)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief The outline key of a reference entry node (Bug 529).
+ * @param Wanted The <reference> node to find, borrowed.
+ * @param Groups The reference lists to search, borrowed.
+ * @param GroupPath The list's path so far (empty at the top).
+ * @param Key Receives the key ("refentry:0.2").
+ * @return True when the node is an entry in these lists.
+ */
+static bool FindReferenceKey(xmlNodePtr Wanted,
+                             const QVector<xmlNodePtr>& Groups,
+                             const QString& GroupPath, QString& Key)
+{
+    for (int g = 0; g < Groups.size(); ++g) {
+        QString Here = GroupPath.isEmpty()
+            ? QString::number(g)
+            : GroupPath + QStringLiteral(".") + QString::number(g);
+        if (FindReferenceKey(Wanted,
+                             DocDocument::NestedReferenceGroups(Groups[g]),
+                             Here, Key)) {
+            return true;
+        }
+        QVector<xmlNodePtr> Entries = DocDocument::ReferenceEntries(Groups[g]);
+        for (int e = 0; e < Entries.size(); ++e) {
+            if (Entries[e] == Wanted) {
+                Key = QStringLiteral("refentry:") + Here +
+                      QStringLiteral(".") + QString::number(e);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief The outline key of an included reference by its anchor (Bug 529).
+ *
+ * An included reference carries no anchor attribute: its anchor
+ * is derived from its href, so it is found by href, not by node.
+ * @param Anchor The anchor to look for.
+ * @param Groups The reference lists to search, borrowed.
+ * @param GroupPath The list's path so far (empty at the top).
+ * @param Key Receives the key ("refinclude:0.1").
+ * @return True when an include in these lists carries the anchor.
+ */
+static bool FindIncludeKey(const QString& Anchor,
+                           const QVector<xmlNodePtr>& Groups,
+                           const QString& GroupPath, QString& Key)
+{
+    for (int g = 0; g < Groups.size(); ++g) {
+        QString Here = GroupPath.isEmpty()
+            ? QString::number(g)
+            : GroupPath + QStringLiteral(".") + QString::number(g);
+        if (FindIncludeKey(Anchor,
+                           DocDocument::NestedReferenceGroups(Groups[g]),
+                           Here, Key)) {
+            return true;
+        }
+        QVector<xmlNodePtr> Includes =
+            DocDocument::ReferenceIncludeNodes(Groups[g]);
+        for (int i = 0; i < Includes.size(); ++i) {
+            QString Href = DocDocument::NodeAttribute(Includes[i], "href");
+            if (DocDocument::ReferenceAnchorFromIncludeHref(Href) == Anchor) {
+                Key = QStringLiteral("refinclude:") + Here +
+                      QStringLiteral(".") + QString::number(i);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief The outline path of a reference list node (Bug 529).
+ * @param Wanted The <references> node to find, borrowed.
+ * @param Groups The reference lists to search, borrowed.
+ * @param Prefix The list's path so far (empty at the top).
+ * @param Path Receives the path ("0", "0.1").
+ * @return True when the node is among these lists.
+ */
+static bool FindGroupPath(xmlNodePtr Wanted,
+                          const QVector<xmlNodePtr>& Groups,
+                          const QString& Prefix, QString& Path)
+{
+    for (int g = 0; g < Groups.size(); ++g) {
+        QString Here = Prefix.isEmpty()
+            ? QString::number(g)
+            : Prefix + QStringLiteral(".") + QString::number(g);
+        if (Groups[g] == Wanted) {
+            Path = Here;
+            return true;
+        }
+        if (FindGroupPath(Wanted,
+                          DocDocument::NestedReferenceGroups(Groups[g]),
+                          Here, Path)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void MainWindow::OnLinkActivated(const QString& LinkName,
+                                 const QString& Target)
+{
+    if (LinkName == QLatin1String("eref")) {
+        // An external link never opens without asking: the
+        // pop-up shows the link, with Yes and Cancel.
+        QMessageBox::StandardButton Answer = QMessageBox::question(
+            this, tr("Open Link"),
+            tr("Open this link in your browser?\n\n%1").arg(Target),
+            QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
+        if (Answer == QMessageBox::Yes) {
+            QDesktopServices::openUrl(QUrl(Target));
+        }
+        return;
+    }
+    NavigateToAnchor(Target);
+}
+
+void MainWindow::NavigateToAnchor(const QString& Anchor)
+{
+    QString Key = OutlineKeyForAnchor(Anchor);
+    QTreeWidgetItem* Item = Key.isEmpty()
+        ? nullptr : FindItemByKey(nullptr, Key);
+    if (Item == nullptr) {
+        statusBar()->showMessage(
+            tr("No element in this document has the anchor \"%1\".")
+                .arg(Anchor));
+        return;
+    }
+    _Outline->setCurrentItem(Item);
+    ShowDetailsFor(Item);
+    _Outline->scrollToItem(Item);
+}
+
+QString MainWindow::OutlineKeyForAnchor(const QString& Anchor) const
+{
+    xmlNodePtr Node = DocDocument::FindNodeByAnchor(_Document.RfcNode(), Anchor);
+    if (Node != nullptr) {
+        // A section selects its own outline item.
+        if (DocDocument::NodeNameEquals(Node, "section")) {
+            QString Path;
+            if (FindSectionPath(Node, _Document.TopSectionNodes(),
+                                QString(), Path) ||
+                FindSectionPath(Node, _Document.BackSectionNodes(),
+                                QStringLiteral("back:"), Path)) {
+                return QStringLiteral("section:") + Path;
+            }
+            return QString();
+        }
+        // A reference entry selects its list item.
+        if (DocDocument::NodeNameEquals(Node, "reference")) {
+            QString Key;
+            if (FindReferenceKey(Node, _Document.ReferenceGroupNodes(),
+                                 QString(), Key)) {
+                return Key;
+            }
+            return QString();
+        }
+        // Anything else (a figure, table, list, or sourcecode in
+        // a section body, for example) selects its containing
+        // section, or the reference list it lives in.
+        for (xmlNodePtr At = Node->parent; At != nullptr; At = At->parent) {
+            if (DocDocument::NodeNameEquals(At, "section")) {
+                QString Path;
+                if (FindSectionPath(At, _Document.TopSectionNodes(),
+                                    QString(), Path) ||
+                    FindSectionPath(At, _Document.BackSectionNodes(),
+                                    QStringLiteral("back:"), Path)) {
+                    return QStringLiteral("section:") + Path;
+                }
+                return QString();
+            }
+            if (DocDocument::NodeNameEquals(At, "references")) {
+                QString Path;
+                if (FindGroupPath(At, _Document.ReferenceGroupNodes(),
+                                  QString(), Path)) {
+                    return QStringLiteral("refgroup:") + Path;
+                }
+                return QString();
+            }
+        }
+        return QString();
+    }
+    // An included reference carries no anchor attribute: its
+    // anchor is derived from its href, so it is found by href.
+    QString Key;
+    if (FindIncludeKey(Anchor, _Document.ReferenceGroupNodes(),
+                       QString(), Key)) {
+        return Key;
+    }
+    return QString();
 }
 
 void MainWindow::RebuildOutline()

@@ -40,6 +40,7 @@
 #include <QMenu>
 #include <QMessageBox>
 #include <QMimeData>
+#include <QMouseEvent>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRegularExpression>
@@ -7954,6 +7955,35 @@ bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
             Tip = ResolvedXrefTip(At, Tip);
             QToolTip::showText(Help->globalPos(), Tip, _TextEdit);
             return true;
+        }
+        return QWidget::eventFilter(Watched, Event);
+    }
+    if (Watched == _TextEdit->viewport() &&
+        Event->type() == QEvent::MouseButtonPress) {
+        // Bug 529: Ctrl+click follows a reference. A plain click
+        // only places the cursor; Ctrl+click on a link follows
+        // it instead. The press is swallowed when a link is
+        // followed, so the click does not also move the cursor.
+        // Mouse presses on a QTextEdit arrive on its viewport,
+        // and cursorForPosition takes viewport coordinates.
+        QMouseEvent* Mouse = static_cast<QMouseEvent*>(Event);
+        if (Mouse->button() == Qt::LeftButton &&
+            (Mouse->modifiers() & Qt::ControlModifier)) {
+            QTextCursor At = _TextEdit->cursorForPosition(Mouse->pos());
+            int Start = 0, End = 0;
+            QString LinkName;
+            DocTagEntry LinkEntry;
+            if (LinkRangeAt(_TextEdit->document(), At.position(),
+                            Start, End, LinkName, LinkEntry) &&
+                LinkName != QLatin1String("cref")) {
+                // A comment reference has no target to follow.
+                QString Target = AttributeOf(
+                    LinkEntry.Attributes, QStringLiteral("target"));
+                if (!Target.isEmpty()) {
+                    emit LinkActivated(LinkName, Target);
+                    return true;
+                }
+            }
         }
         return QWidget::eventFilter(Watched, Event);
     }

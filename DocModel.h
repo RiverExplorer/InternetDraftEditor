@@ -647,6 +647,20 @@ public:
     static bool DocumentHasAnchor(xmlNodePtr Root, const QString& Anchor);
 
     /**
+     * @brief The first element in the tree carrying this anchor (Bug 529).
+     *
+     * Ctrl+click on a cross-reference follows it: the editor
+     * needs the element the anchor belongs to, so it can select
+     * it in the outline. The walk is document order, so the
+     * first match wins when an anchor is (wrongly) duplicated.
+     * @param Root The tree to walk, borrowed.
+     * @param Anchor The anchor to look for.
+     * @return The element, borrowed, or null when no element carries it.
+     */
+    static xmlNodePtr FindNodeByAnchor(xmlNodePtr Root,
+                                       const QString& Anchor);
+
+    /**
      * @brief Renames the target on every cross-reference pointing at it.
      *
      * When a reference entry's anchor changes, the cross-references
