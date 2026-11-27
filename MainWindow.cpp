@@ -64,6 +64,16 @@
 #include <QUrl>
 #include <QVBoxLayout>
 
+// Bug 532: telling Windows the font list changed needs the
+// Win32 API (SendMessageTimeout for WM_FONTCHANGE). NOMINMAX
+// keeps windows.h from defining min/max macros that clash
+// with the C++ standard library.
+#ifdef Q_OS_WIN
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include <functional>
 #include <libxml/tree.h>
 
@@ -1131,7 +1141,7 @@ MainWindow::MainWindow(QWidget* Parent)
     connect(FeedbackAction, &QAction::triggered,
             this, &MainWindow::OnFeedback);
 
-    QAction* AboutAction = HelpMenu->addAction(tr("&About ProtocolDocEditor"));
+    QAction* AboutAction = HelpMenu->addAction(tr("&About InternetDraftsEditor"));
     AboutAction->setStatusTip(
         tr("Show information about this editor, including the copyright and license."));
     connect(AboutAction, &QAction::triggered, this, &MainWindow::OnAbout);
@@ -3002,8 +3012,16 @@ void MainWindow::OnRunXml2rfc()
         statusBar()->showMessage(tr("Save the draft first."));
         return;
     }
+    // Bug 532: the PDF needs a monospace font for its figures.
+    // If PDF is selected and none is installed, offer to
+    // download and install Roboto Mono. The run goes ahead
+    // either way; the check is advisory, not a gate.
+    if (_PdfFormatCheck->isChecked()) {
+        CheckMonospaceFontForPdf();
+    }
     _RunFailed = false;
     _RunLog->clear();
+    _RunLogPending.clear();
     _RunCloseButton->setEnabled(false);
     _RunDialog->show();
     _RunDialog->raise();
@@ -3730,6 +3748,23 @@ void MainWindow::OnBibliography()
 // the same as a bibliography fetch).
 static const int PublishedFetchTimeoutMs = 15000;
 
+// Bug 532: the two Roboto Mono variable fonts, from the Google
+// Fonts repo. These are variable fonts (the [wght] axis), so the
+// two files cover every weight — there is no separate static
+// folder to fetch. Downloaded directly (no zip), so the app
+// needs no zip extractor. Verified 2026-11-26: both return a
+// real TrueType font.
+static const char* RobotoMonoFontUrls[] = {
+    "https://github.com/google/fonts/raw/main/ofl/robotomono/"
+    "RobotoMono%5Bwght%5D.ttf",
+    "https://github.com/google/fonts/raw/main/ofl/robotomono/"
+    "RobotoMono-Italic%5Bwght%5D.ttf",
+};
+static const char* RobotoMonoFontNames[] = {
+    "RobotoMono[wght].ttf",
+    "RobotoMono-Italic[wght].ttf",
+};
+
 // The four formats a published document may be viewed in, in the
 // order they are offered. Not every format exists for every
 // document, so the dialog probes each address and offers only
@@ -3754,7 +3789,7 @@ static QByteArray PublishedFetch(const QUrl& Url, QString* Error)
     QNetworkRequest Request(Url);
     Request.setTransferTimeout(PublishedFetchTimeoutMs);
     Request.setHeader(QNetworkRequest::UserAgentHeader,
-                      QStringLiteral("ProtocolDocEditor/1.1 "
+                      QStringLiteral("InternetDraftsEditor/1.1 "
                                      "(view published)"));
     QNetworkReply* Reply = Network.get(Request);
     QEventLoop Loop;
@@ -3791,7 +3826,7 @@ static bool PublishedExists(const QUrl& Url)
     QNetworkRequest Request(Url);
     Request.setTransferTimeout(PublishedFetchTimeoutMs);
     Request.setHeader(QNetworkRequest::UserAgentHeader,
-                      QStringLiteral("ProtocolDocEditor/1.1 "
+                      QStringLiteral("InternetDraftsEditor/1.1 "
                                      "(view published)"));
     QNetworkReply* Reply = Network.head(Request);
     QEventLoop Loop;
@@ -3807,6 +3842,162 @@ static bool PublishedExists(const QUrl& Url)
              QNetworkRequest::HttpStatusCodeAttribute).toInt() == 200);
     Reply->deleteLater();
     return Found;
+}
+
+// Bug 532: true when a monospace font xml2rfc's PDF can use is
+// installed. The PDF stylesheet lists Roboto Mono, Courier,
+// Courier New, then generic monospace, so the three named fonts
+// are the check.
+bool MainWindow::HasUsableMonospaceFont() const
+{
+    // QFontDatabase's constructor is deprecated in Qt 6; call
+    // the static functions instead.
+    const QStringList Families = QFontDatabase::families();
+    return Families.contains(QStringLiteral("Roboto Mono")) ||
+           Families.contains(QStringLiteral("Courier New")) ||
+           Families.contains(QStringLiteral("Courier"));
+}
+
+// Bug 532: when a PDF run is about to happen and no usable
+// monospace font is installed, offers to download and install
+// Roboto Mono. Asked at most once per session, so a "No" does
+// not nag on every PDF run; a later install is picked up
+// because HasUsableMonospaceFont is checked first. The run goes
+// ahead either way — this is advisory, not a gate.
+void MainWindow::CheckMonospaceFontForPdf()
+{
+    static bool OfferShown = false;
+    if (OfferShown) {
+        return;
+    }
+    if (HasUsableMonospaceFont()) {
+        return;
+    }
+    OfferShown = true;
+    QMessageBox::StandardButton Answer = QMessageBox::question(
+        this, tr("Monospace font needed for PDF"),
+        tr("The PDF needs a monospace font for its figures, and "
+           "none is installed (Roboto Mono, Courier New, or "
+           "Courier). Without one the artwork comes out in a "
+           "proportional font and looks skewed.\n\n"
+           "Would you like me to download and install Roboto "
+           "Mono for you?"),
+        QMessageBox::Yes | QMessageBox::No,
+        QMessageBox::Yes);
+    if (Answer != QMessageBox::Yes) {
+        QMessageBox::information(
+            this, tr("Monospace font needed for PDF"),
+            tr("To fix the PDF by hand, install a monospace font "
+               "and re-run xml2rfc. Roboto Mono from Google Fonts "
+               "works: install all of its files. Or check that "
+               "Courier New is in C:\\Windows\\Fonts."));
+        return;
+    }
+    QString Error;
+    if (DownloadAndInstallRobotoMono(&Error)) {
+        QMessageBox::information(
+            this, tr("Roboto Mono installed"),
+            tr("Roboto Mono is installed. The PDF figures should "
+               "come out aligned now. If a PDF still looks skewed, "
+               "check that it embeds a monospace font."));
+    } else {
+        QMessageBox::warning(
+            this, tr("Roboto Mono install failed"),
+            tr("I could not install Roboto Mono (%1). To fix the "
+               "PDF by hand, install a monospace font and re-run "
+               "xml2rfc. Roboto Mono from Google Fonts works: "
+               "install all of its files.").arg(Error));
+    }
+}
+
+// Bug 532: downloads the two Roboto Mono variable fonts and
+// installs them for the current user only (no admin/UAC). The
+// variable fonts cover every weight, so there is no zip to
+// extract and no static folder to traverse. Returns false, with
+// the reason in Error, when the download or the install fails.
+bool MainWindow::DownloadAndInstallRobotoMono(QString* Error)
+{
+#ifdef Q_OS_WIN
+    const QString FontsDir =
+        QDir(qEnvironmentVariable("LOCALAPPDATA"))
+            .filePath(QStringLiteral("Microsoft/Windows/Fonts"));
+    if (!QDir().mkpath(FontsDir)) {
+        if (Error != nullptr) {
+            *Error = tr("Could not create the fonts folder.");
+        }
+        return false;
+    }
+    for (int i = 0; i < 2; ++i) {
+        QString DownloadError;
+        const QByteArray Data =
+            PublishedFetch(QUrl(QString::fromUtf8(RobotoMonoFontUrls[i])),
+                           &DownloadError);
+        if (Data.isEmpty()) {
+            if (Error != nullptr) {
+                *Error = DownloadError.isEmpty()
+                    ? tr("The download failed.")
+                    : DownloadError;
+            }
+            return false;
+        }
+        // A font file starts with the TrueType scaler tag
+        // (0x00010000) or the 'OTTO' tag for CFF fonts.
+        // Anything else is an error page, not a font.
+        const bool IsTrueType =
+            Data.size() >= 4 &&
+            static_cast<unsigned char>(Data[0]) == 0x00 &&
+            static_cast<unsigned char>(Data[1]) == 0x01 &&
+            static_cast<unsigned char>(Data[2]) == 0x00 &&
+            static_cast<unsigned char>(Data[3]) == 0x00;
+        if (!IsTrueType && !Data.startsWith("OTTO")) {
+            if (Error != nullptr) {
+                *Error = tr("The download was not a font file.");
+            }
+            return false;
+        }
+        const QString FilePath =
+            QDir(FontsDir).filePath(
+                QString::fromUtf8(RobotoMonoFontNames[i]));
+        QFile File(FilePath);
+        if (!File.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            if (Error != nullptr) {
+                *Error = tr("Could not write %1.").arg(FilePath);
+            }
+            return false;
+        }
+        if (File.write(Data) != Data.size()) {
+            if (Error != nullptr) {
+                *Error = tr("Could not write %1.").arg(FilePath);
+            }
+            return false;
+        }
+        File.close();
+        // Register the font for the current user. The value is
+        // the file name only; Windows looks in the per-user
+        // fonts folder for it.
+        QSettings Registry(
+            QStringLiteral("HKEY_CURRENT_USER\\Software\\Microsoft\\"
+                           "Windows NT\\CurrentVersion\\Fonts"),
+            QSettings::NativeFormat);
+        const QString ValueName =
+            (i == 0)
+                ? QStringLiteral("Roboto Mono (TrueType)")
+                : QStringLiteral("Roboto Mono Italic (TrueType)");
+        Registry.setValue(
+            ValueName,
+            QString::fromUtf8(RobotoMonoFontNames[i]));
+    }
+    // Tell Windows (and fontconfig) the font list changed, so a
+    // new WeasyPrint process sees the new font without a restart.
+    SendMessageTimeout(HWND_BROADCAST, WM_FONTCHANGE, 0, 0,
+                       SMTO_ABORTIFHUNG, 5000, nullptr);
+    return true;
+#else
+    if (Error != nullptr) {
+        *Error = tr("Automatic font install is Windows only.");
+    }
+    return false;
+#endif
 }
 
 // Downloads a published document to a temporary file and opens
@@ -4572,7 +4763,7 @@ void MainWindow::OnAbout()
     // backwards: that color is black here, so it made all the
     // text dark on dark.
     QMessageBox box(this);
-    box.setWindowTitle(tr("About ProtocolDocEditor"));
+    box.setWindowTitle(tr("About InternetDraftsEditor"));
     // RiverExplorer logo in the About dialog. The logo is a Qt
     // resource (images.qrc); if it is missing the dialog still
     // works, just without the picture.
@@ -4584,7 +4775,7 @@ void MainWindow::OnAbout()
     }
     box.setTextFormat(Qt::RichText);
     box.setText(
-        tr("ProtocolDocEditor %1<br>"
+        tr("InternetDraftsEditor %1<br>"
            "Built %2 %3<br><br>"
            "An editor for IETF Internet-Drafts in RFCXML (xml2rfc) format.<br><br>"
            "Project page: <a href=\"https://github.com/RiverExplorer/InternetDraftEditor\" "
@@ -4834,7 +5025,7 @@ DocValidationResult MainWindow::ValidateAndReport(const QString& Path, bool Alwa
     if (Schema.isEmpty()) {
         Result.Errors.append(
             tr("The v3 schema (schemas/v3.rng) was not found next to the program. "
-               "Put the schemas folder beside ProtocolDocEditor.exe."));
+               "Put the schemas folder beside InternetDraftsEditor.exe."));
         statusBar()->showMessage(tr("Validation skipped: the v3 schema was not found."));
     } else {
         Result = ValidateRfcXml(Path, Schema);
@@ -4993,6 +5184,18 @@ void MainWindow::OnRunErrorOutput()
 void MainWindow::OnRunFinished(int ExitCode, QProcess::ExitStatus /*ExitStatus*/)
 {
     _RunCloseButton->setEnabled(true);
+    // Bug 541: flush any partial line AppendRunLog was holding
+    // (a final line with no trailing newline). It goes through
+    // the same filter, so a trailing GIO warning is dropped
+    // here too.
+    if (!_RunLogPending.isEmpty()) {
+        if (!_RunLogPending.contains(QStringLiteral("GLib-GIO-WARNING"))) {
+            _RunLog->moveCursor(QTextCursor::End);
+            _RunLog->insertPlainText(_RunLogPending + QStringLiteral("\n"));
+            _RunLog->moveCursor(QTextCursor::End);
+        }
+        _RunLogPending.clear();
+    }
     // A run may have produced the outputs the View buttons open.
     UpdateViewButtons();
     // Bug 539: xml2rfc leaves a tracker.log in the draft folder
@@ -8021,7 +8224,7 @@ void MainWindow::SetModified(bool Modified)
 
 void MainWindow::UpdateWindowTitle()
 {
-    QString Title = tr("ProtocolDocEditor - V%1")
+    QString Title = tr("InternetDraftsEditor - V%1")
                         .arg(QCoreApplication::applicationVersion());
     if (!_Document.DocName().isEmpty()) {
         Title += QStringLiteral(" - ") + _Document.DocName();
@@ -8204,7 +8407,36 @@ QString MainWindow::Xml2rfcPath() const
 
 void MainWindow::AppendRunLog(const QString& Text)
 {
+    // Bug 541: the GTK libraries WeasyPrint uses print
+    // GLib-GIO-WARNING lines to stderr when xml2rfc runs
+    // (they complain about Windows Store apps that declare
+    // file extensions but no open actions). They say nothing
+    // about the draft or the output, so drop them from the
+    // run log and keep only xml2rfc's own messages. A line is
+    // dropped only when it contains the GLib-GIO-WARNING
+    // marker; real xml2rfc warnings and errors do not contain
+    // it, so they are kept. Process output arrives in chunks
+    // that can split a line, so a trailing partial line is
+    // held in _RunLogPending and only complete lines are
+    // judged; OnRunFinished flushes what is left.
+    _RunLogPending += Text;
+    QStringList Lines = _RunLogPending.split(QLatin1Char('\n'));
+    // The last piece has no newline yet (unless the text ended
+    // with one, in which case it is empty); keep it for the
+    // next call.
+    _RunLogPending = Lines.takeLast();
+    QString Kept;
+    for (const QString& Line : Lines) {
+        if (Line.contains(QStringLiteral("GLib-GIO-WARNING"))) {
+            continue;
+        }
+        Kept += Line;
+        Kept += QLatin1Char('\n');
+    }
+    if (Kept.isEmpty()) {
+        return;
+    }
     _RunLog->moveCursor(QTextCursor::End);
-    _RunLog->insertPlainText(Text);
+    _RunLog->insertPlainText(Kept);
     _RunLog->moveCursor(QTextCursor::End);
 }

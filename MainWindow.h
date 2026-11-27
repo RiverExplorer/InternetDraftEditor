@@ -6,7 +6,7 @@
 
 /**
  * @file MainWindow.h
- * @brief Main window for the ProtocolDocEditor (goal #1).
+ * @brief Main window for the InternetDraftsEditor (goal #1).
  *
  * The window is split like the CoOp editor: the outline on the
  * left, the details on the right. The outline holds the document
@@ -482,6 +482,30 @@ private slots:
      * @brief Saves if needed, then runs xml2rfc on the saved file.
      */
     void OnRunXml2rfc();
+
+    /**
+     * @brief True when a monospace font xml2rfc's PDF can use is
+     *        installed (Roboto Mono, Courier New, or Courier).
+     *        Bug 532.
+     */
+    bool HasUsableMonospaceFont() const;
+
+    /**
+     * @brief When a PDF run is about to happen and no usable
+     *        monospace font is installed, offers to download and
+     *        install Roboto Mono. Asked at most once per session.
+     *        The run goes ahead either way. Bug 532.
+     */
+    void CheckMonospaceFontForPdf();
+
+    /**
+     * @brief Downloads the two Roboto Mono variable fonts from
+     *        Google Fonts and installs them for the current user
+     *        (no admin needed). Returns false, with the reason in
+     *        Error, when the download or the install fails.
+     *        Bug 532.
+     */
+    bool DownloadAndInstallRobotoMono(QString* Error);
 
     /**
      * @brief Saves if needed, then validates the saved file and
@@ -1191,6 +1215,11 @@ private:
     QProcess* _RunProcess;
     QDialog* _RunDialog;
     QPlainTextEdit* _RunLog;
+    // Bug 541: a trailing partial line held by AppendRunLog
+    // while it filters GLib-GIO-WARNING noise out of the run
+    // log. Process output arrives in chunks that can split a
+    // line, so only complete lines are judged.
+    QString _RunLogPending;
     QPushButton* _RunCloseButton;
 
     QDialog* _ValidateDialog;

@@ -6,7 +6,7 @@
 
 /**
  * @file DocModel.h
- * @brief Document model for the ProtocolDocEditor: the draft as a libxml2 tree.
+ * @brief Document model for the InternetDraftsEditor: the draft as a libxml2 tree.
  *
  * A DocDocument owns one libxml2 document and nothing else mirrors
  * XML anymore. Every accessor hands out borrowed node pointers into

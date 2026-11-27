@@ -6,7 +6,7 @@
 
 /**
  * @file main.cpp
- * @brief Application entry point for the ProtocolDocEditor.
+ * @brief Application entry point for the InternetDraftsEditor.
  *
  * The start wizard runs first. The user picks an existing draft
  * XML file to open, or creates a new one by answering the minimum
@@ -17,12 +17,13 @@
 #include <QApplication>
 #include <QDialog>
 #include <QFont>
+#include <QSettings>
 
 #include "MainWindow.h"
 #include "StartWizard.h"
 
 /**
- * @brief Runs the ProtocolDocEditor.
+ * @brief Runs the InternetDraftsEditor.
  * @param ArgCount The number of command-line arguments.
  * @param ArgValues The command-line arguments.
  * @return The application exit code.
@@ -30,9 +31,29 @@
 int main(int ArgCount, char* ArgValues[])
 {
     QApplication App(ArgCount, ArgValues);
-    App.setApplicationName(QStringLiteral("ProtocolDocEditor"));
+    App.setApplicationName(QStringLiteral("InternetDraftsEditor"));
     App.setApplicationVersion(QStringLiteral("1.1.0"));
     App.setOrganizationName(QStringLiteral("RiverExplorer"));
+
+    // The application used to be called ProtocolDocEditor, and
+    // its settings (the xml2rfc path, the output formats, the
+    // option markers) live under that old name. The rename
+    // moves them, so on the first run under the new name copy
+    // them across instead of losing them. This runs only when
+    // the new settings are empty and the old ones exist, so
+    // after that first run it does nothing.
+    {
+        QSettings OldSettings(QStringLiteral("RiverExplorer"),
+                              QStringLiteral("ProtocolDocEditor"));
+        QSettings NewSettings;
+        if (NewSettings.allKeys().isEmpty()
+            && !OldSettings.allKeys().isEmpty()) {
+            for (const QString& Key : OldSettings.allKeys()) {
+                NewSettings.setValue(Key, OldSettings.value(Key));
+            }
+            NewSettings.sync();
+        }
+    }
 
     // Font: Arial 10, like the CoOp editor.
     App.setFont(QFont(QStringLiteral("Arial"), 10));

@@ -1,4 +1,4 @@
-# DocEditorTests - Qt Test suite for the ProtocolDocEditor (Bug 462).
+# DocEditorTests - Qt Test suite for the InternetDraftsEditor (Bug 462).
 #
 # qmake project file. This file lives in the tests folder under the
 # editor sources (DocEditor/tests/): open THIS file in Qt Creator
@@ -24,7 +24,7 @@ INCLUDEPATH += $$PWD/..
 # libxml2 (static MinGW build) — the editor sources now use libxml2
 # directly for the document model, so the test build needs the same
 # include and link setup as the editor build (see
-# ProtocolDocEditor.pro). The headers and libraries live in
+# InternetDraftsEditor.pro). The headers and libraries live in
 # RelatedProjects/include and RelatedProjects/lib; this folder sits
 # one level deeper than the editor folder, so the paths go one level
 # further up. LIBXML_STATIC is required: without it the headers

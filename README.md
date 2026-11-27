@@ -1,4 +1,4 @@
-# ProtocolDocEditor
+# InternetDraftsEditor
 
 A Qt desktop editor for writing Internet-Drafts. The audience is a
 person knowledgeable about protocols and not knowledgeable about
@@ -448,7 +448,7 @@ the text of the document goes.
 
 ## Help menu (Bug 323)
 
-- The Help menu holds Legend, Feedback, and About ProtocolDocEditor. Legend
+- The Help menu holds Legend, Feedback, and About InternetDraftsEditor. Legend
   lists what the text editor's special characters mean: the Line
   Break and Vertical Space markers, the Index Entry marker, the
   soft line break, and list markers. Feedback opens the GitHub
@@ -947,7 +947,7 @@ the text of the document goes.
   is decided. A note holding source code, a figure, a table, or
   a name with inline tags stays preserved whole.
 - A new draft created from scratch prefills one note named
-  Created With, holding the text ProtocolDocEditor and the
+  Created With, holding the text InternetDraftsEditor and the
   application version (Bug 456). A GitHub repo URL joins it
   later.
 - The postal address on the author page holds all nine
@@ -1127,7 +1127,7 @@ it back used to lose the file name and leave the placeholder text
 
 ## Build
 
-Open `ProtocolDocEditor.pro` in Qt Creator with the "Desktop Qt
+Open `InternetDraftsEditor.pro` in Qt Creator with the "Desktop Qt
 6.12.0" kit (llvm-mingw 64-bit) and build. Besides Qt Core, Gui, and
 Widgets, the build needs the static libxml2 in
 `RelatedProjects/include` and `RelatedProjects/lib` (see
@@ -1142,7 +1142,7 @@ program path with Settings > Set xml2rfc Path...
 
 For validation, nothing needs placing by hand: the program
 installs the schemas itself on startup (see Goal #2 above). A
-`schemas` folder beside `ProtocolDocEditor.exe` is only a
+`schemas` folder beside `InternetDraftsEditor.exe` is only a
 fallback.
 
 ## Files

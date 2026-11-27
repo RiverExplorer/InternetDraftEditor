@@ -744,7 +744,7 @@ StartWizard::StartWizard(QWidget* Parent, bool CreateOnly)
     , _NewVersionSourceFile()
     , _HasNewVersionSource(false)
 {
-    setWindowTitle(tr("ProtocolDocEditor"));
+    setWindowTitle(tr("InternetDraftsEditor"));
     setWizardStyle(QWizard::ModernStyle);
     setOption(QWizard::NoBackButtonOnStartPage, true);
     setButtonText(QWizard::FinishButton, tr("Create now"));

@@ -5708,7 +5708,7 @@ DocDocument DocDocument::NewWithDefaults(const QString& DocName,
         QByteArray NoteNameUtf8 = Utf8Bytes(QStringLiteral("Created With"));
         xmlNewTextChild(Note, nullptr, reinterpret_cast<const xmlChar*>("name"),
                         reinterpret_cast<const xmlChar*>(NoteNameUtf8.constData()));
-        QString CreatedText = QStringLiteral("ProtocolDocEditor ") +
+        QString CreatedText = QStringLiteral("InternetDraftsEditor ") +
                               QCoreApplication::applicationVersion();
         QByteArray CreatedUtf8 = Utf8Bytes(CreatedText);
         xmlNewTextChild(Note, nullptr, reinterpret_cast<const xmlChar*>("t"),

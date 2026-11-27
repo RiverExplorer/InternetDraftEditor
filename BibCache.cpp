@@ -445,7 +445,7 @@ void BibCache::FetchOne(const QString& Url)
     QNetworkRequest Request(Address);
     Request.setTransferTimeout(FetchTimeoutMs);
     Request.setHeader(QNetworkRequest::UserAgentHeader,
-                      QStringLiteral("ProtocolDocEditor/1.1 "
+                      QStringLiteral("InternetDraftsEditor/1.1 "
                                      "(bibliography cache)"));
     QNetworkReply* Reply = _Network->get(Request);
     ++_Pending;

@@ -6,7 +6,7 @@
 
 /**
  * @file StartWizard.h
- * @brief Start wizard for the ProtocolDocEditor (install-tool style,
+ * @brief Start wizard for the InternetDraftsEditor (install-tool style,
  *        Next/Previous).
  *
  * The wizard collects the minimum information a draft needs, one
