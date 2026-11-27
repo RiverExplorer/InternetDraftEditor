@@ -1,0 +1,44 @@
+# InternetDraftsEditor .gitattributes
+#
+# Text files are normalized to LF on commit. On checkout Git
+# converts them to the platform's line ending (CRLF on Windows,
+# LF elsewhere), so the files work natively on every machine.
+# The source files in this repo already use LF, so adding this
+# file changes nothing on the next commit.
+#
+# Binary files are never converted and never diffed as text.
+
+* text=auto
+
+# --- Text: C++ / Qt project files ---
+*.cpp text
+*.h text
+*.pro text
+*.pri text
+*.qrc text
+
+# --- Text: data and scripts ---
+*.xml text
+*.rng text
+*.xsd text
+*.json text
+*.ps1 text
+*.iss text
+*.md text
+*.txt text
+
+# --- Binary: images and icons (never converted, never diffed) ---
+*.ico binary
+*.bmp binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+
+# --- Binary: libraries and build output ---
+*.lib binary
+*.a binary
+*.dll binary
+*.exe binary
+*.zip binary
+*.pdf binary

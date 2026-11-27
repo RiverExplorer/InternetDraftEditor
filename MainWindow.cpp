@@ -900,11 +900,6 @@ MainWindow::MainWindow(QWidget* Parent)
     , _BibCache(this)
     , _FilePath()
     , _Modified(false)
-    , _DiagLoadFront(false)
-    , _DiagLoadAbstract(false)
-    , _DiagLoadAbstractChildren(0)
-    , _DiagSyncCount(0)
-    , _DiagSyncLastNodes(0)
     , _AbstractEditCurrent(false)
     , _SelectedKey()
     , _AuthorIndex(-1)
@@ -1356,6 +1351,46 @@ MainWindow::MainWindow(QWidget* Parent)
                 HandleAnchorChange(_AbstractEdit, OldAnchor, NewAnchor,
                                    SetAnchor);
             });
+    // Bug 504: a figure's anchor change goes through the same
+    // owner check (duplicate refused, cited delete refused,
+    // cross-references renamed), with the setter writing the
+    // figure's anchor.
+    connect(_AbstractEdit, &TextEditor::FigureAnchorChangeRequested, this,
+            [this](const QString& OldAnchor, const QString& NewAnchor,
+                   int FirstBlockPos, bool* Accepted) {
+                auto SetAnchor = [this, FirstBlockPos](const QString& Value) {
+                    _AbstractEdit->SetFigureAnchor(FirstBlockPos, Value);
+                };
+                if (Accepted != nullptr) {
+                    *Accepted = HandleAnchorChange(_AbstractEdit, OldAnchor,
+                                                   NewAnchor, SetAnchor);
+                }
+            });
+    // Bug 445: the artset and artwork anchors go through the
+    // same owner check, with setters writing those anchors.
+    connect(_AbstractEdit, &TextEditor::ArtsetAnchorChangeRequested, this,
+            [this](const QString& OldAnchor, const QString& NewAnchor,
+                   int FirstBlockPos, bool* Accepted) {
+                auto SetAnchor = [this, FirstBlockPos](const QString& Value) {
+                    _AbstractEdit->SetArtsetAnchor(FirstBlockPos, Value);
+                };
+                if (Accepted != nullptr) {
+                    *Accepted = HandleAnchorChange(_AbstractEdit, OldAnchor,
+                                                   NewAnchor, SetAnchor);
+                }
+            });
+    connect(_AbstractEdit, &TextEditor::ArtworkAnchorChangeRequested, this,
+            [this](const QString& OldAnchor, const QString& NewAnchor,
+                   int FirstBlockPos, bool* Accepted) {
+                auto SetAnchor = [this, FirstBlockPos](const QString& Value) {
+                    _AbstractEdit->SetArtworkAttribute(
+                        FirstBlockPos, QStringLiteral("anchor"), Value);
+                };
+                if (Accepted != nullptr) {
+                    *Accepted = HandleAnchorChange(_AbstractEdit, OldAnchor,
+                                                   NewAnchor, SetAnchor);
+                }
+            });
     _AbstractPreservedLabel = new QLabel(AbstractPageWidget);
     _AbstractPreservedLabel->setWordWrap(true);
     _AbstractPreservedLabel->setTextInteractionFlags(
@@ -1419,6 +1454,46 @@ MainWindow::MainWindow(QWidget* Parent)
                 };
                 HandleAnchorChange(_SectionBodyEdit, OldAnchor, NewAnchor,
                                    SetAnchor);
+            });
+    // Bug 504: a figure's anchor change goes through the same
+    // owner check (duplicate refused, cited delete refused,
+    // cross-references renamed), with the setter writing the
+    // figure's anchor.
+    connect(_SectionBodyEdit, &TextEditor::FigureAnchorChangeRequested, this,
+            [this](const QString& OldAnchor, const QString& NewAnchor,
+                   int FirstBlockPos, bool* Accepted) {
+                auto SetAnchor = [this, FirstBlockPos](const QString& Value) {
+                    _SectionBodyEdit->SetFigureAnchor(FirstBlockPos, Value);
+                };
+                if (Accepted != nullptr) {
+                    *Accepted = HandleAnchorChange(_SectionBodyEdit, OldAnchor,
+                                                   NewAnchor, SetAnchor);
+                }
+            });
+    // Bug 445: the artset and artwork anchors go through the
+    // same owner check, with setters writing those anchors.
+    connect(_SectionBodyEdit, &TextEditor::ArtsetAnchorChangeRequested, this,
+            [this](const QString& OldAnchor, const QString& NewAnchor,
+                   int FirstBlockPos, bool* Accepted) {
+                auto SetAnchor = [this, FirstBlockPos](const QString& Value) {
+                    _SectionBodyEdit->SetArtsetAnchor(FirstBlockPos, Value);
+                };
+                if (Accepted != nullptr) {
+                    *Accepted = HandleAnchorChange(_SectionBodyEdit, OldAnchor,
+                                                   NewAnchor, SetAnchor);
+                }
+            });
+    connect(_SectionBodyEdit, &TextEditor::ArtworkAnchorChangeRequested, this,
+            [this](const QString& OldAnchor, const QString& NewAnchor,
+                   int FirstBlockPos, bool* Accepted) {
+                auto SetAnchor = [this, FirstBlockPos](const QString& Value) {
+                    _SectionBodyEdit->SetArtworkAttribute(
+                        FirstBlockPos, QStringLiteral("anchor"), Value);
+                };
+                if (Accepted != nullptr) {
+                    *Accepted = HandleAnchorChange(_SectionBodyEdit, OldAnchor,
+                                                   NewAnchor, SetAnchor);
+                }
             });
     // Bug 520: pasted <section> nodes in the section body's XML
     // tab become subsections of the current section.
@@ -1823,6 +1898,46 @@ MainWindow::MainWindow(QWidget* Parent)
                 HandleAnchorChange(_SettingsNoteEdit, OldAnchor, NewAnchor,
                                    SetAnchor);
             });
+    // Bug 504: a figure's anchor change goes through the same
+    // owner check (duplicate refused, cited delete refused,
+    // cross-references renamed), with the setter writing the
+    // figure's anchor.
+    connect(_SettingsNoteEdit, &TextEditor::FigureAnchorChangeRequested, this,
+            [this](const QString& OldAnchor, const QString& NewAnchor,
+                   int FirstBlockPos, bool* Accepted) {
+                auto SetAnchor = [this, FirstBlockPos](const QString& Value) {
+                    _SettingsNoteEdit->SetFigureAnchor(FirstBlockPos, Value);
+                };
+                if (Accepted != nullptr) {
+                    *Accepted = HandleAnchorChange(_SettingsNoteEdit, OldAnchor,
+                                                   NewAnchor, SetAnchor);
+                }
+            });
+    // Bug 445: the artset and artwork anchors go through the
+    // same owner check, with setters writing those anchors.
+    connect(_SettingsNoteEdit, &TextEditor::ArtsetAnchorChangeRequested, this,
+            [this](const QString& OldAnchor, const QString& NewAnchor,
+                   int FirstBlockPos, bool* Accepted) {
+                auto SetAnchor = [this, FirstBlockPos](const QString& Value) {
+                    _SettingsNoteEdit->SetArtsetAnchor(FirstBlockPos, Value);
+                };
+                if (Accepted != nullptr) {
+                    *Accepted = HandleAnchorChange(_SettingsNoteEdit, OldAnchor,
+                                                   NewAnchor, SetAnchor);
+                }
+            });
+    connect(_SettingsNoteEdit, &TextEditor::ArtworkAnchorChangeRequested, this,
+            [this](const QString& OldAnchor, const QString& NewAnchor,
+                   int FirstBlockPos, bool* Accepted) {
+                auto SetAnchor = [this, FirstBlockPos](const QString& Value) {
+                    _SettingsNoteEdit->SetArtworkAttribute(
+                        FirstBlockPos, QStringLiteral("anchor"), Value);
+                };
+                if (Accepted != nullptr) {
+                    *Accepted = HandleAnchorChange(_SettingsNoteEdit, OldAnchor,
+                                                   NewAnchor, SetAnchor);
+                }
+            });
     QPushButton* RemoveNoteButton = new QPushButton(tr("Remove Note"), _SettingsNoteGroup);
     RemoveNoteButton->setToolTip(tr("Remove this note from the draft."));
     connect(RemoveNoteButton, &QPushButton::clicked, this, &MainWindow::OnRemoveNote);
@@ -1989,7 +2104,6 @@ MainWindow::MainWindow(QWidget* Parent)
 void MainWindow::SetDocument(const DocDocument& Document, const QString& FilePath)
 {
     _Document = Document;
-    RecordLoadDiagnostic();
     // Bug 502 fix: see OpenDraftFile — the abstract editor is not
     // current for this document until its page is filled.
     _AbstractEditCurrent = false;
@@ -2002,28 +2116,6 @@ void MainWindow::SetDocument(const DocDocument& Document, const QString& FilePat
     UpdateViewButtons();
 }
 
-void MainWindow::RecordLoadDiagnostic()
-{
-    _DiagSyncCount = 0;
-    _DiagSyncLastNodes = 0;
-    xmlNodePtr Front = _Document.FrontNode();
-    _DiagLoadFront = (Front != nullptr);
-    xmlNodePtr Abstract = nullptr;
-    if (Front != nullptr) {
-        Abstract = DocDocument::ChildElement(Front, "abstract");
-    }
-    _DiagLoadAbstract = (Abstract != nullptr);
-    _DiagLoadAbstractChildren = 0;
-    if (Abstract != nullptr) {
-        for (xmlNodePtr Child = Abstract->children; Child != nullptr;
-             Child = Child->next) {
-            if (Child->type == XML_ELEMENT_NODE) {
-                ++_DiagLoadAbstractChildren;
-            }
-        }
-    }
-}
-
 void MainWindow::OpenDraftFile(const QString& Path)
 {
     DocDocument Loaded;
@@ -2034,7 +2126,6 @@ void MainWindow::OpenDraftFile(const QString& Path)
         return;
     }
     _Document = Loaded;
-    RecordLoadDiagnostic();
     // Bug 502 fix: the editors still hold the previous document (or
     // nothing). The abstract editor is not current for this file
     // until its page is filled.
@@ -2956,15 +3047,50 @@ QString MainWindow::OutputFilePath(const QString& Extension) const
 
 void MainWindow::UpdateViewButtons()
 {
-    _TextViewButton->setEnabled(
-        _TextFormatCheck->isChecked() &&
-        QFile::exists(OutputFilePath(QStringLiteral("txt"))));
-    _PdfViewButton->setEnabled(
-        _PdfFormatCheck->isChecked() &&
-        QFile::exists(OutputFilePath(QStringLiteral("pdf"))));
-    _HtmlViewButton->setEnabled(
-        _HtmlFormatCheck->isChecked() &&
-        QFile::exists(OutputFilePath(QStringLiteral("html"))));
+    // Bug 531: a View button is enabled only when its format
+    // is checked, its output exists, and the output is not
+    // older than the XML it was made from. An output older
+    // than the XML is stale and must be remade, so its button
+    // is greyed out until xml2rfc runs again. An output that
+    // does not exist is greyed out too. When the XML has never
+    // been saved there is no time to compare against, so an
+    // existing output is treated as current.
+    QFileInfo XmlInfo(_FilePath);
+    bool XmlExists = XmlInfo.exists();
+    QDateTime XmlTime = XmlInfo.lastModified();
+    auto UpdateOne = [&](QPushButton* Button, const QString& Extension,
+                         bool FormatChecked, const QString& OpenTip) {
+        if (Button == nullptr) {
+            return;
+        }
+        bool Exists = false;
+        bool Stale = false;
+        if (FormatChecked) {
+            QString Path = OutputFilePath(Extension);
+            Exists = !Path.isEmpty() && QFile::exists(Path);
+            if (Exists && XmlExists &&
+                QFileInfo(Path).lastModified() < XmlTime) {
+                Stale = true;
+            }
+        }
+        Button->setEnabled(FormatChecked && Exists && !Stale);
+        if (Stale) {
+            Button->setToolTip(
+                tr("The %1 output is out of date -- run xml2rfc to remake it.")
+                    .arg(Extension));
+        } else {
+            Button->setToolTip(OpenTip);
+        }
+    };
+    UpdateOne(_TextViewButton, QStringLiteral("txt"),
+              _TextFormatCheck->isChecked(),
+              tr("Open the .txt output in Notepad."));
+    UpdateOne(_PdfViewButton, QStringLiteral("pdf"),
+              _PdfFormatCheck->isChecked(),
+              tr("Open the .pdf output in the default PDF viewer."));
+    UpdateOne(_HtmlViewButton, QStringLiteral("html"),
+              _HtmlFormatCheck->isChecked(),
+              tr("Open the .html output in the default browser."));
 }
 
 void MainWindow::ViewOutput(const QString& Extension)
@@ -4859,6 +4985,12 @@ void MainWindow::OnRunFinished(int ExitCode, QProcess::ExitStatus /*ExitStatus*/
     _RunCloseButton->setEnabled(true);
     // A run may have produced the outputs the View buttons open.
     UpdateViewButtons();
+    // Bug 539: xml2rfc leaves a tracker.log in the draft folder
+    // on Windows (its debug module falls back to a file log
+    // when syslog is missing). Nothing reads it, so remove it
+    // after every run; a no-op when the file is not there.
+    QFile::remove(QDir(QFileInfo(_FilePath).absolutePath())
+                      .filePath(QStringLiteral("tracker.log")));
     if (_RunFailed) {
         return;
     }
@@ -5028,10 +5160,6 @@ void MainWindow::OnRemoveNote()
 void MainWindow::OnAbstractEdited()
 {
     QVector<xmlNodePtr> Nodes = _AbstractEdit->BodyNodes();
-    // Bug 502 diagnostic: how many times the abstract editor has
-    // synced since load, and how many nodes the last sync carried.
-    ++_DiagSyncCount;
-    _DiagSyncLastNodes = Nodes.size();
     // Bug 502 fix: ignore a sync from an editor that has not been
     // filled for the current document. A stale editor (empty, or
     // holding a previous document's text) must not overwrite the
@@ -5732,29 +5860,15 @@ void MainWindow::ShowDetailsFor(QTreeWidgetItem* Item)
         QVector<DocPreservedItem> Preserved = _Document.AbstractPreservedNodes();
         _AbstractEdit->SetPreservedNodes(Preserved);
         int Blocks = Preserved.size();
-        // Bug 502 diagnostic: load-time counts plus fill-time counts.
-        QString Diag = tr("Diag (Bug 502): on load, front %1, abstract %2, "
-                          "%3 element children; on this page, body %4, "
-                          "preserved %5, editor blocks %6; syncs since load "
-                          "%7, last sync nodes %8.")
-            .arg(_DiagLoadFront ? tr("yes") : tr("no"))
-            .arg(_DiagLoadAbstract ? tr("yes") : tr("no"))
-            .arg(_DiagLoadAbstractChildren)
-            .arg(_Document.AbstractBodyNodes().size())
-            .arg(Blocks)
-            .arg(_AbstractEdit->BlockCount())
-            .arg(_DiagSyncCount)
-            .arg(_DiagSyncLastNodes);
         if (Blocks > 0) {
             QString Word = (Blocks == 1) ? tr("block") : tr("blocks");
             _AbstractPreservedLabel->setText(
                 tr("The abstract also holds %1 preserved %2, kept when you "
-                   "save and shown in the XML tab.").arg(Blocks).arg(Word) +
-                QStringLiteral("\n") + Diag);
+                   "save and shown in the XML tab.").arg(Blocks).arg(Word));
+            _AbstractPreservedLabel->show();
         } else {
-            _AbstractPreservedLabel->setText(Diag);
+            _AbstractPreservedLabel->hide();
         }
-        _AbstractPreservedLabel->show();
         _Details->setCurrentIndex(DetailAbstract);
         break;
     }

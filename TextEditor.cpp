@@ -12,6 +12,7 @@
 #include "TextEditor.h"
 
 #include "BibCache.h"
+#include "FigureEditor.h"
 #include "SpellChecker.h"
 #include "SpellHighlighter.h"
 
@@ -257,6 +258,20 @@ const int DocOptionMarkerProperty = QTextFormat::UserProperty + 18;
  * block properties, never here.
  */
 const int DocSrcPlaceholderProperty = QTextFormat::UserProperty + 19;
+
+/**
+ * @brief Block-format property holding a list item's attributes.
+ *
+ * The value is the <li>, <dt>, or <dd> element's attributes in
+ * file order. The list element's own attributes ride on
+ * DocListProperty; an item's attributes ride here, so a <dt>
+ * anchor (Bug 504) survives the display and read-back: the
+ * list machinery rebuilds each item element with its own
+ * attributes. The property is absent when the item carries
+ * no attributes. It never groups blocks: the read-back walk
+ * groups by the list's attributes, not by the item's.
+ */
+const int DocListItemProperty = QTextFormat::UserProperty + 20;
 
 /**
  * @brief True when a block is one line of a sourcecode element.
@@ -2347,14 +2362,35 @@ static void BuildNodeRuns(const QVector<DocEvent>& Events, int& Pos,
             // The marker text is the literal delimiters plus
             // the content; the delimiters come off, and what is
             // left is the comment, exactly as typed (Bug 441).
-            QString Content = Event.Text;
-            if (Content.startsWith(QStringLiteral("<!--"))) {
-                Content.remove(0, 4);
+            // But text typed after a comment takes the
+            // comment's format, so it arrives here as a
+            // comment marker even though it is not one. Split
+            // the text at each comment: a segment that is a
+            // whole comment (<!--...-->) becomes a comment
+            // node, and any other text becomes plain text.
+            // (Bug 540.)
+            QString Text = Event.Text;
+            int At = 0;
+            while (At < Text.size()) {
+                int Start = Text.indexOf(QStringLiteral("<!--"), At);
+                if (Start < 0) {
+                    AddTextChild(Parent, Text.mid(At));
+                    break;
+                }
+                if (Start > At) {
+                    AddTextChild(Parent, Text.mid(At, Start - At));
+                }
+                int End = Text.indexOf(QStringLiteral("-->"), Start + 4);
+                if (End < 0) {
+                    // An unterminated "<!--": plain text, not
+                    // a comment.
+                    AddTextChild(Parent, Text.mid(Start));
+                    break;
+                }
+                xmlAddChild(Parent, NewCommentNode(
+                    Text.mid(Start + 4, End - (Start + 4))));
+                At = End + 3;
             }
-            if (Content.endsWith(QStringLiteral("-->"))) {
-                Content.chop(3);
-            }
-            xmlAddChild(Parent, NewCommentNode(Content));
             continue;
         }
         QByteArray Name = Event.Tag.Name.toUtf8();
@@ -2935,8 +2971,34 @@ static void SetListProperties(QTextCursor& Cursor, const QString& Kind,
     } else {
         Format.setProperty(DocListRoleProperty, Role);
     }
+    // A block newly given list properties carries no item
+    // attributes: a new list item (Enter, or turning
+    // paragraphs into a list) must not inherit the anchor of
+    // the item it came from. InsertListNode sets the item's
+    // own attributes right after this, and ApplyListAttributes
+    // restores them around this call.
+    Format.clearProperty(DocListItemProperty);
     // List blocks sit tight: no paragraph spacing.
     Format.setBottomMargin(0);
+    Cursor.setBlockFormat(Format);
+}
+
+/**
+ * @brief Sets a list block's item attributes (Bug 504).
+ * @param Cursor The cursor in the block.
+ * @param Attributes The <li>, <dt>, or <dd> element's attributes.
+ */
+static void SetListItemAttributes(
+    QTextCursor& Cursor,
+    const QVector<QPair<QString, QString>>& Attributes)
+{
+    QTextBlockFormat Format = Cursor.blockFormat();
+    if (Attributes.isEmpty()) {
+        Format.clearProperty(DocListItemProperty);
+    } else {
+        Format.setProperty(DocListItemProperty,
+                           AttributesToVariant(Attributes));
+    }
     Cursor.setBlockFormat(Format);
 }
 
@@ -4253,6 +4315,12 @@ struct DocListItem
 {
     xmlNodePtr ItemNode = nullptr;
     bool Continuation = false;
+    /**
+     * The <li>, <dt>, or <dd> element's attributes (its anchor,
+     * for a tag-list term). The list element's own attributes
+     * ride on the block separately; these are the item's own.
+     */
+    QVector<QPair<QString, QString>> Attributes;
 };
 
 /**
@@ -4282,6 +4350,12 @@ struct DocListBuildItem
 {
     xmlNodePtr TNode = nullptr;
     bool Continuation = false;
+    /**
+     * The <li>, <dt>, or <dd> element's attributes, read from
+     * the block's item property. BuildListNode writes them back
+     * onto the rebuilt item element.
+     */
+    QVector<QPair<QString, QString>> Attributes;
 };
 
 /**
@@ -4479,6 +4553,9 @@ static xmlNodePtr BuildListNode(
             }
             xmlNodePtr Term = AddElementChild(List, "dt");
             if (Unit.Head >= 0) {
+                // The term's own attributes (its anchor, for a
+                // tag-list term) ride back onto the <dt>.
+                SetNodeAttributes(Term, Items[Unit.Head].Attributes);
                 xmlNodePtr TNode = Items[Unit.Head].TNode;
                 for (xmlNodePtr Child = TNode->children;
                      Child != nullptr;) {
@@ -4491,6 +4568,10 @@ static xmlNodePtr BuildListNode(
                 Items[Unit.Head].TNode = nullptr;
             }
             xmlNodePtr Definition = AddElementChild(List, "dd");
+            if (!Unit.More.isEmpty()) {
+                SetNodeAttributes(Definition,
+                                  Items[Unit.More.first()].Attributes);
+            }
             AppendUnitParagraphs(Definition, Unit.More);
         }
     } else {
@@ -4503,6 +4584,11 @@ static xmlNodePtr BuildListNode(
             QVector<int> Indices;
             if (Unit.Head >= 0) {
                 Indices.append(Unit.Head);
+                SetNodeAttributes(ItemElement,
+                                  Items[Unit.Head].Attributes);
+            } else if (!Unit.More.isEmpty()) {
+                SetNodeAttributes(ItemElement,
+                                  Items[Unit.More.first()].Attributes);
             }
             Indices.append(Unit.More);
             AppendUnitParagraphs(ItemElement, Indices);
@@ -4571,6 +4657,11 @@ static void InsertListNode(QTextCursor& Cursor, xmlNodePtr ListNode)
         }
         bool HasT = false;
         bool FirstT = true;
+        // The item element's own attributes (a <dt> anchor, for
+        // example) ride on every block of the item, so the
+        // read-back writes them back onto the rebuilt element.
+        QVector<QPair<QString, QString>> ItemAttributes =
+            NodeAttributes(Child);
         for (xmlNodePtr Part = Child->children; Part != nullptr;
              Part = Part->next) {
             if (Part->type == XML_ELEMENT_NODE &&
@@ -4582,6 +4673,7 @@ static void InsertListNode(QTextCursor& Cursor, xmlNodePtr ListNode)
                 // <li> or <dt>, the first <t> starts the item
                 // and later ones continue it.
                 Item.Continuation = IsDefinition || !FirstT;
+                Item.Attributes = ItemAttributes;
                 FirstT = false;
                 Items.append(Item);
             }
@@ -4590,6 +4682,7 @@ static void InsertListNode(QTextCursor& Cursor, xmlNodePtr ListNode)
             DocListItem Item;
             Item.ItemNode = Child;
             Item.Continuation = IsDefinition;
+            Item.Attributes = ItemAttributes;
             Items.append(Item);
         }
     }
@@ -4626,6 +4719,7 @@ static void InsertListNode(QTextCursor& Cursor, xmlNodePtr ListNode)
                                      : QStringLiteral("item");
         }
         SetListProperties(Cursor, Kind, Group, Attributes, Role);
+        SetListItemAttributes(Cursor, Item.Attributes);
         if (IsContinuationRole(Role)) {
             QTextBlockFormat Indented = Cursor.blockFormat();
             Indented.setIndent(1);
@@ -7615,12 +7709,6 @@ TextEditor::TextEditor(QWidget* Parent)
     , _ShowMarkersCheck(nullptr)
     , _BlockKind()
     , _SettingParagraphs(false)
-    , _DiagMarkersShown(false)
-    , _DiagMarkersBlocks(0)
-    , _DiagMarkersSourceFirst(0)
-    , _DiagMarkersListFirst(0)
-    , _DiagMarkersGearsInserted(0)
-    , _DiagMarkersGearsRemoved(0)
     , _SrcPlaceholderHintBlock(-1)
     , _LinkReadOnlyHintPos(-1)
     , _IrefReadOnlyHintPos(-1)
@@ -7710,9 +7798,11 @@ TextEditor::TextEditor(QWidget* Parent)
     // picks the kind of block, its label names the picked kind,
     // and pressing the button again stops the block. Until a
     // kind is picked, pressing the button opens the menu: it
-    // has no default (Bug 444). The menu holds ASCII art, a
-    // figure, and source code, plus the Comment insert, which is
-    // a one-shot action rather than a block kind.
+    // has no default (Bug 444). The menu holds a figure and
+    // source code, plus the Comment insert, which is a one-shot
+    // action rather than a block kind. A bare ASCII-art block
+    // is no longer offered: a figure with no caption renders
+    // the same, and the figure is the one way to add ASCII art.
     _BlocksButton = new QToolButton(this);
     _BlocksButton->setText(tr("Blocks"));
     _BlocksButton->setCheckable(true);
@@ -7720,11 +7810,6 @@ TextEditor::TextEditor(QWidget* Parent)
     _BlocksButton->setToolTip(
         tr("Start or stop a block; the menu picks which kind of block."));
     QMenu* BlockMenu = new QMenu(this);
-    QAction* ArtworkAction = BlockMenu->addAction(tr("ASCII art"));
-    connect(ArtworkAction, &QAction::triggered, this, [this]() {
-        _BlockKind = QStringLiteral("artwork");
-        ToggleArtwork();
-    });
     QAction* CommentAction = BlockMenu->addAction(tr("Comment"));
     connect(CommentAction, &QAction::triggered, this,
             &TextEditor::InsertComment);
@@ -7936,6 +8021,30 @@ QString TextEditor::ResolvedXrefTip(const QTextCursor& At,
         return Text;
     }
     return Fallback;
+}
+
+/**
+ * @brief True when the cursor sits inside a comment in its
+ *        block (Bug 540).
+ *
+ * The cursor is inside a comment when the block text before
+ * it holds an unmatched "<!--": an opener with no closer
+ * between it and the cursor. After a complete comment, or in
+ * an empty block, it is not inside one, so text typed there
+ * must not take the comment's format.
+ * @param Block The block.
+ * @param Position The cursor position, in the document.
+ * @return True when the cursor is inside a comment.
+ */
+static bool CursorInsideComment(const QTextBlock& Block, int Position)
+{
+    QString Before = Block.text().left(Position - Block.position());
+    int Open = Before.lastIndexOf(QStringLiteral("<!--"));
+    if (Open < 0) {
+        return false;
+    }
+    int Close = Before.indexOf(QStringLiteral("-->"), Open + 4);
+    return Close < 0;
 }
 
 bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
@@ -8195,6 +8304,23 @@ bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
                     : FormatForStack(StackOf(CharFormat));
             Cursor.setCharFormat(Fixed);
             _TextEdit->setTextCursor(Cursor);
+            CharFormat = Cursor.charFormat();
+        }
+        // Bug 540: typing beside a comment must not take the
+        // comment's format, or the typed text shows in italics
+        // as if it were a comment. The cursor inside a comment
+        // keeps the format -- it is editing the comment -- but
+        // after a complete comment, or in an empty block that
+        // inherited the format, the typed text is plain.
+        QVariant MarkerValue = CharFormat.property(DocMarkerProperty);
+        if (MarkerValue.isValid()) {
+            DocTagEntry Marker = EntryFromVariant(MarkerValue);
+            if (Marker.Name == QLatin1String("comment") &&
+                !CursorInsideComment(Block, Cursor.position())) {
+                QTextCharFormat Fixed = FormatForStack(StackOf(CharFormat));
+                Cursor.setCharFormat(Fixed);
+                _TextEdit->setTextCursor(Cursor);
+            }
         }
         // Bug 514: typing over a selection that sits entirely
         // inside one link must keep the link. The default insert
@@ -8322,6 +8448,18 @@ bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
             // new block is taken out of any list it inherited,
             // or Qt would draw a marker on it and eat a later
             // Enter on the empty line.
+            // Bug 537: Enter on an empty artwork line that is
+            // the last block of the figure exits the figure
+            // instead, so the author can type a plain paragraph
+            // after it. The figure button now opens the editor
+            // (Bug 535), so Enter on the empty last line is
+            // the way out of a figure.
+            if (IsFigureArtworkBlock(Block) &&
+                Block.text().trimmed().isEmpty() &&
+                Block == FigureRegionBlocks(Block).last()) {
+                StopFigure();
+                return true;
+            }
             Cursor.beginEditBlock();
             Cursor.insertBlock();
             if (QTextList* List = Cursor.currentList()) {
@@ -8714,12 +8852,21 @@ void TextEditor::SetBodyNodes(const QVector<xmlNodePtr>& Nodes)
             }
         } else if (Node->type == XML_COMMENT_NODE) {
             // A comment body node shows as its marker text,
-            // as a comment run inside a paragraph does.
+            // as a comment run inside a paragraph does. The
+            // text carries the comment marker, so the
+            // read-back turns it back into a comment node
+            // (Bug 504: the figure-tags grouping comments
+            // must survive a save and reload). Plain text
+            // would read back as a paragraph holding the
+            // literal delimiters instead.
             QString CommentText = QString::fromUtf8(
                 reinterpret_cast<const char*>(Node->content));
             CommentText.replace(QLatin1Char('\n'), QLatin1Char(' '));
+            DocTagEntry Marker;
+            Marker.Name = QStringLiteral("comment");
             Cursor.insertText(QStringLiteral("<!--") + CommentText +
-                              QStringLiteral("-->"));
+                                  QStringLiteral("-->"),
+                              FormatForMarker(DocTagStack(), Marker));
         } else {
             InsertNodeRuns(Cursor, Node);
         }
@@ -8971,6 +9118,44 @@ QVector<xmlNodePtr> TextEditor::BodyNodes() const
                 DocDocument::SetNodeText(
                     Versions[Visible], Lines.join(QLatin1Char('\n')));
             }
+            // Bug 534: an ascii-art artwork with no text is
+            // invalid, and xml2rfc rejects the whole file over
+            // it, so drop empty versions here. An artwork with
+            // element children (an SVG) or a src attribute is
+            // not empty: its content lives in the elements or
+            // in another file. A figure left with no artwork
+            // versions is not a figure at all: drop it too, so
+            // a cancelled insert or a bare artwork typed into
+            // nothing leaves nothing behind.
+            bool IsBareArtwork =
+                DocDocument::NodeNameEquals(FigureNode, "artwork");
+            bool DroppedBareArtwork = false;
+            for (xmlNodePtr Version : Versions) {
+                if (ArtworkNodeIsSvg(Version) ||
+                    DocDocument::HasNodeAttribute(Version, "src")) {
+                    continue;
+                }
+                QString Type =
+                    DocDocument::NodeAttribute(Version, "type");
+                if (!Type.isEmpty() &&
+                    Type != QLatin1String("ascii-art")) {
+                    continue;
+                }
+                if (DocDocument::NodeText(Version).trimmed().isEmpty()) {
+                    xmlUnlinkNode(Version);
+                    xmlFreeNode(Version);
+                    if (IsBareArtwork) {
+                        DroppedBareArtwork = true;
+                    }
+                }
+            }
+            if (DroppedBareArtwork) {
+                continue;
+            }
+            if (FigureVersionNodes(FigureNode).isEmpty()) {
+                xmlFreeNode(FigureNode);
+                continue;
+            }
             Nodes.append(FigureNode);
             continue;
         }
@@ -9077,6 +9262,8 @@ QVector<xmlNodePtr> TextEditor::BodyNodes() const
                     DocListBuildItem Item;
                     Item.TNode = NodeFromBlock(Block);
                     Item.Continuation = false;
+                    Item.Attributes = AttributesFromVariant(
+                        Format.property(DocListItemProperty));
                     Items.append(Item);
                     Block = Block.next();
                     continue;
@@ -9100,6 +9287,8 @@ QVector<xmlNodePtr> TextEditor::BodyNodes() const
             DocListBuildItem Item;
             Item.TNode = NodeFromBlock(Block);
             Item.Continuation = IsContinuationRole(ListRoleOf(Block));
+            Item.Attributes = AttributesFromVariant(
+                Format.property(DocListItemProperty));
             Items.append(Item);
             Block = Block.next();
         }
@@ -9159,19 +9348,6 @@ int TextEditor::BlockCount() const
         return 0;
     }
     return _TextEdit->document()->blockCount();
-}
-
-QString TextEditor::MarkerSweepReport() const
-{
-    return tr("Markers: setting %1, blocks scanned %2, first source "
-              "blocks %3, gears inserted %4, gears removed %5, first "
-              "list blocks %6.")
-        .arg(_DiagMarkersShown ? tr("on") : tr("off"))
-        .arg(_DiagMarkersBlocks)
-        .arg(_DiagMarkersSourceFirst)
-        .arg(_DiagMarkersGearsInserted)
-        .arg(_DiagMarkersGearsRemoved)
-        .arg(_DiagMarkersListFirst);
 }
 
 void TextEditor::OnTextDocumentChanged()
@@ -9234,17 +9410,72 @@ void TextEditor::OnXmlTextChanged()
     }
 }
 
+/**
+ * @brief True when a block holds text other than gear characters.
+ *
+ * The gear itself is not content: a block whose only text is a
+ * gear (and whitespace) is empty for options purposes.
+ * @param Block The block.
+ * @return True when the block holds non-gear text.
+ */
+static bool BlockHasNonGearText(const QTextBlock& Block)
+{
+    QString Text = Block.text();
+    Text.remove(OptionGlyph);
+    return !Text.trimmed().isEmpty();
+}
+
+/**
+ * @brief True when any block of a list or sourcecode element
+ * holds non-gear text (Bug 536).
+ *
+ * A block whose list or sourcecode was deleted out from under
+ * it keeps stale properties, so it still looks like a first
+ * list or source block -- but its element is gone, and it must
+ * not carry a gear. An element with content anywhere keeps its
+ * gear; a lone empty block, and an element whose every block
+ * is empty, do not.
+ * @param Block A block of the element.
+ * @param Source True for a sourcecode element, false for a list.
+ * @return True when the element holds non-gear text.
+ */
+static bool ElementHasContent(const QTextBlock& Block, bool Source)
+{
+    if (Source) {
+        QTextBlock First = FirstBlockOfSourceElement(Block);
+        QVariant Attrs =
+            First.blockFormat().property(DocSourceProperty);
+        for (QTextBlock At = First; At.isValid(); At = At.next()) {
+            if (!IsSourceCodeBlock(At) ||
+                At.blockFormat().property(DocSourceProperty) != Attrs) {
+                break;
+            }
+            if (BlockHasNonGearText(At)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    QTextBlock First = FirstListBlock(Block);
+    for (QTextBlock At = First; At.isValid(); At = At.next()) {
+        while (At.isValid() && IsBlankPlainBlock(At)) {
+            At = At.next();
+        }
+        if (!At.isValid() || !IsListBlock(At) ||
+            !SameListAs(First, At)) {
+            break;
+        }
+        if (BlockHasNonGearText(At)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void TextEditor::UpdateOptionMarkers()
 {
     QTextDocument* Document = _TextEdit->document();
     bool Shown = OptionMarkersShown();
-    // Bug 502 diagnostic: counts for the sweep report.
-    _DiagMarkersShown = Shown;
-    _DiagMarkersBlocks = 0;
-    _DiagMarkersSourceFirst = 0;
-    _DiagMarkersListFirst = 0;
-    _DiagMarkersGearsInserted = 0;
-    _DiagMarkersGearsRemoved = 0;
     // The sweep's own edits must not re-enter the change
     // handler, which would sweep again mid-walk.
     QSignalBlocker Blocker(_TextEdit);
@@ -9278,6 +9509,21 @@ void TextEditor::UpdateOptionMarkers()
             // "list", "ul", "ol", and "dl" all carry options.
             FirstList = true;
         }
+        // Bug 536: a block whose list or sourcecode was deleted
+        // out from under it keeps stale properties, so it still
+        // looks like a first list or source block -- but its
+        // element is gone, and it must not carry a gear. An
+        // element with content anywhere keeps its gear; a lone
+        // empty block, and an element whose every block is
+        // empty, do not. A figure block gets no gear here at
+        // all (it is not a source, list, or table block), so
+        // its orphaned gear is removed by the sweep below.
+        if (FirstSource && !ElementHasContent(Block, true)) {
+            FirstSource = false;
+        }
+        if (FirstList && !ElementHasContent(Block, false)) {
+            FirstList = false;
+        }
         if (FirstSource) {
             Attributes = AttributesFromVariant(
                 Block.blockFormat().property(DocSourceProperty));
@@ -9296,13 +9542,6 @@ void TextEditor::UpdateOptionMarkers()
             WantedGears = TableGearsForBlock(Document, Block);
         }
         bool First = !WantedGears.isEmpty();
-        ++_DiagMarkersBlocks;
-        if (FirstSource) {
-            ++_DiagMarkersSourceFirst;
-        }
-        if (FirstList) {
-            ++_DiagMarkersListFirst;
-        }
         bool ShowGear = Shown && First;
         int WantedCount = ShowGear ? WantedGears.size() : 0;
         // The gears already in the block, with their kinds.
@@ -9362,7 +9601,6 @@ void TextEditor::UpdateOptionMarkers()
                 Sweep.setPosition(Found[i].Pos + 1,
                                   QTextCursor::KeepAnchor);
                 Sweep.removeSelectedText();
-                ++_DiagMarkersGearsRemoved;
                 if (CursorPos > Found[i].Pos) {
                     --CursorPos;
                 }
@@ -9376,7 +9614,6 @@ void TextEditor::UpdateOptionMarkers()
                 Sweep.setPosition(Pos);
                 Sweep.insertText(QString(OptionGlyph),
                                  FormatForGear(WantedGears[i]));
-                ++_DiagMarkersGearsInserted;
                 if (CursorPos > Pos) {
                     ++CursorPos;
                 }
@@ -9564,10 +9801,6 @@ void TextEditor::OnShowMarkersToggled(bool Checked)
     _SettingParagraphs = true;
     UpdateOptionMarkers();
     _SettingParagraphs = false;
-    // Bug 502 diagnostic: report the sweep that just ran, so the
-    // counts are visible without any other step.
-    QMessageBox::information(this, tr("Option markers"),
-                             MarkerSweepReport());
 }
 
 void TextEditor::OnContextMenuRequested(const QPoint& Pos)
@@ -9582,6 +9815,7 @@ void TextEditor::OnContextMenuRequested(const QPoint& Pos)
     AddSourceOptionsActions(Menu, At);
     AddListOptionsActions(Menu, At);
     AddTableOptionsActions(Menu, At);
+    AddFigureOptionsActions(Menu, At);
     AddTagActions(Menu);
     AddReferenceActions(Menu);
     AddRenameLinkAction(Menu, At);
@@ -10214,14 +10448,15 @@ void TextEditor::AddTagActions(QMenu* Menu)
     bool InTable = TouchesTable(_TextEdit->document(), Cursor);
     bool InTableCaption = TouchesTableCaption(_TextEdit->document(), Cursor);
 
-    // Bug 524: the block-level inserts (ASCII art, figures, source
-    // code, tables) share one alphabetical list with the tags, so
-    // ASCII art sorts before BCP 14 instead of after Vertical
-    // Space. They are added at their alphabetical points in the
-    // tag loop below: ASCII art before the first tag, Figure
-    // before Index Entry, Source code before Strong, Table before
-    // Teletype. The enablement matches the old block after the
-    // loop: offered wherever the cursor sits, but never where it
+    // Bug 524: the block-level inserts (figures, source code,
+    // tables) share one alphabetical list with the tags. They
+    // are added at their alphabetical points in the tag loop
+    // below: Figure before Index Entry, Source code before
+    // Strong, Table before Teletype. A bare ASCII-art insert
+    // is no longer offered: a figure with no caption renders
+    // the same, and the figure is the one way to add ASCII art.
+    // The enablement matches the old block after the loop:
+    // offered wherever the cursor sits, but never where it
     // already touches a list, a sourcecode block, a figure, or a
     // table.
     bool CanInsertBlock = ListKinds.isEmpty() && !InSource && !InFigure &&
@@ -10232,7 +10467,6 @@ void TextEditor::AddTagActions(QMenu* Menu)
         Action->setEnabled(CanInsertBlock);
         connect(Action, &QAction::triggered, this, Slot);
     };
-    AddInsertAction(tr("ASCII art"), &TextEditor::InsertArtwork);
 
     for (const DocTagInfo& Info : TagInfos) {
         QString Name = QString::fromLatin1(Info.Name);
@@ -11938,11 +12172,21 @@ void TextEditor::ApplyListAttributes(
         }
         // Each block keeps its own role: an item stays an
         // item, a term stays a term, a continuation stays a
-        // continuation.
+        // continuation. Each block also keeps its own item
+        // attributes (a <dt> anchor): SetListProperties clears
+        // them, since a new item must not inherit one, so they
+        // are restored around it here.
         QString Role = ListRoleOf(Target);
+        QVariant ItemAttributes = Target.blockFormat().property(
+            DocListItemProperty);
         Cursor.setPosition(Target.position());
         SetListProperties(Cursor, Kind, GroupValue.toInt(), Attributes,
                           Role);
+        if (ItemAttributes.isValid()) {
+            QTextBlockFormat Format = Cursor.blockFormat();
+            Format.setProperty(DocListItemProperty, ItemAttributes);
+            Cursor.setBlockFormat(Format);
+        }
     }
     // A style change re-labels the list: numbers become
     // numbers, letters become letters, the rest show bullets.
@@ -13549,6 +13793,13 @@ void TextEditor::InsertFigure()
 {
     QTextCursor Cursor = _TextEdit->textCursor();
     QTextDocument* Document = _TextEdit->document();
+    // Bug 535: never nest a figure inside a figure or artwork.
+    // Edit the figure the cursor is in instead, so no press
+    // leaves a nested empty figure behind with no pop-up.
+    if (TouchesFigure(Document, Cursor)) {
+        EditFigure();
+        return;
+    }
     Cursor.beginEditBlock();
     QVector<QTextBlock> Touched;
     if (Cursor.hasSelection()) {
@@ -13609,6 +13860,870 @@ void TextEditor::InsertFigure()
     At.setCharFormat(CaptionTyping);
     _TextEdit->setTextCursor(At);
     UpdateBlockButtons();
+    // Bug 504: a new figure opens straight into the figures
+    // editor, so its artwork can be drawn and its tag list
+    // filled in. Cancelling the dialog leaves the skeleton
+    // above, which the figure can be edited from later.
+    EditFigure();
+}
+
+// ---------------------------------------------------------------------------
+// The figures editor (Bug 504)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief The anchor slug from a figure caption.
+ *
+ * Lowercase, with runs of non-alphanumerics as one hyphen and
+ * no leading or trailing hyphen. An empty caption gives
+ * "figure". (Mirrors MainWindow::SlugAnchor, which defaults
+ * to "section".)
+ * @param Caption The caption.
+ * @return The slug.
+ */
+static QString FigureSlugAnchor(const QString& Caption)
+{
+    QString Slug = Caption.trimmed().toLower();
+    Slug.replace(QRegularExpression(QStringLiteral("[^a-z0-9]+")),
+                 QStringLiteral("-"));
+    while (Slug.startsWith(QLatin1Char('-'))) {
+        Slug.remove(0, 1);
+    }
+    while (Slug.endsWith(QLatin1Char('-'))) {
+        Slug.chop(1);
+    }
+    if (Slug.isEmpty()) {
+        Slug = QStringLiteral("figure");
+    }
+    return Slug;
+}
+
+/**
+ * @brief The comment content of a node, when it is one.
+ *
+ * A grouping comment reaches here as a bare comment node, or
+ * as a <t> holding only that comment: the read-back wraps a
+ * comment paragraph in a <t>, and the writer unwraps a
+ * comments-only <t> back into a bare comment, so both forms
+ * mean the same comment.
+ * @param Node The node; borrowed.
+ * @return The comment content, or empty when the node is not
+ *         a lone comment.
+ */
+static QString CommentTextOfNode(xmlNodePtr Node)
+{
+    if (Node == nullptr) {
+        return QString();
+    }
+    if (Node->type == XML_COMMENT_NODE) {
+        return DocDocument::NodeText(Node);
+    }
+    if (Node->type != XML_ELEMENT_NODE ||
+        !DocDocument::NodeNameEquals(Node, "t")) {
+        return QString();
+    }
+    xmlNodePtr Found = nullptr;
+    for (xmlNodePtr Child = Node->children; Child != nullptr;
+         Child = Child->next) {
+        if (Child->type == XML_TEXT_NODE) {
+            if (!DocDocument::NodeText(Child).trimmed().isEmpty()) {
+                return QString();
+            }
+            continue;
+        }
+        if (Child->type == XML_COMMENT_NODE) {
+            if (Found != nullptr) {
+                return QString();
+            }
+            Found = Child;
+            continue;
+        }
+        return QString();
+    }
+    if (Found == nullptr) {
+        return QString();
+    }
+    return DocDocument::NodeText(Found);
+}
+
+/**
+ * @brief The content of a figure-tags grouping comment.
+ * @param Kind "start", "middle", or "end".
+ * @param Anchor The figure's anchor.
+ * @return e.g. "figure-tags-start: my-figure".
+ */
+static QString FigureTagsCommentText(const QString& Kind,
+                                     const QString& Anchor)
+{
+    return QStringLiteral("figure-tags-") + Kind +
+           QStringLiteral(": ") + Anchor;
+}
+
+/**
+ * @brief True when a node is a figure-tags grouping comment.
+ * @param Node The node; borrowed.
+ * @param Kind "start", "middle", or "end".
+ * @param Anchor The figure's anchor.
+ * @return True when the node is that comment.
+ */
+static bool IsFigureTagsComment(xmlNodePtr Node, const QString& Kind,
+                                const QString& Anchor)
+{
+    return CommentTextOfNode(Node) == FigureTagsCommentText(Kind, Anchor);
+}
+
+/**
+ * @brief The index of a figure region among the document's
+ *        figure regions.
+ * @param Document The text document.
+ * @param Block A block of the region.
+ * @return The 0-based index, or -1 when the block is not a
+ *         figure block.
+ */
+static int FigureRegionIndex(QTextDocument* Document,
+                             const QTextBlock& Block)
+{
+    if (!IsFigureBlock(Block)) {
+        return -1;
+    }
+    QVector<QTextBlock> Region = FigureRegionBlocks(Block);
+    if (Region.isEmpty()) {
+        return -1;
+    }
+    QTextBlock First = Region.first();
+    int Index = 0;
+    QTextBlock At = Document->begin();
+    while (At.isValid() && At.position() < First.position()) {
+        if (IsFigureBlock(At)) {
+            QVector<QTextBlock> Found = FigureRegionBlocks(At);
+            if (Found.isEmpty()) {
+                At = At.next();
+                continue;
+            }
+            ++Index;
+            At = Found.last().next();
+        } else {
+            At = At.next();
+        }
+    }
+    return Index;
+}
+
+/**
+ * @brief The tag rows of a tag-list <dl> node.
+ * @param Dl The <dl> node; borrowed.
+ * @return The rows, in order.
+ */
+static QVector<FigureTagRow> TagRowsFromDl(xmlNodePtr Dl)
+{
+    QVector<FigureTagRow> Rows;
+    if (Dl == nullptr) {
+        return Rows;
+    }
+    xmlNodePtr Dt = nullptr;
+    for (xmlNodePtr Child = Dl->children; Child != nullptr;
+         Child = Child->next) {
+        if (Child->type != XML_ELEMENT_NODE) {
+            continue;
+        }
+        if (DocDocument::NodeNameEquals(Child, "dt")) {
+            Dt = Child;
+        } else if (DocDocument::NodeNameEquals(Child, "dd") &&
+                   Dt != nullptr) {
+            FigureTagRow Row;
+            Row.Tag = DocDocument::NodeText(Dt).trimmed();
+            Row.Description = DocDocument::NodeText(Child).trimmed();
+            Row.Anchor = DocDocument::NodeAttribute(Dt, "anchor");
+            Rows.append(Row);
+            Dt = nullptr;
+        }
+    }
+    return Rows;
+}
+
+/**
+ * @brief Builds a tag-list <dl> node from rows.
+ *
+ * An empty tag or description is written as a space, so the
+ * <dl> still converts: a wholly empty <dt> or <dd> would
+ * leave the list with no paragraph to convert.
+ * @param Rows The rows.
+ * @return The node; the caller owns it.
+ */
+static xmlNodePtr BuildTagDl(const QVector<FigureTagRow>& Rows)
+{
+    xmlNodePtr Dl = NewNode("dl");
+    for (const FigureTagRow& Row : Rows) {
+        xmlNodePtr Dt = AddElementChild(Dl, "dt");
+        if (!Row.Anchor.isEmpty()) {
+            DocDocument::SetNodeAttribute(Dt, "anchor", Row.Anchor);
+        }
+        AddTextChild(Dt, Row.Tag.isEmpty() ? QStringLiteral(" ")
+                                           : Row.Tag);
+        xmlNodePtr Dd = AddElementChild(Dl, "dd");
+        AddTextChild(Dd, Row.Description.isEmpty()
+                             ? QStringLiteral(" ")
+                             : Row.Description);
+    }
+    return Dl;
+}
+
+void TextEditor::EditFigure()
+{
+    QTextDocument* Document = _TextEdit->document();
+    QTextCursor Cursor = _TextEdit->textCursor();
+    if (!TouchesFigure(Document, Cursor)) {
+        return;
+    }
+    QTextBlock Block = Cursor.block();
+    QVector<QTextBlock> Region = FigureRegionBlocks(Block);
+    if (Region.isEmpty()) {
+        return;
+    }
+    // The figure node and the version showing, from the first
+    // block's payload.
+    xmlNodePtr PayloadNode = nullptr;
+    int Visible = 0;
+    if (!FigurePayloadOf(Region.first(), PayloadNode, Visible)) {
+        return;
+    }
+    // The current artwork text and caption, from the blocks:
+    // the blocks are the on-screen text, and the payload may
+    // be stale when the author has typed in the figure.
+    QStringList ArtLines;
+    QString Caption;
+    for (const QTextBlock& RegionBlock : Region) {
+        if (FigureRoleOf(RegionBlock) == QLatin1String("caption")) {
+            if (!Caption.isEmpty()) {
+                Caption += QLatin1Char(' ');
+            }
+            Caption += RegionBlock.text().trimmed();
+        } else {
+            ArtLines.append(CodeTextOf(RegionBlock));
+        }
+    }
+    QString ArtworkText = ArtLines.join(QLatin1Char('\n'));
+    QString OldAnchor = DocDocument::NodeAttribute(PayloadNode, "anchor");
+    QString SuggestedAnchor =
+        OldAnchor.isEmpty() ? FigureSlugAnchor(Caption) : OldAnchor;
+    int RegionIndex = FigureRegionIndex(Document, Block);
+    // The figure's tag list, from the body nodes: the <dl>
+    // grouped with the figure by its comments.
+    QVector<FigureTagRow> TagRows;
+    {
+        QVector<xmlNodePtr> Nodes = BodyNodes();
+        int FigurePos = -1;
+        int Seen = 0;
+        for (int i = 0; i < Nodes.size(); ++i) {
+            xmlNodePtr Node = Nodes[i];
+            if (Node->type == XML_ELEMENT_NODE &&
+                (DocDocument::NodeNameEquals(Node, "figure") ||
+                 DocDocument::NodeNameEquals(Node, "artset") ||
+                 DocDocument::NodeNameEquals(Node, "artwork"))) {
+                if (Seen == RegionIndex) {
+                    FigurePos = i;
+                    break;
+                }
+                ++Seen;
+            }
+        }
+        if (FigurePos >= 0 && FigurePos + 2 < Nodes.size() &&
+            IsFigureTagsComment(Nodes[FigurePos + 1], "middle",
+                                OldAnchor) &&
+            Nodes[FigurePos + 2]->type == XML_ELEMENT_NODE &&
+            DocDocument::NodeNameEquals(Nodes[FigurePos + 2], "dl")) {
+            TagRows = TagRowsFromDl(Nodes[FigurePos + 2]);
+        }
+        for (xmlNodePtr Node : Nodes) {
+            xmlFreeNode(Node);
+        }
+    }
+    FigureEditorDialog Dialog(this);
+    Dialog.setArtworkText(ArtworkText);
+    Dialog.setCaption(Caption);
+    Dialog.setAnchor(SuggestedAnchor);
+    Dialog.setTagRows(TagRows);
+    if (Dialog.exec() != QDialog::Accepted) {
+        xmlFreeNode(PayloadNode);
+        return;
+    }
+    QString NewArtwork = Dialog.artworkText();
+    QString NewCaption = Dialog.caption();
+    QString NewAnchor = Dialog.anchor();
+    QVector<FigureTagRow> NewRows = Dialog.tagRows();
+    // A tag list needs an anchor to group by: when the author
+    // cleared the anchor but kept tags, keep the figure's
+    // anchor, or derive one from the caption when it has none.
+    // With no tag rows an empty anchor is fine.
+    if (NewAnchor.isEmpty() && !NewRows.isEmpty()) {
+        NewAnchor = OldAnchor.isEmpty() ? FigureSlugAnchor(NewCaption)
+                                        : OldAnchor;
+    }
+    // The anchor change goes through the owner, so a duplicate
+    // is refused, a cited delete is refused, and the
+    // cross-references move when it changes. A refusal keeps
+    // the old anchor; the dialog's other changes still apply.
+    bool AnchorChanged = false;
+    if (NewAnchor != OldAnchor) {
+        bool Accepted = true;
+        int FirstBlockPos = Region.first().position();
+        emit FigureAnchorChangeRequested(OldAnchor, NewAnchor,
+                                         FirstBlockPos, &Accepted);
+        if (!Accepted) {
+            NewAnchor = OldAnchor;
+        } else {
+            AnchorChanged = true;
+        }
+    }
+    // Re-read the body fresh: the anchor change above may have
+    // reloaded the editor (a cited rename), so anything read
+    // before the dialog is stale. The figure's anchor is now
+    // NewAnchor.
+    QVector<xmlNodePtr> Nodes = BodyNodes();
+    xmlNodePtr FigureInBody = nullptr;
+    int FigurePos = -1;
+    int Seen = 0;
+    for (int i = 0; i < Nodes.size(); ++i) {
+        xmlNodePtr Node = Nodes[i];
+        if (Node->type == XML_ELEMENT_NODE &&
+            (DocDocument::NodeNameEquals(Node, "figure") ||
+             DocDocument::NodeNameEquals(Node, "artset") ||
+             DocDocument::NodeNameEquals(Node, "artwork"))) {
+            if (Seen == RegionIndex) {
+                FigureInBody = Node;
+                FigurePos = i;
+                break;
+            }
+            ++Seen;
+        }
+    }
+    if (FigureInBody == nullptr || FigurePos < 0) {
+        for (xmlNodePtr Node : Nodes) {
+            xmlFreeNode(Node);
+        }
+        xmlFreeNode(PayloadNode);
+        return;
+    }
+    // The version showing: the payload's, unless the anchor
+    // change reloaded the editor, which resets the display to
+    // the first non-SVG version.
+    QVector<xmlNodePtr> Versions = FigureVersionNodes(FigureInBody);
+    int UseVisible = Visible;
+    if (AnchorChanged || UseVisible < 0 ||
+        UseVisible >= Versions.size()) {
+        UseVisible = 0;
+        for (int i = 0; i < Versions.size(); ++i) {
+            if (!ArtworkNodeIsSvg(Versions[i])) {
+                UseVisible = i;
+                break;
+            }
+        }
+    }
+    // Update the figure node: the visible version's text, the
+    // caption (a <figure> only: an artset or bare artwork
+    // carries no <name>), and the anchor.
+    if (UseVisible >= 0 && UseVisible < Versions.size() &&
+        !ArtworkNodeIsSvg(Versions[UseVisible])) {
+        DocDocument::SetNodeText(Versions[UseVisible], NewArtwork);
+    }
+    bool IsFigure = DocDocument::NodeNameEquals(FigureInBody, "figure");
+    xmlNodePtr NameNode =
+        DocDocument::ChildElement(FigureInBody, "name");
+    if (!IsFigure || NewCaption.isEmpty()) {
+        if (NameNode != nullptr && IsFigure) {
+            xmlUnlinkNode(NameNode);
+            xmlFreeNode(NameNode);
+        }
+    } else {
+        if (NameNode == nullptr) {
+            NameNode = NewNode("name");
+            if (FigureInBody->children != nullptr) {
+                xmlAddPrevSibling(FigureInBody->children, NameNode);
+            } else {
+                xmlAddChild(FigureInBody, NameNode);
+            }
+        }
+        DocDocument::SetNodeText(NameNode, NewCaption);
+    }
+    DocDocument::SetNodeAttribute(FigureInBody, "anchor", NewAnchor);
+    // The old tag-list group, by the old anchor: the start
+    // comment before the figure, and the middle comment, the
+    // <dl>, and the end comment after it. A <dl> with no
+    // middle comment is not the figure's tag list and stays.
+    int StartIdx = -1;
+    int MiddleIdx = -1;
+    int DlIdx = -1;
+    int EndIdx = -1;
+    if (FigurePos > 0 &&
+        IsFigureTagsComment(Nodes[FigurePos - 1], "start", OldAnchor)) {
+        StartIdx = FigurePos - 1;
+    }
+    if (FigurePos + 1 < Nodes.size() &&
+        IsFigureTagsComment(Nodes[FigurePos + 1], "middle", OldAnchor)) {
+        MiddleIdx = FigurePos + 1;
+    }
+    if (MiddleIdx >= 0 && MiddleIdx + 1 < Nodes.size() &&
+        Nodes[MiddleIdx + 1]->type == XML_ELEMENT_NODE &&
+        DocDocument::NodeNameEquals(Nodes[MiddleIdx + 1], "dl")) {
+        DlIdx = MiddleIdx + 1;
+    }
+    if (DlIdx >= 0 && DlIdx + 1 < Nodes.size() &&
+        IsFigureTagsComment(Nodes[DlIdx + 1], "end", OldAnchor)) {
+        EndIdx = DlIdx + 1;
+    }
+    // Rebuild the body: the old group goes, the figure stays
+    // (updated), and the new group follows it when there are
+    // tag rows.
+    QVector<xmlNodePtr> NewNodes;
+    for (int i = 0; i < Nodes.size(); ++i) {
+        if (i == StartIdx || i == MiddleIdx || i == DlIdx ||
+            i == EndIdx) {
+            xmlFreeNode(Nodes[i]);
+            continue;
+        }
+        if (i == FigurePos) {
+            if (!NewRows.isEmpty()) {
+                NewNodes.append(NewCommentNode(
+                    FigureTagsCommentText("start", NewAnchor)));
+            }
+            NewNodes.append(Nodes[i]);
+            if (!NewRows.isEmpty()) {
+                NewNodes.append(NewCommentNode(
+                    FigureTagsCommentText("middle", NewAnchor)));
+                NewNodes.append(BuildTagDl(NewRows));
+                NewNodes.append(NewCommentNode(
+                    FigureTagsCommentText("end", NewAnchor)));
+            }
+            continue;
+        }
+        NewNodes.append(Nodes[i]);
+    }
+    SetBodyNodes(NewNodes);
+    for (xmlNodePtr Node : NewNodes) {
+        xmlFreeNode(Node);
+    }
+    xmlFreeNode(PayloadNode);
+    // Bug 538: SetBodyNodes rebuilds the text while
+    // _SettingParagraphs is set, so OnTextDocumentChanged
+    // swallows the change and never emits TextChanged. The
+    // owner only syncs the text pane into the document model
+    // on TextChanged, so without this the edited figure
+    // (caption, artwork, tag list) never reaches the model
+    // and Save writes the old figure. Signal it explicitly.
+    emit TextChanged();
+    // The cursor goes back to the figure, so the author sees
+    // the drawing they just made.
+    QTextBlock At = _TextEdit->document()->begin();
+    while (At.isValid()) {
+        if (IsFigureBlock(At)) {
+            xmlNodePtr Found = nullptr;
+            int FoundVisible = 0;
+            if (FigurePayloadOf(At, Found, FoundVisible) &&
+                DocDocument::NodeAttribute(Found, "anchor") ==
+                    NewAnchor) {
+                xmlFreeNode(Found);
+                QTextCursor To(_TextEdit->document());
+                To.setPosition(At.position());
+                _TextEdit->setTextCursor(To);
+                break;
+            }
+            if (Found != nullptr) {
+                xmlFreeNode(Found);
+            }
+            QVector<QTextBlock> FoundRegion = FigureRegionBlocks(At);
+            At = FoundRegion.isEmpty() ? At.next()
+                                       : FoundRegion.last().next();
+        } else {
+            At = At.next();
+        }
+    }
+    UpdateBlockButtons();
+}
+
+void TextEditor::SetFigureAnchor(int FirstBlockPos, const QString& Value)
+{
+    QTextDocument* Document = _TextEdit->document();
+    QTextBlock Block = Document->findBlock(FirstBlockPos);
+    if (!IsFigureBlock(Block)) {
+        return;
+    }
+    QVector<QTextBlock> Region = FigureRegionBlocks(Block);
+    if (Region.isEmpty()) {
+        return;
+    }
+    xmlNodePtr FigureNode = nullptr;
+    int Visible = 0;
+    if (!FigurePayloadOf(Region.first(), FigureNode, Visible)) {
+        return;
+    }
+    DocDocument::SetNodeAttribute(FigureNode, "anchor", Value);
+    QVariant Payload = FigureToVariant(FigureNode, Visible);
+    xmlFreeNode(FigureNode);
+    QString Kind = FigureKindOf(Region.first());
+    int Group = Region.first().blockFormat()
+                    .property(DocFigureGroupProperty)
+                    .toInt();
+    QTextCursor Cursor(Document);
+    Cursor.beginEditBlock();
+    for (const QTextBlock& RegionBlock : Region) {
+        QString Role = FigureRoleOf(RegionBlock);
+        QTextCursor At(Document);
+        At.setPosition(RegionBlock.position());
+        SetFigureProperties(At, Kind, Group, Role, Payload);
+    }
+    Cursor.endEditBlock();
+}
+
+/**
+ * @brief Sets the <artset> anchor of the figure at a block
+ *        (Bug 445).
+ *
+ * The artset is the <artset> child of a <figure>, or the node
+ * itself when the figure's kind is "artset". With no artset
+ * there is nothing to set. An empty value removes the anchor.
+ * The payload is rewritten into the region blocks, like
+ * SetFigureAnchor, so the model picks it up on sync-back.
+ */
+void TextEditor::SetArtsetAnchor(int FirstBlockPos, const QString& Value)
+{
+    QTextDocument* Document = _TextEdit->document();
+    QTextBlock Block = Document->findBlock(FirstBlockPos);
+    if (!IsFigureBlock(Block)) {
+        return;
+    }
+    QVector<QTextBlock> Region = FigureRegionBlocks(Block);
+    if (Region.isEmpty()) {
+        return;
+    }
+    xmlNodePtr FigureNode = nullptr;
+    int Visible = 0;
+    if (!FigurePayloadOf(Region.first(), FigureNode, Visible)) {
+        return;
+    }
+    xmlNodePtr Artset = nullptr;
+    if (DocDocument::NodeNameEquals(FigureNode, "artset")) {
+        Artset = FigureNode;
+    } else {
+        Artset = DocDocument::ChildElement(FigureNode, "artset");
+    }
+    if (Artset == nullptr) {
+        xmlFreeNode(FigureNode);
+        return;
+    }
+    DocDocument::SetNodeAttribute(Artset, "anchor", Value);
+    QVariant Payload = FigureToVariant(FigureNode, Visible);
+    xmlFreeNode(FigureNode);
+    QString Kind = FigureKindOf(Region.first());
+    int Group = Region.first().blockFormat()
+                    .property(DocFigureGroupProperty)
+                    .toInt();
+    QTextCursor Cursor(Document);
+    Cursor.beginEditBlock();
+    for (const QTextBlock& RegionBlock : Region) {
+        QString Role = FigureRoleOf(RegionBlock);
+        QTextCursor At(Document);
+        At.setPosition(RegionBlock.position());
+        SetFigureProperties(At, Kind, Group, Role, Payload);
+    }
+    Cursor.endEditBlock();
+}
+
+/**
+ * @brief Sets one attribute of the figure's visible artwork
+ *        version (Bug 445).
+ *
+ * Only the editable artwork attributes are accepted here
+ * ("anchor", "name", "type", "src", "align", "alt"); pn,
+ * originalSrc, width, height, and xml:space have no editing
+ * UI. An empty value removes the attribute. The payload is
+ * rewritten into the region blocks, like SetFigureAnchor, so
+ * the model picks it up on sync-back.
+ */
+void TextEditor::SetArtworkAttribute(int FirstBlockPos,
+                                     const QString& Name,
+                                     const QString& Value)
+{
+    static const char* Editable[] = {
+        "anchor", "name", "type", "src", "align", "alt",
+    };
+    bool Allowed = false;
+    for (const char* Each : Editable) {
+        if (Name == QLatin1String(Each)) {
+            Allowed = true;
+            break;
+        }
+    }
+    if (!Allowed) {
+        return;
+    }
+    QTextDocument* Document = _TextEdit->document();
+    QTextBlock Block = Document->findBlock(FirstBlockPos);
+    if (!IsFigureBlock(Block)) {
+        return;
+    }
+    QVector<QTextBlock> Region = FigureRegionBlocks(Block);
+    if (Region.isEmpty()) {
+        return;
+    }
+    xmlNodePtr FigureNode = nullptr;
+    int Visible = 0;
+    if (!FigurePayloadOf(Region.first(), FigureNode, Visible)) {
+        return;
+    }
+    QVector<xmlNodePtr> Versions = FigureVersionNodes(FigureNode);
+    if (Visible < 0 || Visible >= Versions.size()) {
+        xmlFreeNode(FigureNode);
+        return;
+    }
+    QByteArray NameUtf8 = Name.toUtf8();
+    DocDocument::SetNodeAttribute(Versions[Visible],
+                                  NameUtf8.constData(), Value);
+    QVariant Payload = FigureToVariant(FigureNode, Visible);
+    xmlFreeNode(FigureNode);
+    QString Kind = FigureKindOf(Region.first());
+    int Group = Region.first().blockFormat()
+                    .property(DocFigureGroupProperty)
+                    .toInt();
+    QTextCursor Cursor(Document);
+    Cursor.beginEditBlock();
+    for (const QTextBlock& RegionBlock : Region) {
+        QString Role = FigureRoleOf(RegionBlock);
+        QTextCursor At(Document);
+        At.setPosition(RegionBlock.position());
+        SetFigureProperties(At, Kind, Group, Role, Payload);
+    }
+    Cursor.endEditBlock();
+}
+
+void TextEditor::AddFigureOptionsActions(QMenu* Menu, const QPoint& Pos)
+{
+    QTextCursor Clicked = _TextEdit->cursorForPosition(Pos);
+    QTextDocument* Document = _TextEdit->document();
+    if (!TouchesFigure(Document, Clicked)) {
+        return;
+    }
+    QAction* EditAction = Menu->addAction(tr("Edit figure..."));
+    connect(EditAction, &QAction::triggered, this,
+            &TextEditor::EditFigure);
+    // Bug 445: the figure's own options. The region's first
+    // block anchors the setters; each action re-reads the
+    // payload when it fires, so the dialog is prefilled with
+    // the value as it stands then. The options are one
+    // alphabetical list: the artset anchor (when there is an
+    // artset), the visible artwork's align, alt, anchor, name,
+    // src, and type, and the figure anchor (when the kind is
+    // "figure"). Anchors go through the owner, so a duplicate
+    // is refused, a cited delete is refused, and the
+    // cross-references move when one changes; the other
+    // attributes are set on the artwork directly. pn and
+    // originalSrc, the figure's deprecated attributes, and the
+    // artwork's deprecated attributes have no editing UI.
+    QVector<QTextBlock> Region = FigureRegionBlocks(Clicked.block());
+    if (Region.isEmpty()) {
+        return;
+    }
+    QTextBlock First = Region.first();
+    int FirstBlockPos = First.position();
+    QString Kind = FigureKindOf(First);
+    xmlNodePtr FigureNode = nullptr;
+    int Visible = 0;
+    bool HasArtset = false;
+    if (FigurePayloadOf(First, FigureNode, Visible)) {
+        HasArtset =
+            DocDocument::NodeNameEquals(FigureNode, "artset") ||
+            DocDocument::ChildElement(FigureNode, "artset") != nullptr;
+        xmlFreeNode(FigureNode);
+    }
+    QMenu* Options = Menu->addMenu(tr("Figure options"));
+    auto ReadAnchor = [this, FirstBlockPos](const char* Which) {
+        QString Value;
+        QTextBlock Block =
+            _TextEdit->document()->findBlock(FirstBlockPos);
+        if (!IsFigureBlock(Block)) {
+            return Value;
+        }
+        xmlNodePtr Node = nullptr;
+        int Seen = 0;
+        if (!FigurePayloadOf(Block, Node, Seen)) {
+            return Value;
+        }
+        if (QLatin1String(Which) == QLatin1String("figure")) {
+            Value = DocDocument::NodeAttribute(Node, "anchor");
+        } else if (QLatin1String(Which) == QLatin1String("artset")) {
+            xmlNodePtr Artset = nullptr;
+            if (DocDocument::NodeNameEquals(Node, "artset")) {
+                Artset = Node;
+            } else {
+                Artset = DocDocument::ChildElement(Node, "artset");
+            }
+            if (Artset != nullptr) {
+                Value = DocDocument::NodeAttribute(Artset, "anchor");
+            }
+        } else if (QLatin1String(Which) == QLatin1String("artwork")) {
+            QVector<xmlNodePtr> Versions = FigureVersionNodes(Node);
+            if (Seen >= 0 && Seen < Versions.size()) {
+                Value = DocDocument::NodeAttribute(Versions[Seen],
+                                                   "anchor");
+            }
+        }
+        xmlFreeNode(Node);
+        return Value;
+    };
+    auto ReadArtwork = [this, FirstBlockPos](const QString& Name) {
+        QString Value;
+        QTextBlock Block =
+            _TextEdit->document()->findBlock(FirstBlockPos);
+        if (!IsFigureBlock(Block)) {
+            return Value;
+        }
+        xmlNodePtr Node = nullptr;
+        int Seen = 0;
+        if (!FigurePayloadOf(Block, Node, Seen)) {
+            return Value;
+        }
+        QVector<xmlNodePtr> Versions = FigureVersionNodes(Node);
+        if (Seen >= 0 && Seen < Versions.size()) {
+            QByteArray NameUtf8 = Name.toUtf8();
+            Value = DocDocument::NodeAttribute(Versions[Seen],
+                                               NameUtf8.constData());
+        }
+        xmlFreeNode(Node);
+        return Value;
+    };
+    if (HasArtset) {
+        QAction* ArtsetAnchorAction =
+            Options->addAction(tr("Artset anchor..."));
+        connect(ArtsetAnchorAction, &QAction::triggered, this,
+                [this, FirstBlockPos, ReadAnchor]() {
+                    QString Old = ReadAnchor("artset");
+                    bool Ok = false;
+                    QString Value = QInputDialog::getText(
+                        this, tr("Figure options"), tr("Artset anchor:"),
+                        QLineEdit::Normal, Old, &Ok);
+                    if (!Ok) {
+                        return;
+                    }
+                    bool Accepted = true;
+                    emit ArtsetAnchorChangeRequested(
+                        Old, Value.trimmed(), FirstBlockPos, &Accepted);
+                });
+    }
+    QAction* AlignAction = Options->addAction(tr("Artwork align..."));
+    connect(AlignAction, &QAction::triggered, this,
+            [this, FirstBlockPos, ReadArtwork]() {
+                QString Current = ReadArtwork(QStringLiteral("align"));
+                if (Current.isEmpty()) {
+                    Current = QStringLiteral("left");
+                }
+                QStringList Choices;
+                Choices << QStringLiteral("left")
+                        << QStringLiteral("center")
+                        << QStringLiteral("right");
+                bool Ok = false;
+                QString Picked = QInputDialog::getItem(
+                    this, tr("Figure options"), tr("Artwork align:"),
+                    Choices, Choices.indexOf(Current), false, &Ok);
+                if (!Ok) {
+                    return;
+                }
+                SetArtworkAttribute(FirstBlockPos,
+                                    QStringLiteral("align"), Picked);
+            });
+    QAction* AltAction = Options->addAction(tr("Artwork alt..."));
+    connect(AltAction, &QAction::triggered, this,
+            [this, FirstBlockPos, ReadArtwork]() {
+                bool Ok = false;
+                QString Value = QInputDialog::getText(
+                    this, tr("Figure options"), tr("Artwork alt:"),
+                    QLineEdit::Normal,
+                    ReadArtwork(QStringLiteral("alt")), &Ok);
+                if (!Ok) {
+                    return;
+                }
+                SetArtworkAttribute(FirstBlockPos,
+                                    QStringLiteral("alt"),
+                                    Value.trimmed());
+            });
+    QAction* ArtworkAnchorAction =
+        Options->addAction(tr("Artwork anchor..."));
+    connect(ArtworkAnchorAction, &QAction::triggered, this,
+            [this, FirstBlockPos, ReadAnchor]() {
+                QString Old = ReadAnchor("artwork");
+                bool Ok = false;
+                QString Value = QInputDialog::getText(
+                    this, tr("Figure options"), tr("Artwork anchor:"),
+                    QLineEdit::Normal, Old, &Ok);
+                if (!Ok) {
+                    return;
+                }
+                bool Accepted = true;
+                emit ArtworkAnchorChangeRequested(
+                    Old, Value.trimmed(), FirstBlockPos, &Accepted);
+            });
+    QAction* NameAction = Options->addAction(tr("Artwork name..."));
+    connect(NameAction, &QAction::triggered, this,
+            [this, FirstBlockPos, ReadArtwork]() {
+                bool Ok = false;
+                QString Value = QInputDialog::getText(
+                    this, tr("Figure options"), tr("Artwork name:"),
+                    QLineEdit::Normal,
+                    ReadArtwork(QStringLiteral("name")), &Ok);
+                if (!Ok) {
+                    return;
+                }
+                SetArtworkAttribute(FirstBlockPos,
+                                    QStringLiteral("name"),
+                                    Value.trimmed());
+            });
+    QAction* SrcAction = Options->addAction(tr("Artwork src..."));
+    connect(SrcAction, &QAction::triggered, this,
+            [this, FirstBlockPos, ReadArtwork]() {
+                bool Ok = false;
+                QString Value = QInputDialog::getText(
+                    this, tr("Figure options"), tr("Artwork src:"),
+                    QLineEdit::Normal,
+                    ReadArtwork(QStringLiteral("src")), &Ok);
+                if (!Ok) {
+                    return;
+                }
+                SetArtworkAttribute(FirstBlockPos,
+                                    QStringLiteral("src"),
+                                    Value.trimmed());
+            });
+    QAction* TypeAction = Options->addAction(tr("Artwork type..."));
+    connect(TypeAction, &QAction::triggered, this,
+            [this, FirstBlockPos, ReadArtwork]() {
+                bool Ok = false;
+                QString Value = QInputDialog::getText(
+                    this, tr("Figure options"), tr("Artwork type:"),
+                    QLineEdit::Normal,
+                    ReadArtwork(QStringLiteral("type")), &Ok);
+                if (!Ok) {
+                    return;
+                }
+                SetArtworkAttribute(FirstBlockPos,
+                                    QStringLiteral("type"),
+                                    Value.trimmed());
+            });
+    if (Kind == QLatin1String("figure")) {
+        QAction* FigureAnchorAction =
+            Options->addAction(tr("Figure anchor..."));
+        connect(FigureAnchorAction, &QAction::triggered, this,
+                [this, FirstBlockPos, ReadAnchor]() {
+                    QString Old = ReadAnchor("figure");
+                    bool Ok = false;
+                    QString Value = QInputDialog::getText(
+                        this, tr("Figure options"),
+                        tr("Figure anchor:"), QLineEdit::Normal, Old,
+                        &Ok);
+                    if (!Ok) {
+                        return;
+                    }
+                    bool Accepted = true;
+                    emit FigureAnchorChangeRequested(
+                        Old, Value.trimmed(), FirstBlockPos, &Accepted);
+                });
+    }
 }
 
 void TextEditor::RemoveFigure()
@@ -14636,7 +15751,10 @@ void TextEditor::ToggleFigure()
     QTextDocument* Document = _TextEdit->document();
     QTextCursor Cursor = _TextEdit->textCursor();
     if (TouchesFigure(Document, Cursor)) {
-        StopFigure();
+        // Bug 535: inside a figure, open the figures editor
+        // for it. Nesting a new figure here left an empty
+        // figure behind and never opened the pop-up.
+        EditFigure();
     } else if (!TouchesSourceCode(Document, Cursor) &&
                !TouchesTable(Document, Cursor) &&
                ListKindsTouched(Document, Cursor).isEmpty()) {

@@ -229,6 +229,51 @@ public:
                             const QString& Anchor);
 
     /**
+     * @brief Sets the anchor of the figure at a block position
+     *        (Bug 504).
+     *
+     * Called by the owner in answer to
+     * FigureAnchorChangeRequested. The anchor is written into
+     * the figure node's attribute and into every block of the
+     * figure's payload, so the model picks it up on sync-back.
+     * An empty value removes the anchor.
+     * @param FirstBlockPos The figure's first block, in the editor.
+     * @param Value The anchor to set, empty to clear it.
+     */
+    void SetFigureAnchor(int FirstBlockPos, const QString& Value);
+
+    /**
+     * @brief Sets the <artset> anchor of the figure at a block
+     *        (Bug 445).
+     *
+     * The artset is the <artset> child of a <figure>, or the
+     * node itself when the figure's kind is "artset". An empty
+     * value removes the anchor. The payload is rewritten into
+     * the region blocks, like SetFigureAnchor, so the model
+     * picks it up on sync-back.
+     * @param FirstBlockPos The figure's first block, in the editor.
+     * @param Value The anchor to set, empty to clear it.
+     */
+    void SetArtsetAnchor(int FirstBlockPos, const QString& Value);
+
+    /**
+     * @brief Sets one attribute of the figure's visible artwork
+     *        version (Bug 445).
+     *
+     * The attribute is one of "anchor", "name", "type", "src",
+     * "align", or "alt" (the editable artwork attributes; pn,
+     * originalSrc, width, height, and xml:space have no editing
+     * UI). An empty value removes the attribute. The payload is
+     * rewritten into the region blocks, like SetFigureAnchor,
+     * so the model picks it up on sync-back.
+     * @param FirstBlockPos The figure's first block, in the editor.
+     * @param Name The attribute name.
+     * @param Value The value to set, empty to clear it.
+     */
+    void SetArtworkAttribute(int FirstBlockPos, const QString& Name,
+                             const QString& Value);
+
+    /**
      * @brief Moves the cursor to a range, clamped to the document.
      * @param Start The first character of the range.
      * @param End The character after the range.
@@ -312,14 +357,6 @@ public:
      * @return The block count of the text document.
      */
     int BlockCount() const;
-
-    /**
-     * @brief A one-line report of the last option-marker sweep
-     * (Bug 502 diagnostic: setting, blocks scanned, first source
-     * blocks, gears inserted and removed).
-     * @return The report text.
-     */
-    QString MarkerSweepReport() const;
 
     /**
      * @brief Gives the editor the document to read references from.
@@ -554,6 +591,63 @@ signals:
                                const QString& PartKind);
 
     /**
+     * @brief Sent when the figures editor asks to change a
+     *        figure's anchor (Bug 504).
+     *
+     * The editor shows the dialog but never writes the
+     * document itself. The owner checks whether the old
+     * anchor is cited, updates the cross-references when it
+     * changes, and calls SetFigureAnchor with the value to
+     * set. Accepted is set false when the change is refused
+     * (a duplicate anchor, or a cited anchor being deleted);
+     * the editor then keeps the old anchor and still applies
+     * the dialog's other changes.
+     * @param OldAnchor The anchor now on the figure, empty when none.
+     * @param NewAnchor The anchor the user entered, empty to clear it.
+     * @param FirstBlockPos The figure's first block, in the editor.
+     * @param Accepted Set false when the change is refused.
+     */
+    void FigureAnchorChangeRequested(const QString& OldAnchor,
+                                     const QString& NewAnchor,
+                                     int FirstBlockPos, bool* Accepted);
+
+    /**
+     * @brief Sent when the user asks to change the <artset>
+     *        anchor from the figure's gear menu (Bug 445).
+     *
+     * Like FigureAnchorChangeRequested, the owner checks the
+     * change (a duplicate anchor, or a cited anchor being
+     * deleted) and calls SetArtsetAnchor with the value to
+     * set. Accepted is set false when the change is refused.
+     * @param OldAnchor The anchor now on the artset, empty when none.
+     * @param NewAnchor The anchor the user entered, empty to clear it.
+     * @param FirstBlockPos The figure's first block, in the editor.
+     * @param Accepted Set false when the change is refused.
+     */
+    void ArtsetAnchorChangeRequested(const QString& OldAnchor,
+                                     const QString& NewAnchor,
+                                     int FirstBlockPos, bool* Accepted);
+
+    /**
+     * @brief Sent when the user asks to change the visible
+     *        artwork's anchor from the figure's gear menu
+     *        (Bug 445).
+     *
+     * Like FigureAnchorChangeRequested, the owner checks the
+     * change (a duplicate anchor, or a cited anchor being
+     * deleted) and calls SetArtworkAttribute with "anchor" and
+     * the value to set. Accepted is set false when the change
+     * is refused.
+     * @param OldAnchor The anchor now on the artwork, empty when none.
+     * @param NewAnchor The anchor the user entered, empty to clear it.
+     * @param FirstBlockPos The figure's first block, in the editor.
+     * @param Accepted Set false when the change is refused.
+     */
+    void ArtworkAnchorChangeRequested(const QString& OldAnchor,
+                                      const QString& NewAnchor,
+                                      int FirstBlockPos, bool* Accepted);
+
+    /**
      * @brief Sent when the XML tab's edited XML holds new
      *        subsections (Bug 520).
      *
@@ -710,6 +804,17 @@ private:
      * @param Pos The click position, in viewport coordinates.
      */
     void AddTableOptionsActions(QMenu* Menu, const QPoint& Pos);
+
+    /**
+     * @brief Adds the "Edit figure..." action when the click
+     *        lands on a figure (Bug 504).
+     *
+     * The action opens the figures editor on that figure. Nothing
+     * is added when the click is not on a figure.
+     * @param Menu The menu being built.
+     * @param Pos The click position, in viewport coordinates.
+     */
+    void AddFigureOptionsActions(QMenu* Menu, const QPoint& Pos);
 
     /**
      * @brief Adds one table part's submenu to a gear menu
@@ -985,6 +1090,21 @@ private:
      * empty caption.
      */
     void InsertFigure();
+
+    /**
+     * @brief Opens the figures editor on the figure at the
+     *        cursor (Bug 504).
+     *
+     * The dialog edits the figure's artwork, caption, anchor,
+     * and tag list as one pop-up. On OK the figure is updated
+     * in place and its tag list is written as a <dl> below the
+     * figure, grouped by comments carrying the figure's
+     * anchor; on Cancel nothing changes. The anchor change
+     * goes through FigureAnchorChangeRequested, so the owner
+     * refuses a duplicate or a cited delete and renames the
+     * cross-references when it changes.
+     */
+    void EditFigure();
 
     /**
      * @brief Turns the touched figure regions back into
@@ -1380,13 +1500,6 @@ private:
     QCheckBox* _ShowMarkersCheck;
     QString _BlockKind;
     bool _SettingParagraphs;
-    // Last option-marker sweep counts (Bug 502 diagnostic).
-    bool _DiagMarkersShown;
-    int _DiagMarkersBlocks;
-    int _DiagMarkersSourceFirst;
-    int _DiagMarkersListFirst;
-    int _DiagMarkersGearsInserted;
-    int _DiagMarkersGearsRemoved;
     int _SrcPlaceholderHintBlock;
     int _LinkReadOnlyHintPos;
     int _IrefReadOnlyHintPos;

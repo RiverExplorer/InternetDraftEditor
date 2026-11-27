@@ -1,4 +1,4 @@
-# ProtocolDocEditor - Qt 6 desktop editor for Internet-Draft text (RFCXML).
+# InternetDraftsEditor - Qt 6 desktop editor for Internet-Draft text (RFCXML).
 #
 # qmake project file. Open this file in Qt Creator (Welcome > Open Project,
 # or File > Open File) and Qt Creator will configure it with the
@@ -11,15 +11,21 @@ QT += core gui widgets network
 CONFIG += c++20
 CONFIG -= app_bundle
 
-TARGET = ProtocolDocEditor
+TARGET = InternetDraftsEditor
 TEMPLATE = app
 VERSION = 1.1.0
+
+# Windows-only: the exe's icon. The .ico sits next to this file.
+win32 {
+    RC_ICONS = InternetDraftsEditor.ico
+}
 
 SOURCES += \
     main.cpp \
     BibCache.cpp \
     DocModel.cpp \
     DocValidator.cpp \
+    FigureEditor.cpp \
     StartWizard.cpp \
     TextEditor.cpp \
     LegendDialog.cpp \
@@ -41,6 +47,7 @@ HEADERS += \
     BibCache.h \
     DocModel.h \
     DocValidator.h \
+    FigureEditor.h \
     StartWizard.h \
     TextEditor.h \
     LegendDialog.h \
@@ -101,4 +108,27 @@ DEFINES += LIBXML_STATIC
 win32 {
     QMAKE_DEL_FILE = powershell -NoProfile -ExecutionPolicy Bypass -File $$PWD/rm.ps1
     QMAKE_DEL_DIR = powershell -NoProfile -ExecutionPolicy Bypass -File $$PWD/rm.ps1
+}
+
+# Windows-only: run windeployqt after a release link, so the
+# deploy folder (deploy/, next to this file) always holds the
+# exe plus the Qt DLLs and plugins it needs, and the Inno Setup
+# script (InternetDraftsEditor.iss) can package it without a
+# manual step. Release only: a debug build does not ship.
+# $$[QT_INSTALL_BINS] is the Qt bin folder for the kit in use,
+# so this works wherever Qt lives (C:, G:, and so on);
+# $$OUT_PWD is the build folder, and the release exe sits in
+# its release/ subfolder. windeployqt copies the Qt DLLs and
+# plugins, but NOT the exe itself, so a second step copies the
+# exe in too (copy-to-deploy.ps1, next to this file), making
+# the deploy folder a complete, runnable copy of the program.
+# The two steps are ONE command joined by &&: qmake joins
+# separate QMAKE_POST_LINK lines with a space, which would pass
+# the PowerShell words to windeployqt as unknown options.
+# To re-run windeployqt by hand, use:
+#   <qt-bin>\windeployqt.exe --dir <source-dir>\deploy <build-dir>\release\InternetDraftsEditor.exe
+win32 {
+    CONFIG(release, debug|release) {
+        QMAKE_POST_LINK = $$[QT_INSTALL_BINS]/windeployqt.exe --dir $$PWD/deploy $$OUT_PWD/release/$${TARGET}.exe && powershell -NoProfile -ExecutionPolicy Bypass -File $$PWD/copy-to-deploy.ps1 $$OUT_PWD/release/$${TARGET}.exe $$PWD/deploy
+    }
 }

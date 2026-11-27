@@ -3,3 +3,6 @@ draft-royer-*
 build
 .qtcreator
 NotInGithub
+*.exe
+:
+deploy

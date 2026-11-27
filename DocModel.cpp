@@ -518,14 +518,17 @@ static bool CommentsOnlyTElement(xmlNodePtr Node)
 /**
  * @brief Tests whether a list item (li, dt, or dd) converts to paragraphs.
  *
- * The item must carry no attributes or namespace declarations:
- * the editor does not edit them, so an attributed item keeps the
- * whole list preserved. An item holding only <t> elements
- * converts to one paragraph per <t> (a term never holds a <t>:
- * the schema allows a term inline content only). Otherwise the
- * item's children convert as inline runs in a single paragraph.
- * Comments, processing instructions, and entity references
- * directly inside an item keep the whole list preserved.
+ * The item must carry no namespace declarations: the editor does
+ * not preserve those. The item MAY carry attributes (a <dt>
+ * anchor, for a figure tag list): they ride on the item's blocks
+ * through DocListItemProperty and are written back by
+ * BuildListNode, so an attributed item converts. An item holding
+ * only <t> elements converts to one paragraph per <t> (a term
+ * never holds a <t>: the schema allows a term inline content
+ * only). Otherwise the item's children convert as inline runs in
+ * a single paragraph. Comments, processing instructions, and
+ * entity references directly inside an item keep the whole list
+ * preserved.
  * @param Node The item element.
  * @param ForTerm True when the item is a definition term, whose
  *        inline set is smaller than a paragraph's.
@@ -536,8 +539,7 @@ static bool ItemParagraphsConvert(xmlNodePtr Node, bool ForTerm,
                                   int& ParagraphCount)
 {
     ParagraphCount = 0;
-    if (!IsElementKind(Node) || Node->properties != nullptr ||
-        !ElementHasNoNsDecls(Node)) {
+    if (!IsElementKind(Node) || !ElementHasNoNsDecls(Node)) {
         return false;
     }
     bool HasT = false;

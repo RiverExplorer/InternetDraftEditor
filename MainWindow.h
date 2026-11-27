@@ -1065,23 +1065,10 @@ private:
      */
     void AppendRunLog(const QString& Text);
 
-    /**
-     * @brief Records what the just-loaded document holds for the
-     * abstract (Bug 502 diagnostic), for the Abstract page to show.
-     */
-    void RecordLoadDiagnostic();
-
     DocDocument _Document;
     BibCache _BibCache;
     QString _FilePath;
     bool _Modified;
-    // Load-time abstract counts (Bug 502 diagnostic).
-    bool _DiagLoadFront;
-    bool _DiagLoadAbstract;
-    int _DiagLoadAbstractChildren;
-    // Abstract-editor syncs since load (Bug 502 diagnostic).
-    int _DiagSyncCount;
-    int _DiagSyncLastNodes;
     // Bug 502 fix: true only while the abstract editor holds content
     // filled from the current document. A sync from an editor that
     // has not been filled for this document must not overwrite the
