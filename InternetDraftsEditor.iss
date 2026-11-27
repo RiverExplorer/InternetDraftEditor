@@ -35,6 +35,7 @@
 #define MyAppSmallImage "D:\DocEditor\RiverExplorer-small.bmp"
 #define MyAppDeployDir "D:\DocEditor\deploy"
 #define MyAppOutputDir "D:\DocEditor"
+#define MyAppSourceDir "D:\DocEditor"
 
 [Setup]
 ; A unique id for this program. Never change it.
@@ -81,6 +82,14 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 ; on). The deploy folder holds only runtime files, so there is
 ; nothing to exclude.
 Source: "{#MyAppDeployDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; The xml2rfc setup helpers, installed next to the exe so the
+; user has them after install (no trip to GitHub to fetch
+; them). The .bat calls the .ps1 for the Roboto Mono font step
+; when it sits beside it, and points at the .md for the manual
+; steps. All three live in the repo root (D:\DocEditor).
+Source: "{#MyAppSourceDir}\install-xml2rfc.bat"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSourceDir}\install-roboto-mono.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSourceDir}\INSTALL-xml2rfc.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

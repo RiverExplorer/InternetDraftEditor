@@ -168,6 +168,16 @@ echo   Roboto Mono installed.
 
 :Verify
 REM ---------- Step 5: verify everything works ----------
+REM xml2rfc on Windows writes a tracker.log file into the
+REM current folder (its syslog fallback, when "import syslog"
+REM fails). This .bat often runs from Program Files, which a
+REM normal user cannot write to, so "xml2rfc --version" dies
+REM with PermissionError on tracker.log instead of printing
+REM its version. Run the checks from %TEMP%, which is always
+REM writable, so the check passes. (The editor avoids this
+REM the same way: it runs xml2rfc from the draft's folder and
+REM deletes tracker.log afterwards.)
+cd /d "%TEMP%"
 echo.
 echo [5/5] Verifying the install...
 REM A running Command Prompt does not pick up a PATH change made by

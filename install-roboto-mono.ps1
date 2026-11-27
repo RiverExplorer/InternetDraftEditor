@@ -96,12 +96,38 @@ try {
     $installed = 0
     foreach ($font in $found) {
         $target = Join-Path $fontsFolder $font.Name
-        Copy-Item -LiteralPath $font.FullName -Destination $target -Force
         if ($displayNames.ContainsKey($font.Name)) {
             $displayName = $displayNames[$font.Name]
         }
         else {
             $displayName = ([System.IO.Path]::GetFileNameWithoutExtension($font.Name)) + ' (TrueType)'
+        }
+        # If this font is already installed (the file is in place
+        # and registered under this display name), there is
+        # nothing to copy. Overwriting an installed font fails
+        # because Windows holds the file open while the font is
+        # loaded, so a re-run would report a false failure.
+        # Count it as installed and move on.
+        $regValue = Get-ItemPropertyValue -Path $regPath -Name $displayName -ErrorAction SilentlyContinue
+        if ($regValue -eq $target -and (Test-Path -LiteralPath $target)) {
+            Write-Host "  Already installed: $($font.Name)"
+            $installed++
+            continue
+        }
+        try {
+            Copy-Item -LiteralPath $font.FullName -Destination $target -Force
+        }
+        catch {
+            # The copy can still fail if the font is installed and
+            # Windows has the file open. If it is registered, the
+            # font is usable, so that is not a failure either.
+            $regValue = Get-ItemPropertyValue -Path $regPath -Name $displayName -ErrorAction SilentlyContinue
+            if ($regValue -eq $target -and (Test-Path -LiteralPath $target)) {
+                Write-Host "  Already installed: $($font.Name)"
+                $installed++
+                continue
+            }
+            throw
         }
         New-ItemProperty -Path $regPath -Name $displayName -Value $target -PropertyType String -Force | Out-Null
         Write-Host "  Installed: $($font.Name)"
