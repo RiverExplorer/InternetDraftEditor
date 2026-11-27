@@ -41,6 +41,7 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QNetworkAccessManager>
+#include <QPixmap>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QPlainTextEdit>
@@ -4572,6 +4573,15 @@ void MainWindow::OnAbout()
     // text dark on dark.
     QMessageBox box(this);
     box.setWindowTitle(tr("About ProtocolDocEditor"));
+    // RiverExplorer logo in the About dialog. The logo is a Qt
+    // resource (images.qrc); if it is missing the dialog still
+    // works, just without the picture.
+    QPixmap LogoPixmap(QStringLiteral(":/images/RiverExplorer-logo.png"));
+    if (!LogoPixmap.isNull()) {
+        box.setIconPixmap(
+            LogoPixmap.scaled(120, 120, Qt::KeepAspectRatio,
+                              Qt::SmoothTransformation));
+    }
     box.setTextFormat(Qt::RichText);
     box.setText(
         tr("ProtocolDocEditor %1<br>"

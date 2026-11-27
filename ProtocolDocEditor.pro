@@ -81,6 +81,11 @@ DEFINES += HUNSPELL_STATIC
 # StartWizard::accept (Bug 431).
 RESOURCES += templates.qrc
 
+# The RiverExplorer logo rides inside the program as a Qt
+# resource and is shown in the About dialog; see
+# MainWindow::OnAbout.
+RESOURCES += images.qrc
+
 # libxml2 (static MinGW build) for in-app RelaxNG validation. The
 # headers and libraries live beside this file, in include/ and lib/
 # (moved into the tree for GitHub, 2026-11-23); see
