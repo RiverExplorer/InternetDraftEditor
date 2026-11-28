@@ -28,6 +28,7 @@ SOURCES += \
     FigureEditor.cpp \
     StartWizard.cpp \
     TextEditor.cpp \
+    UpdateChecker.cpp \
     LegendDialog.cpp \
     MainWindow.cpp \
     SpellChecker.cpp \
@@ -50,6 +51,7 @@ HEADERS += \
     FigureEditor.h \
     StartWizard.h \
     TextEditor.h \
+    UpdateChecker.h \
     LegendDialog.h \
     MainWindow.h \
     SpellChecker.h \

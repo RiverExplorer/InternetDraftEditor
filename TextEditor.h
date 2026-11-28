@@ -336,9 +336,16 @@ public:
      * content. The caller owns the returned nodes and must
      * free each with xmlFreeNode, except when passing them to
      * DocDocument::RebuildBodyChildren, which adopts them.
+     * @param KeepFigureIndex Bug 553: the 0-based index, among
+     *        the document's figure regions, of the figure to
+     *        keep even when its visible artwork is still empty.
+     *        The figure editor applies the dialog's artwork to
+     *        that version right after this read, so dropping it
+     *        here would lose the figure. -1 keeps nothing, and
+     *        is the Bug 534 behaviour everywhere else.
      * @return The body nodes.
      */
-    QVector<xmlNodePtr> BodyNodes() const;
+    QVector<xmlNodePtr> BodyNodes(int KeepFigureIndex = -1) const;
 
     /**
      * @brief Whether pasted <section> nodes may become
@@ -1371,7 +1378,7 @@ private:
     /**
      * @brief Shows on the list and Blocks buttons what the
      *        cursor is in, names the Blocks button for the
-     *        picked kind of block, and fills the version picker
+     *        kind of block the cursor is in, and fills the version picker
      *        when the cursor sits in a figure holding several
      *        versions.
      */

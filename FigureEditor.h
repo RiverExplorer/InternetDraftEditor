@@ -52,8 +52,9 @@ struct FigureTagRow
  *
  * The text is the <artwork> text itself: each line is one row
  * of the grid, and drawing a shape sets the characters of the
- * cells it covers. Typing replaces the character under the
- * cursor (overwrite mode), as ASCII art wants. Undo is a
+ * cells it covers. Typing inserts at the cursor, pushing
+ * existing characters right (Bug 552: the canvas no longer
+ * uses overwrite mode). Undo is a
  * snapshot stack: one entry per completed stroke or typing
  * run, restored by Ctrl+Z or the Undo button.
  */

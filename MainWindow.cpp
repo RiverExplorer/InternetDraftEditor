@@ -81,6 +81,7 @@
 
 #include "StartWizard.h"
 #include "TextEditor.h"
+#include "UpdateChecker.h"
 
 /**
  * @brief How many recently opened files the File menu remembers.
@@ -1115,6 +1116,7 @@ MainWindow::MainWindow(QWidget* Parent)
     , _ValidateDialog(nullptr)
     , _ValidateLog(nullptr)
     , _ValidateCloseButton(nullptr)
+    , _UpdateChecker(nullptr)
 {
     EnsureSchemasInstalled();
     EnsureDictionariesInstalled();
@@ -1211,6 +1213,12 @@ MainWindow::MainWindow(QWidget* Parent)
     connect(ViewIdDiffAction, &QAction::triggered,
             this, &MainWindow::OnViewPublishedIdDiff);
 
+    // The update checker owns the GitHub check: it asks GitHub
+    // for new releases on startup (at most once every 7 days)
+    // and from Help > Check for Updates. It is a child of this
+    // window, so Qt deletes it with the window.
+    _UpdateChecker = new UpdateChecker(this);
+
     QMenu* HelpMenu = menuBar()->addMenu(tr("&Help"));
 
     QAction* LegendAction = HelpMenu->addAction(tr("&Legend"));
@@ -1235,6 +1243,13 @@ MainWindow::MainWindow(QWidget* Parent)
         tr("Show information about this editor, including the copyright and license."));
     connect(AboutAction, &QAction::triggered, this, &MainWindow::OnAbout);
 
+    QAction* CheckForUpdatesAction =
+        HelpMenu->addAction(tr("Check for &Updates..."));
+    CheckForUpdatesAction->setStatusTip(
+        tr("Check GitHub for a newer version of this editor."));
+    connect(CheckForUpdatesAction, &QAction::triggered,
+            this, &MainWindow::OnCheckForUpdates);
+
     // A one-time note, the first time the app starts, pointing at
     // Help > Feedback (Bug 494). The single-shot timer waits until
     // the window is showing before the box appears; the start
@@ -1254,6 +1269,16 @@ MainWindow::MainWindow(QWidget* Parent)
             tr("You can report issues and make suggestions from the "
                "Help menu: Help > Feedback opens the GitHub issues "
                "page in your default browser."));
+    });
+
+    // Check GitHub for updates on startup, but only once every 7
+    // days (or on the first run, or the first run after an
+    // update): the checker itself applies that timing rule. The
+    // single-shot timer waits until the window is showing before
+    // the check starts, as with the feedback notice above; the
+    // check runs in the background and never blocks startup.
+    QTimer::singleShot(0, this, [this]() {
+        _UpdateChecker->CheckForUpdates(false);
     });
 
     RebuildRecentMenu();
@@ -5041,6 +5066,14 @@ void MainWindow::OnFeedback()
 {
     QDesktopServices::openUrl(QUrl(QStringLiteral(
         "https://github.com/RiverExplorer/InternetDraftEditor/issues")));
+}
+
+void MainWindow::OnCheckForUpdates()
+{
+    // A manual check always asks GitHub, whatever the startup
+    // timing rule says; the checker records the check on success,
+    // resetting the 7-day clock.
+    _UpdateChecker->CheckForUpdates(true);
 }
 
 void MainWindow::OnValidate()

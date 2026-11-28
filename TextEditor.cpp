@@ -8250,8 +8250,9 @@ TextEditor::TextEditor(QWidget* Parent)
         ToggleBlockList(QStringLiteral("dl"));
     });
     // The Blocks button starts and stops a block: its menu
-    // picks the kind of block, its label names the picked kind,
-    // and pressing the button again stops the block. Until a
+    // picks the kind of block, its label names the kind the
+    // cursor is in, and pressing the button again stops the
+    // block. Until a
     // kind is picked, pressing the button opens the menu: it
     // has no default (Bug 444). The menu holds a figure and
     // source code, plus the Comment insert, which is a one-shot
@@ -8883,6 +8884,34 @@ bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
         return true;
     }
     if (IsSourceCodeBlock(Block) || IsFigureArtworkBlock(Block)) {
+        if (IsSourceCodeBlock(Block) && Plain &&
+            Key->key() == Qt::Key_Backspace &&
+            !Cursor.hasSelection() &&
+            Cursor.position() == Block.position() &&
+            Block.blockFormat().indent() > 0 &&
+            Block.previous().isValid()) {
+            // Bug 550: Qt's own Backspace handling at the start
+            // of an indented block dedents first (indent 1 -> 0)
+            // instead of merging with the previous block. A
+            // sourcecode line's indent is a fixed formatting
+            // property (SetSourceProperties, indent 1), not
+            // user-controlled indentation, so that first
+            // Backspace is silently wasted on an invisible
+            // dedent: after Enter + Backspace the cursor is
+            // still on the next line and the text is intact.
+            // Merge here instead, with deletePreviousChar(),
+            // which joins the blocks directly and puts the
+            // cursor at the end of the previous line. The
+            // empty-source cleanup was already queued above
+            // (QueueEmptySourceCleanup), so an element emptied
+            // by the merge is still cleaned up. Artwork blocks
+            // are left to Qt: only sourcecode indent is fixed.
+            Cursor.beginEditBlock();
+            Cursor.deletePreviousChar();
+            Cursor.endEditBlock();
+            _TextEdit->setTextCursor(Cursor);
+            return true;
+        }
         if (Plain && Key->key() == Qt::Key_Tab) {
             // Tabs are prohibited inside <sourcecode> and
             // <artwork>, so the Tab key inserts spaces instead.
@@ -8906,9 +8935,9 @@ bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
             // Bug 537: Enter on an empty artwork line that is
             // the last block of the figure exits the figure
             // instead, so the author can type a plain paragraph
-            // after it. The figure button now opens the editor
-            // (Bug 535), so Enter on the empty last line is
-            // the way out of a figure.
+            // after it. Enter on the empty last line exits the
+            // figure (Bug 537); the Blocks button stops it too
+            // (Bug 554).
             if (IsFigureArtworkBlock(Block) &&
                 Block.text().trimmed().isEmpty() &&
                 Block == FigureRegionBlocks(Block).last()) {
@@ -9065,6 +9094,12 @@ bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
                 Cursor.removeSelectedText();
             }
             Cursor.insertBlock();
+            // Bug 551: the new paragraph is plain prose, so its
+            // typing format is plain too, matching the reset
+            // InsertParagraphBreak applies (5219). Without it
+            // the block inherits a leaked fixed-width format
+            // from the paragraph it split from.
+            Cursor.setCharFormat(QTextCharFormat());
         } else {
             Cursor.insertText(QString(SoftBreakChar));
         }
@@ -9463,9 +9498,14 @@ bool TextEditor::ApplyXmlEdits()
     return true;
 }
 
-QVector<xmlNodePtr> TextEditor::BodyNodes() const
+QVector<xmlNodePtr> TextEditor::BodyNodes(int KeepFigureIndex) const
 {
     QVector<xmlNodePtr> Nodes;
+    // Bug 553: the index of the figure region being read, among
+    // the document's figure regions, in document order -- the
+    // same count FigureRegionIndex returns, so the caller can
+    // name the figure under edit.
+    int FigureIndex = -1;
     QTextDocument* Document = _TextEdit->document();
     QTextBlock Block = Document->begin();
     while (Block.isValid()) {
@@ -9516,6 +9556,7 @@ QVector<xmlNodePtr> TextEditor::BodyNodes() const
             // placeholder line is display only. Only a figure
             // carries a <name>: an artset or artwork region
             // drops its caption, as the old writer did.
+            ++FigureIndex;
             QString FigureKindName = FigureKindOf(Block);
             int Group = Block.blockFormat()
                             .property(DocFigureGroupProperty)
@@ -9622,6 +9663,19 @@ QVector<xmlNodePtr> TextEditor::BodyNodes() const
                     DocDocument::NodeAttribute(Version, "type");
                 if (!Type.isEmpty() &&
                     Type != QLatin1String("ascii-art")) {
+                    continue;
+                }
+                // Bug 553: the figure under edit keeps its
+                // visible version through this read, even when
+                // its artwork is still empty: the dialog's
+                // artwork is applied to that version by the
+                // caller right after this read, so dropping it
+                // here would lose the figure. Every other
+                // figure, and every other version of this one,
+                // still drops under Bug 534.
+                if (FigureIndex == KeepFigureIndex &&
+                    Visible >= 0 && Visible < Versions.size() &&
+                    Version == Versions[Visible]) {
                     continue;
                 }
                 if (DocDocument::NodeText(Version).trimmed().isEmpty()) {
@@ -13738,6 +13792,18 @@ void TextEditor::ToggleBlockList(const QString& Kind)
     _TextEdit->setFocus();
 }
 
+/**
+ * @brief Re-syncs the caret's typing format when it moves.
+ *
+ * Just past a link, typing must be plain text, so the link
+ * tag is stripped from the caret's format. Just past a
+ * sourcecode block (Bug 551), the caret's format is often a
+ * leaked fixed-width font, so the code font is stripped from
+ * the caret's format in a plain block whose tag stack holds
+ * no tt. Typing at the end of a legitimate <tt> run keeps
+ * the teletype, and sourcecode and artwork blocks keep
+ * their code font.
+ */
 void TextEditor::OnCaretMoved()
 {
     QTextCursor Cursor = _TextEdit->textCursor();
@@ -13750,6 +13816,34 @@ void TextEditor::OnCaretMoved()
     }
     QTextDocument* Document = _TextEdit->document();
     DocTagStack Before = StackAtPosition(Document, Pos - 1);
+    // Bug 551: a plain paragraph after a sourcecode block is
+    // often empty when the caret arrives in it, so Qt derives
+    // the typing font from the neighbouring character -- the
+    // last code character -- and it stays Courier New. The
+    // creation-site resets (InsertParagraphBreak, 5219;
+    // InsertPlainParagraphAfter, 6708) live only on a cursor,
+    // never in the document, so they cannot save a later
+    // arrival. Strip the code font here, on arrival, in every
+    // plain block: a caret format in the code font whose tag
+    // stack holds no tt is a leak, not a teletype run. The tt
+    // check keeps typing at the end of a legitimate <tt> run
+    // extending the teletype, and sourcecode and artwork
+    // blocks keep their code font, as they should.
+    if (!IsSourceCodeBlock(Cursor.block()) &&
+        !IsFigureArtworkBlock(Cursor.block())) {
+        QTextCharFormat Caret = Cursor.charFormat();
+        if (!StackHolds(Before, QStringLiteral("tt")) &&
+            !StackHolds(StackOf(Caret), QStringLiteral("tt"))) {
+            QStringList Families = Caret.fontFamilies().toStringList();
+            for (const QString& Family : CodeFontFamilies()) {
+                if (Families.contains(Family)) {
+                    Caret.clearProperty(QTextFormat::FontFamilies);
+                    _TextEdit->setCurrentCharFormat(Caret);
+                    break;
+                }
+            }
+        }
+    }
     // The link tag on the character before the caret, if any.
     QString Link;
     for (const QString& Name :
@@ -13825,7 +13919,7 @@ void TextEditor::UpdateBlockButtons()
     // The Blocks button works wherever the cursor touches no
     // list and no table: in prose it starts the picked kind of
     // block, and in a block of that kind it stops it. Its label
-    // names the kind the cursor is in, or the picked kind. A
+    // names the kind the cursor is in. A
     // table has no stop — removal lives in the right-click
     // menu — so the button is greyed out in one, showing Table.
     _BlocksButton->setEnabled(Touched.isEmpty() && !InTable);
@@ -13838,7 +13932,12 @@ void TextEditor::UpdateBlockButtons()
     } else if (InSource) {
         Kind = QStringLiteral("sourcecode");
     } else {
-        Kind = _BlockKind;
+        // Bug 554: the label names only the kind the cursor
+        // is in, never the kind last picked from the menu:
+        // in a plain paragraph the button says "Blocks".
+        // _BlockKind is still the button-press default (see
+        // OnBlocksButtonClicked), it is only not the label.
+        Kind.clear();
     }
     if (Kind == QLatin1String("table")) {
         _BlocksButton->setText(tr("Table"));
@@ -13995,9 +14094,25 @@ void TextEditor::EnsureTrailingPlainParagraph()
     if (!Last.isValid() || !IsSourceCodeBlock(Last)) {
         return;
     }
+    // Bug 550 (C7): the new paragraph is inserted at the end of
+    // the last source line. When the edit cursor sits exactly
+    // there -- a Backspace that just deleted a character there,
+    // for example -- Qt pushes the edit cursor down into the new
+    // paragraph, so the cursor leaves the line just edited. The
+    // cursor is remembered and put back when it was at the
+    // insertion point with no selection; anywhere else it is
+    // left exactly as Qt leaves it.
+    QTextCursor EditCursor = _TextEdit->textCursor();
+    int InsertPos = Last.position() + Last.length() - 1;
+    bool AtInsert = !EditCursor.hasSelection() &&
+                    EditCursor.position() == InsertPos;
     QTextCursor Cursor(Document);
     Cursor.setPosition(Last.position());
     InsertPlainParagraphAfter(Cursor);
+    if (AtInsert && _TextEdit->textCursor().position() != InsertPos) {
+        EditCursor.setPosition(InsertPos);
+        _TextEdit->setTextCursor(EditCursor);
+    }
 }
 
 void TextEditor::SetSpellChecker(SpellChecker* Checker)
@@ -14700,6 +14815,59 @@ void TextEditor::EditFigure()
         NewAnchor = OldAnchor.isEmpty() ? FigureSlugAnchor(NewCaption)
                                         : OldAnchor;
     }
+    // Bug 553: an empty artwork cannot be applied. The figure
+    // would reach SetBodyNodes with no artwork text, and the
+    // next BodyNodes() read -- the owner's model sync, under
+    // the Bug 534 rule -- would drop the whole figure from the
+    // model while its skeleton stayed in the text pane, so the
+    // text and the model would disagree and the figure would
+    // be lost from the document. So when no version of the
+    // figure would survive an empty artwork, the dialog's
+    // changes are discarded instead: the figure stays exactly
+    // as it was, in the text pane and in the model. Deleting
+    // a figure is RemoveFigure's job, with its confirmation;
+    // emptying the artwork in the dialog is not a delete. A
+    // new figure's skeleton stays in the text pane, as on
+    // Cancel, and can be edited from later. A version that
+    // would survive on its own -- an SVG, a src version, a
+    // non-ascii-art type, or another version holding text --
+    // lets the edit apply, and only the emptied version drops.
+    if (NewArtwork.trimmed().isEmpty()) {
+        bool AnyVersionSurvives = false;
+        QVector<xmlNodePtr> PayloadVersions =
+            FigureVersionNodes(PayloadNode);
+        for (int i = 0; i < PayloadVersions.size(); ++i) {
+            xmlNodePtr Version = PayloadVersions[i];
+            if (ArtworkNodeIsSvg(Version) ||
+                DocDocument::HasNodeAttribute(Version, "src")) {
+                AnyVersionSurvives = true;
+                break;
+            }
+            QString Type = DocDocument::NodeAttribute(Version, "type");
+            if (!Type.isEmpty() &&
+                Type != QLatin1String("ascii-art")) {
+                AnyVersionSurvives = true;
+                break;
+            }
+            // The visible version takes the dialog's (empty)
+            // artwork; any other version keeps the text it
+            // has now.
+            QString EffectiveText =
+                (i == Visible) ? NewArtwork
+                               : DocDocument::NodeText(Version);
+            if (!EffectiveText.trimmed().isEmpty()) {
+                AnyVersionSurvives = true;
+                break;
+            }
+        }
+        if (!AnyVersionSurvives) {
+            xmlFreeNode(PayloadNode);
+            if (CaptionNameNode != nullptr) {
+                xmlFreeNode(CaptionNameNode);
+            }
+            return;
+        }
+    }
     // The anchor change goes through the owner, so a duplicate
     // is refused, a cited delete is refused, and the
     // cross-references move when it changes. A refusal keeps
@@ -14719,8 +14887,15 @@ void TextEditor::EditFigure()
     // Re-read the body fresh: the anchor change above may have
     // reloaded the editor (a cited rename), so anything read
     // before the dialog is stale. The figure's anchor is now
-    // NewAnchor.
-    QVector<xmlNodePtr> Nodes = BodyNodes();
+    // NewAnchor. Bug 553: the figure under edit is kept
+    // through this read even when its artwork is still empty
+    // -- a new figure's skeleton holds no artwork yet, the
+    // drawing exists only in the dialog -- so the accept path
+    // below finds it and applies the dialog's artwork, caption,
+    // and tag list instead of returning early and discarding
+    // them. The Bug 534 empty-drop still applies to every
+    // other figure in this read.
+    QVector<xmlNodePtr> Nodes = BodyNodes(RegionIndex);
     xmlNodePtr FigureInBody = nullptr;
     int FigurePos = -1;
     int Seen = 0;
@@ -16308,10 +16483,12 @@ void TextEditor::ToggleFigure()
     QTextDocument* Document = _TextEdit->document();
     QTextCursor Cursor = _TextEdit->textCursor();
     if (TouchesFigure(Document, Cursor)) {
-        // Bug 535: inside a figure, open the figures editor
-        // for it. Nesting a new figure here left an empty
-        // figure behind and never opened the pop-up.
-        EditFigure();
+        // Bug 554: inside a figure, stop it, mirroring
+        // ToggleSourceCode()/StopSourceCode(). The figures
+        // editor is reached from the Blocks menu -> Figure
+        // when the cursor is not in a figure, and from
+        // Edit figure... in the right-click menu.
+        StopFigure();
     } else if (!TouchesSourceCode(Document, Cursor) &&
                !TouchesTable(Document, Cursor) &&
                ListKindsTouched(Document, Cursor).isEmpty()) {

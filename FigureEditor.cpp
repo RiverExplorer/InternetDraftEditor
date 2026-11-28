@@ -321,7 +321,6 @@ FigureCanvas::FigureCanvas(QWidget* Parent) : QPlainTextEdit(Parent)
     Font.setPointSize(11);
     setFont(Font);
     setWordWrapMode(QTextOption::NoWrap);
-    setOverwriteMode(true);
     // The canvas owns undo (a snapshot per stroke or typing
     // run); the built-in undo would fight it, since drawing
     // replaces the text wholesale.

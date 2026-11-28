@@ -64,6 +64,7 @@ class QStackedWidget;
 class QTableWidget;
 class QTreeWidget;
 class QTreeWidgetItem;
+class UpdateChecker;
 
 /**
  * @brief The main window: outline left, details right.
@@ -619,6 +620,13 @@ private slots:
      * @brief Opens the GitHub issues page in the default browser.
      */
     void OnFeedback();
+
+    /**
+     * @brief Checks GitHub for a newer release at once (Help >
+     *        Check for Updates). A manual check always asks
+     *        GitHub, whatever the startup timing rule says.
+     */
+    void OnCheckForUpdates();
 
     /**
      * @brief Remembers the checked output formats when one changes.
@@ -1353,6 +1361,11 @@ private:
     QDialog* _ValidateDialog;
     QPlainTextEdit* _ValidateLog;
     QPushButton* _ValidateCloseButton;
+
+    // Checks GitHub for a newer release: on startup (at most
+    // once every 7 days) and from Help > Check for Updates.
+    // Owned by Qt: created with this window as its parent.
+    UpdateChecker* _UpdateChecker;
 };
 
 #endif // DOCEDITOR_MAINWINDOW_H
