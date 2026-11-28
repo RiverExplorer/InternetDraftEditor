@@ -17,8 +17,8 @@
  * markup other than a line break inside a title, markup inside a
  * section or reference-list name, an organization, or an email, and
  * stray text outside elements at the <rfc> level cannot be kept;
- * ReadXml notes those in HadSkippedContent so the user is warned
- * before saving would drop them.
+ * ReadXml notes those in HadSkippedContent and SkippedDetails so the
+ * user is warned before saving would drop them.
  *
  * WriteXml writes RFCXML version 3, valid against the v3.rng schema
  * from the xml2rfc 3.35.0 distribution, with a custom recursive
@@ -530,6 +530,20 @@ public:
     static QVector<xmlNodePtr> ReferenceEntries(xmlNodePtr Group);
 
     /**
+     * @brief The <referencegroup> children of a list, borrowed, file order.
+     *
+     * A <referencegroup> is a group of references inside a list,
+     * not a list itself: in this codebase "ReferenceGroup" names
+     * a <references> list, while this returns the <referencegroup>
+     * elements that list holds. The entries inside one such group
+     * are read with ReferenceEntries, which returns the
+     * <reference> children of any node it is given.
+     * @param Group The <references> node, borrowed.
+     * @return The reference groups.
+     */
+    static QVector<xmlNodePtr> ReferenceGroupEntries(xmlNodePtr Group);
+
+    /**
      * @brief The outline label for a reference entry.
      *
      * The anchor, plus " - " plus the title when the title is
@@ -890,7 +904,9 @@ public:
      * This lists every over-long line in the modeled
      * <sourcecode> blocks and ASCII-art <artwork>, and in the
      * preserved blocks, with its block kind, its section, its
-     * line number within the block, and its length. SVG artwork
+     * file line number (the line number within the block when
+     * the block carries no file line), the start of the line's
+     * text, and its length. SVG artwork
      * is not listed: it is markup, rendered as an image. Prose
      * is not listed: xml2rfc re-wraps it. This is a warning,
      * not a problem: it does not keep the draft from saving.
@@ -933,7 +949,7 @@ public:
      * title, markup inside a section or reference-list name, an
      * organization, or an email, and stray text outside elements
      * at the <rfc> level cannot be kept; those set
-     * HadSkippedContent.
+     * HadSkippedContent and are named in SkippedDetails.
      * @param Path The file to read.
      * @param Error Set to the reason when reading fails.
      * @return True when the file was read.
@@ -1019,6 +1035,22 @@ public:
      * @param Text The new text.
      */
     static void SetNodeText(xmlNodePtr Node, const QString& Text);
+
+    /**
+     * @brief Removes every child of a node, freeing them.
+     *
+     * The node itself is kept. This is the clearing step for
+     * writing runs back into an element: the old children go,
+     * and the caller appends the new ones.
+     * @param Parent The parent, borrowed; null does nothing.
+     */
+    static void ClearChildren(xmlNodePtr Parent);
+
+    /**
+     * @brief Unlinks a node from its tree and frees it.
+     * @param Node The node, borrowed; null does nothing.
+     */
+    static void RemoveNode(xmlNodePtr Node);
 
     /**
      * @brief One attribute value of a node (xmlGetProp).
@@ -1131,9 +1163,21 @@ public:
      * reference-list name, an organization, or an email, and
      * stray text outside elements at the <rfc> level set this.
      * Saving such a document drops that content; preserved
-     * content is not affected.
+     * content is not affected. SkippedDetails names each item.
      */
     bool HadSkippedContent = false;
+
+    /**
+     * @brief The details ReadXml could not keep, one per skipped item.
+     *
+     * Each entry names what was dropped and where, such as
+     * "Line 42: markup <em> inside a <title> (text kept, markup
+     * dropped)". The list is empty when nothing was skipped, so
+     * it is empty exactly when HadSkippedContent is false. The
+     * Save Draft warning shows these entries so the user can find
+     * and correct what saving would drop.
+     */
+    QStringList SkippedDetails;
 
     /**
      * @brief True when the file already carries the "used as an

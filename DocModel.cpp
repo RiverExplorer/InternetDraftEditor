@@ -1646,6 +1646,7 @@ DocDocument::DocDocument()
 
 DocDocument::DocDocument(const DocDocument& Other)
     : HadSkippedContent(Other.HadSkippedContent)
+    , SkippedDetails(Other.SkippedDetails)
     , HasAidComment(Other.HasAidComment)
     , _Document(Other._Document != nullptr
                 ? xmlCopyDoc(Other._Document, 1) : nullptr)
@@ -1654,11 +1655,13 @@ DocDocument::DocDocument(const DocDocument& Other)
 
 DocDocument::DocDocument(DocDocument&& Other) noexcept
     : HadSkippedContent(Other.HadSkippedContent)
+    , SkippedDetails(Other.SkippedDetails)
     , HasAidComment(Other.HasAidComment)
     , _Document(Other._Document)
 {
     Other._Document = nullptr;
     Other.HadSkippedContent = false;
+    Other.SkippedDetails.clear();
     Other.HasAidComment = false;
 }
 
@@ -1670,6 +1673,7 @@ DocDocument& DocDocument::operator=(const DocDocument& Other)
         if (Copied != nullptr || Other._Document == nullptr) {
             ResetDocument(Copied);
             HadSkippedContent = Other.HadSkippedContent;
+            SkippedDetails = Other.SkippedDetails;
             HasAidComment = Other.HasAidComment;
         }
     }
@@ -1681,9 +1685,11 @@ DocDocument& DocDocument::operator=(DocDocument&& Other) noexcept
     if (this != &Other) {
         ResetDocument(Other._Document);
         HadSkippedContent = Other.HadSkippedContent;
+        SkippedDetails = Other.SkippedDetails;
         HasAidComment = Other.HasAidComment;
         Other._Document = nullptr;
         Other.HadSkippedContent = false;
+        Other.SkippedDetails.clear();
         Other.HasAidComment = false;
     }
     return *this;
@@ -1821,6 +1827,16 @@ void DocDocument::SetNodeText(xmlNodePtr Node, const QString& Text)
     }
     QByteArray TextUtf8 = Utf8Bytes(Text);
     xmlNodeSetContent(Node, reinterpret_cast<const xmlChar*>(TextUtf8.constData()));
+}
+
+void DocDocument::ClearChildren(xmlNodePtr Parent)
+{
+    RemoveAllChildren(Parent);
+}
+
+void DocDocument::RemoveNode(xmlNodePtr Node)
+{
+    UnlinkAndFreeNode(Node);
 }
 
 QString DocDocument::NodeAttribute(xmlNodePtr Node, const char* Name)
@@ -2511,6 +2527,11 @@ QVector<xmlNodePtr> DocDocument::BackChildNodes() const
 QVector<xmlNodePtr> DocDocument::ReferenceEntries(xmlNodePtr Group)
 {
     return ChildElements(Group, "reference");
+}
+
+QVector<xmlNodePtr> DocDocument::ReferenceGroupEntries(xmlNodePtr Group)
+{
+    return ChildElements(Group, "referencegroup");
 }
 
 QString DocDocument::ReferenceLabel(xmlNodePtr Entry,
@@ -3807,16 +3828,26 @@ static QString LiteralLineLocation(const QString& Path, const QString& Label)
  * @brief Appends one description per over-long line in literal text.
  *
  * Lines split on \n; a trailing \r is stripped before counting,
- * since loaded content may carry CRLF endings. Line numbers
- * count from 1 within the block, blank lines included.
+ * since loaded content may carry CRLF endings. The line number
+ * reported is the FILE line: the element's own line plus the
+ * line's index within the block, since the block's text starts on
+ * the element's start-tag line and each newline advances one file
+ * line. When the element carries no file line (a node the editor
+ * created, not one read from the file), the number is labelled
+ * block-relative instead. The start of the line's text is included
+ * so the line can be found by content even when the file has moved on.
+ * @param Element The <sourcecode> or <artwork> element holding the text.
  * @param Text The literal text to check.
  * @param Kind The block kind for the message, such as "sourcecode".
  * @param Location The display location for the message.
  * @param Found The descriptions, appended to.
  */
-static void CollectLongLiteralLines(const QString& Text, const QString& Kind,
-                                    const QString& Location, QStringList& Found)
+static void CollectLongLiteralLines(xmlNodePtr Element, const QString& Text,
+                                    const QString& Kind, const QString& Location,
+                                    QStringList& Found)
 {
+    int ElementLine =
+        (Element != nullptr) ? static_cast<int>(Element->line) : 0;
     const QStringList Lines = Text.split(QLatin1Char('\n'));
     for (int Index = 0; Index < Lines.size(); ++Index) {
         QString Line = Lines.at(Index);
@@ -3824,10 +3855,25 @@ static void CollectLongLiteralLines(const QString& Text, const QString& Kind,
             Line.chop(1);
         }
         if (Line.size() > MaxLiteralLineLength) {
-            Found.append(QStringLiteral("%1 in %2, line %3: %4 characters (limit %5).")
-                             .arg(Kind, Location, QString::number(Index + 1),
-                                  QString::number(Line.size()),
-                                  QString::number(MaxLiteralLineLength)));
+            QString Shown = Line.trimmed();
+            if (Shown.size() > 60) {
+                Shown = Shown.left(60) + QStringLiteral("...");
+            }
+            if (ElementLine > 0) {
+                Found.append(QStringLiteral("%1 in %2, file line %3: %4 characters (limit %5): %6")
+                                 .arg(Kind, Location,
+                                      QString::number(ElementLine + Index),
+                                      QString::number(Line.size()),
+                                      QString::number(MaxLiteralLineLength),
+                                      Shown));
+            } else {
+                Found.append(QStringLiteral("%1 in %2, line %3 of the block: %4 characters (limit %5): %6")
+                                 .arg(Kind, Location,
+                                      QString::number(Index + 1),
+                                      QString::number(Line.size()),
+                                      QString::number(MaxLiteralLineLength),
+                                      Shown));
+            }
         }
     }
 }
@@ -3878,7 +3924,7 @@ static void CollectPreservedLiteralLines(xmlNodePtr Node, const QString& Path,
     QString Name = TextFromXmlChars(Node->name);
     if (Name == QLatin1String("sourcecode")) {
         if (!DocDocument::HasNodeAttribute(Node, "src")) {
-            CollectLongLiteralLines(DirectTextContent(Node),
+            CollectLongLiteralLines(Node, DirectTextContent(Node),
                                     QStringLiteral("sourcecode"),
                                     LiteralLineLocation(Path, Label), Found);
         }
@@ -3897,7 +3943,7 @@ static void CollectPreservedLiteralLines(xmlNodePtr Node, const QString& Path,
         if (!HasElement &&
             !DocDocument::HasNodeAttribute(Node, "src") &&
             (Type.isEmpty() || Type == QLatin1String("ascii-art"))) {
-            CollectLongLiteralLines(DirectTextContent(Node),
+            CollectLongLiteralLines(Node, DirectTextContent(Node),
                                     QStringLiteral("artwork"),
                                     LiteralLineLocation(Path, Label), Found);
         }
@@ -3938,7 +3984,7 @@ static void CollectModeledLiteralLines(xmlNodePtr Node, const QString& Location,
     QString Name = TextFromXmlChars(Node->name);
     if (Name == QLatin1String("sourcecode")) {
         if (!DocDocument::HasNodeAttribute(Node, "src")) {
-            CollectLongLiteralLines(DocDocument::NodeText(Node),
+            CollectLongLiteralLines(Node, DocDocument::NodeText(Node),
                                     QStringLiteral("sourcecode"),
                                     Location, Found);
         }
@@ -3995,7 +4041,7 @@ static void CollectModeledLiteralLines(xmlNodePtr Node, const QString& Location,
         if (Artworks.size() > 1) {
             Kind = QStringLiteral("artwork version %1").arg(Index + 1);
         }
-        CollectLongLiteralLines(DirectTextContent(Artwork), Kind, Location,
+        CollectLongLiteralLines(Artwork, DirectTextContent(Artwork), Kind, Location,
                                 Found);
     }
 }
@@ -4077,11 +4123,83 @@ static bool IsModeledFrontChild(xmlNodePtr Child, bool& SawTitle,
 }
 
 /**
+ * @brief Appends descriptions for over-long lines in one reference entry.
+ *
+ * The modeled front children (the first title and date, series
+ * info, authors) and the first stream are skipped; anything else
+ * in the entry is walked as preserved content.
+ * @param Entry The <reference> node, borrowed.
+ * @param Found The descriptions, appended to.
+ */
+static void CollectReferenceEntryLiteralLines(xmlNodePtr Entry,
+                                              QStringList& Found)
+{
+    QString EntryAnchor = DocDocument::NodeAttribute(Entry, "anchor").trimmed();
+    QString EntryLabel = EntryAnchor.isEmpty()
+        ? QStringLiteral("a reference")
+        : QStringLiteral("reference \"%1\"").arg(EntryAnchor);
+    xmlNodePtr EntryFront = DocDocument::ChildElement(Entry, "front");
+    if (EntryFront != nullptr) {
+        bool SawEntryTitle = false;
+        bool SawEntryDate = false;
+        for (xmlNodePtr Child = EntryFront->children; Child != nullptr;
+             Child = Child->next) {
+            if (!IsElementKind(Child)) {
+                continue;
+            }
+            QString Name = TextFromXmlChars(Child->name);
+            if (Name == QLatin1String("title")) {
+                if (SawEntryTitle) {
+                    CollectPreservedLiteralLines(Child, QString(),
+                                                 EntryLabel, Found);
+                } else {
+                    SawEntryTitle = true;
+                }
+                continue;
+            }
+            if (Name == QLatin1String("date")) {
+                if (SawEntryDate) {
+                    CollectPreservedLiteralLines(Child, QString(),
+                                                 EntryLabel, Found);
+                } else {
+                    SawEntryDate = true;
+                }
+                continue;
+            }
+            if (Name == QLatin1String("seriesInfo") ||
+                Name == QLatin1String("author")) {
+                continue;
+            }
+            CollectPreservedLiteralLines(Child, QString(), EntryLabel,
+                                         Found);
+        }
+    }
+    bool SawStream = false;
+    for (xmlNodePtr Child = Entry->children; Child != nullptr;
+         Child = Child->next) {
+        if (!IsElementKind(Child)) {
+            continue;
+        }
+        QString Name = TextFromXmlChars(Child->name);
+        if (Name == QLatin1String("front")) {
+            continue;
+        }
+        if (Name == QLatin1String("stream") && !SawStream) {
+            SawStream = true;
+            continue;
+        }
+        CollectPreservedLiteralLines(Child, QString(), EntryLabel,
+                                     Found);
+    }
+}
+
+/**
  * @brief Appends descriptions for over-long lines in one reference list.
  *
  * Preserved children of the list and of its entries are walked;
  * a nested list is walked in turn, under its own label, instead
- * of being treated as preserved content.
+ * of being treated as preserved content. A reference group is
+ * walked the same way: its entries are walked one by one.
  * @param Group The <references> node, borrowed.
  * @param Found The descriptions, appended to.
  */
@@ -4105,66 +4223,16 @@ static void CollectReferenceGroupLiteralLines(xmlNodePtr Group,
             CollectReferenceGroupLiteralLines(Child, Found);
             continue;
         }
+        if (DocDocument::NodeNameEquals(Child, "referencegroup")) {
+            for (xmlNodePtr Entry : DocDocument::ReferenceEntries(Child)) {
+                CollectReferenceEntryLiteralLines(Entry, Found);
+            }
+            continue;
+        }
         CollectPreservedLiteralLines(Child, QString(), GroupLabel, Found);
     }
     for (xmlNodePtr Entry : DocDocument::ReferenceEntries(Group)) {
-        QString EntryAnchor = DocDocument::NodeAttribute(Entry, "anchor").trimmed();
-        QString EntryLabel = EntryAnchor.isEmpty()
-            ? QStringLiteral("a reference")
-            : QStringLiteral("reference \"%1\"").arg(EntryAnchor);
-        xmlNodePtr EntryFront = DocDocument::ChildElement(Entry, "front");
-        if (EntryFront != nullptr) {
-            bool SawEntryTitle = false;
-            bool SawEntryDate = false;
-            for (xmlNodePtr Child = EntryFront->children; Child != nullptr;
-                 Child = Child->next) {
-                if (!IsElementKind(Child)) {
-                    continue;
-                }
-                QString Name = TextFromXmlChars(Child->name);
-                if (Name == QLatin1String("title")) {
-                    if (SawEntryTitle) {
-                        CollectPreservedLiteralLines(Child, QString(),
-                                                     EntryLabel, Found);
-                    } else {
-                        SawEntryTitle = true;
-                    }
-                    continue;
-                }
-                if (Name == QLatin1String("date")) {
-                    if (SawEntryDate) {
-                        CollectPreservedLiteralLines(Child, QString(),
-                                                     EntryLabel, Found);
-                    } else {
-                        SawEntryDate = true;
-                    }
-                    continue;
-                }
-                if (Name == QLatin1String("seriesInfo") ||
-                    Name == QLatin1String("author")) {
-                    continue;
-                }
-                CollectPreservedLiteralLines(Child, QString(), EntryLabel,
-                                             Found);
-            }
-        }
-        bool SawStream = false;
-        for (xmlNodePtr Child = Entry->children; Child != nullptr;
-             Child = Child->next) {
-            if (!IsElementKind(Child)) {
-                continue;
-            }
-            QString Name = TextFromXmlChars(Child->name);
-            if (Name == QLatin1String("front")) {
-                continue;
-            }
-            if (Name == QLatin1String("stream") && !SawStream) {
-                SawStream = true;
-                continue;
-            }
-            CollectPreservedLiteralLines(Child, QString(), EntryLabel,
-                                         Found);
-        }
+        CollectReferenceEntryLiteralLines(Entry, Found);
     }
 }
 
@@ -4430,6 +4498,8 @@ static bool ReferenceHasPreservedContent(xmlNodePtr Entry)
         }
     }
     bool SawStream = false;
+    bool SawRefContent = false;
+    bool SawAnnotation = false;
     for (xmlNodePtr Child = Entry->children; Child != nullptr;
          Child = Child->next) {
         if (IsElementKind(Child)) {
@@ -4439,6 +4509,17 @@ static bool ReferenceHasPreservedContent(xmlNodePtr Entry)
             }
             if (Name == QLatin1String("stream") && !SawStream) {
                 SawStream = true;
+                continue;
+            }
+            if (Name == QLatin1String("refcontent") && !SawRefContent) {
+                SawRefContent = true;
+                continue;
+            }
+            // The first annotation is modelled (it is editable
+            // in the entry form, with markup); further ones
+            // count as preserved, as for stream and refcontent.
+            if (Name == QLatin1String("annotation") && !SawAnnotation) {
+                SawAnnotation = true;
                 continue;
             }
             return true;
@@ -4479,6 +4560,35 @@ static bool ReferenceGroupHasPreservedContent(xmlNodePtr Group)
                 continue;
             }
             if (Name == QLatin1String("name")) {
+                continue;
+            }
+            // A reference group is modeled by the editor, not
+            // preserved itself, but preserved content inside
+            // it still counts for the document as a whole.
+            if (Name == QLatin1String("referencegroup")) {
+                if (NodeHasExtraAttribute(Child, { "anchor", "derivedAnchor",
+                                                   "target" }) ||
+                    Child->nsDef != nullptr) {
+                    return true;
+                }
+                for (xmlNodePtr Inner = Child->children; Inner != nullptr;
+                     Inner = Inner->next) {
+                    if (IsElementKind(Inner)) {
+                        if (!DocDocument::NodeNameEquals(Inner, "reference") ||
+                            ReferenceHasPreservedContent(Inner)) {
+                            return true;
+                        }
+                        continue;
+                    }
+                    if (IsCommentKind(Inner) || IsPiKind(Inner) ||
+                        IsEntityRefKind(Inner)) {
+                        return true;
+                    }
+                    if ((IsTextKind(Inner) || IsCdataKind(Inner)) &&
+                        !DocDocument::IsWhitespaceText(Inner)) {
+                        return true;
+                    }
+                }
                 continue;
             }
             // A nested list is modeled by the editor, not
@@ -5236,6 +5346,26 @@ static void ReplaceNodeWithText(xmlNodePtr Node, const QString& Text)
 }
 
 /**
+ * @brief Formats one skipped-content description for the save warning.
+ *
+ * The description names the file line, when the parser recorded
+ * one, and what was dropped, so the user can find and correct it.
+ * The caller builds the description before the node is replaced
+ * or freed, since ReplaceNodeWithText frees the node it replaces.
+ * @param Node The node that was dropped, or the element holding it.
+ * @param Detail What was dropped, such as "markup <em> inside a <title>".
+ * @return The description, such as "Line 42: markup <em> inside a <title>".
+ */
+static QString SkippedDescription(xmlNodePtr Node, const QString& Detail)
+{
+    if (Node != nullptr && Node->line > 0) {
+        return QStringLiteral("Line %1: %2")
+            .arg(static_cast<int>(Node->line)).arg(Detail);
+    }
+    return Detail;
+}
+
+/**
  * @brief Flattens a plain-text element: element children are
  *        replaced by their text, and comments, processing
  *        instructions, and entity references are dropped.
@@ -5243,14 +5373,22 @@ static void ReplaceNodeWithText(xmlNodePtr Node, const QString& Text)
  * The text is kept and the markup is dropped, which sets Skipped.
  * @param Element The element to flatten.
  * @param Skipped Set to true when markup was dropped.
+ * @param SkippedDetails Appended with one description per dropped markup.
+ * @param Context Where the element sits, such as "a section <name>".
  */
-static void FlattenTextElement(xmlNodePtr Element, bool& Skipped)
+static void FlattenTextElement(xmlNodePtr Element, bool& Skipped,
+                               QStringList& SkippedDetails,
+                               const QString& Context)
 {
     for (xmlNodePtr Child : CollectChildren(Element)) {
         if (IsElementKind(Child)) {
             QString Text = DocDocument::NodeText(Child);
+            QString Detail = SkippedDescription(
+                Child, QStringLiteral("markup <%1> inside %2 (text kept, markup dropped)")
+                           .arg(TextFromXmlChars(Child->name), Context));
             ReplaceNodeWithText(Child, Text);
             Skipped = true;
+            SkippedDetails.append(Detail);
         } else if (IsCommentKind(Child) || IsPiKind(Child) ||
                    IsEntityRefKind(Child)) {
             UnlinkAndFreeNode(Child);
@@ -5269,8 +5407,10 @@ static void FlattenTextElement(xmlNodePtr Element, bool& Skipped)
  * entity references are dropped silently, as the old reader did.
  * @param Title The <title> element.
  * @param Skipped Set to true when markup was dropped.
+ * @param SkippedDetails Appended with one description per dropped markup.
  */
-static void NormalizeTitleElement(xmlNodePtr Title, bool& Skipped)
+static void NormalizeTitleElement(xmlNodePtr Title, bool& Skipped,
+                                  QStringList& SkippedDetails)
 {
     for (xmlNodePtr Child : CollectChildren(Title)) {
         if (IsTextKind(Child) || IsCdataKind(Child)) {
@@ -5279,8 +5419,11 @@ static void NormalizeTitleElement(xmlNodePtr Title, bool& Skipped)
         if (IsElementKind(Child) &&
             DocDocument::NodeNameEquals(Child, "br")) {
             if (Child->properties != nullptr || Child->nsDef != nullptr) {
+                QString Detail = SkippedDescription(
+                    Child, QStringLiteral("a <br/> with attributes or a namespace declaration inside a <title> (text kept, markup dropped)"));
                 ReplaceNodeWithText(Child, DocDocument::NodeText(Child));
                 Skipped = true;
+                SkippedDetails.append(Detail);
                 continue;
             }
             bool HasElement = false;
@@ -5295,19 +5438,28 @@ static void NormalizeTitleElement(xmlNodePtr Title, bool& Skipped)
                 }
             }
             if (HasElement) {
+                QString Detail = SkippedDescription(
+                    Child, QStringLiteral("a <br/> holding markup inside a <title> (text kept, markup dropped)"));
                 ReplaceNodeWithText(Child, DocDocument::NodeText(Child));
                 Skipped = true;
+                SkippedDetails.append(Detail);
             } else {
                 RemoveAllChildren(Child);
                 if (HasContent) {
                     Skipped = true;
+                    SkippedDetails.append(SkippedDescription(
+                        Child, QStringLiteral("text inside a <br/> in a <title> (dropped)")));
                 }
             }
             continue;
         }
         if (IsElementKind(Child)) {
+            QString Detail = SkippedDescription(
+                Child, QStringLiteral("markup <%1> inside a <title> (text kept, markup dropped)")
+                           .arg(TextFromXmlChars(Child->name)));
             ReplaceNodeWithText(Child, DocDocument::NodeText(Child));
             Skipped = true;
+            SkippedDetails.append(Detail);
             continue;
         }
         UnlinkAndFreeNode(Child);
@@ -5363,14 +5515,18 @@ static bool NoteNodeIsEmpty(xmlNodePtr Note)
  * dropped. Empty notes in the front are dropped on load.
  * @param Document The parsed document.
  * @param Skipped Set to true when content that cannot be kept was found.
+ * @param SkippedDetails Appended with one description per skipped item.
  */
-static void ApplyStructuralPass(xmlDocPtr Document, bool& Skipped)
+static void ApplyStructuralPass(xmlDocPtr Document, bool& Skipped,
+                                QStringList& SkippedDetails)
 {
     if (Document == nullptr) {
         return;
     }
     if (Document->intSubset != nullptr || Document->extSubset != nullptr) {
         Skipped = true;
+        SkippedDetails.append(
+            QStringLiteral("a document type declaration (<!DOCTYPE ...>)"));
     }
     xmlNodePtr Root = xmlDocGetRootElement(Document);
     for (xmlNodePtr Child = Document->children; Child != nullptr;
@@ -5391,14 +5547,24 @@ static void ApplyStructuralPass(xmlDocPtr Document, bool& Skipped)
             if (!Comment.contains(
                     QStringLiteral("InternetDraftEditor"))) {
                 Skipped = true;
+                SkippedDetails.append(SkippedDescription(
+                    Child, QStringLiteral("a comment outside the <rfc> element")));
             }
         } else if (IsPiKind(Child) || IsEntityRefKind(Child)) {
             Skipped = true;
+            SkippedDetails.append(SkippedDescription(
+                Child, IsPiKind(Child)
+                    ? QStringLiteral("a processing instruction outside the <rfc> element")
+                    : QStringLiteral("an entity reference outside the <rfc> element")));
         } else if (Child->type == XML_DTD_NODE) {
             Skipped = true;
+            SkippedDetails.append(
+                QStringLiteral("a document type declaration (<!DOCTYPE ...>)"));
         } else if ((IsTextKind(Child) || IsCdataKind(Child)) &&
                    !DocDocument::IsWhitespaceText(Child)) {
             Skipped = true;
+            SkippedDetails.append(SkippedDescription(
+                Child, QStringLiteral("text outside the <rfc> element")));
         }
     }
     if (Root == nullptr) {
@@ -5407,8 +5573,11 @@ static void ApplyStructuralPass(xmlDocPtr Document, bool& Skipped)
     for (xmlNodePtr Child : CollectChildren(Root)) {
         if ((IsTextKind(Child) || IsCdataKind(Child)) &&
             !DocDocument::IsWhitespaceText(Child)) {
+            QString Detail = SkippedDescription(
+                Child, QStringLiteral("stray text inside <rfc>, outside any element"));
             UnlinkAndFreeNode(Child);
             Skipped = true;
+            SkippedDetails.append(Detail);
         }
     }
     std::function<void(xmlNodePtr)> Visit = [&](xmlNodePtr Node) {
@@ -5425,23 +5594,28 @@ static void ApplyStructuralPass(xmlDocPtr Document, bool& Skipped)
             ParentName = TextFromXmlChars(Parent->name);
         }
         if (Name == QLatin1String("title")) {
-            NormalizeTitleElement(Node, Skipped);
+            NormalizeTitleElement(Node, Skipped, SkippedDetails);
             return;
         }
         if (Name == QLatin1String("name") &&
             (ParentName == QLatin1String("section") ||
              ParentName == QLatin1String("references"))) {
-            FlattenTextElement(Node, Skipped);
+            QString Context = (ParentName == QLatin1String("section"))
+                ? QStringLiteral("a section <name>")
+                : QStringLiteral("a reference-list <name>");
+            FlattenTextElement(Node, Skipped, SkippedDetails, Context);
             return;
         }
         if (Name == QLatin1String("organization") &&
             ParentName == QLatin1String("author")) {
-            FlattenTextElement(Node, Skipped);
+            FlattenTextElement(Node, Skipped, SkippedDetails,
+                               QStringLiteral("an author's <organization>"));
             return;
         }
         if (Name == QLatin1String("email") &&
             ParentName == QLatin1String("address")) {
-            FlattenTextElement(Node, Skipped);
+            FlattenTextElement(Node, Skipped, SkippedDetails,
+                               QStringLiteral("an <email>"));
             return;
         }
         if (Name == QLatin1String("section")) {
@@ -5543,9 +5717,12 @@ bool DocDocument::ReadXml(const QString& Path, QString& Error)
         }
     }
     bool Skipped = false;
-    ApplyStructuralPass(Parsed, Skipped);
+    QStringList Details;
+    ApplyStructuralPass(Parsed, Skipped, Details);
+    Details.removeDuplicates();
     ResetDocument(Parsed);
     HadSkippedContent = Skipped;
+    SkippedDetails = Details;
     return true;
 }
 
@@ -5828,5 +6005,6 @@ DocDocument DocDocument::NewWithDefaults(const QString& DocName,
     }
     Document.ResetDocument(Parsed);
     Document.HadSkippedContent = false;
+    Document.SkippedDetails.clear();
     return Document;
 }

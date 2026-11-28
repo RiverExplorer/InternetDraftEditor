@@ -27,8 +27,11 @@
 #include <QPlainTextEdit>
 #include <QPoint>
 #include <QVector>
+#include <libxml/tree.h>
 
+class DocDocument;
 class QLineEdit;
+class QPushButton;
 class QTableWidget;
 class QDialogButtonBox;
 
@@ -171,15 +174,53 @@ public:
 
     /**
      * @brief Sets the figure's caption.
+     *
+     * The caption is display-only: it is the plain text of
+     * the <name> node when one was given with setNameNode,
+     * and the string given here otherwise. A later setNameNode
+     * refreshes the preview from the node.
      * @param Caption The <name> text.
      */
     void setCaption(const QString& Caption);
 
     /**
-     * @brief The figure's caption.
+     * @brief The figure's caption, as plain text.
+     *
+     * When a <name> node was given with setNameNode, this is
+     * the node's text content (markup stripped); otherwise it
+     * is the caption string given with setCaption.
      * @return The <name> text.
      */
     QString caption() const;
+
+    /**
+     * @brief Gives the dialog the figure's <name> node.
+     *
+     * The node is borrowed, owned by the caller, and edited
+     * in place by the Edit Caption button through the shared
+     * inline editor. Passing a node enables that button; with
+     * no node the caption stays a plain string and the button
+     * stays disabled. The preview refreshes from the node's
+     * text, so the string from setCaption and the node agree
+     * only when the caller passes the node the caption came
+     * from.
+     * @param NameNode The <name> node, borrowed; null keeps
+     *        the plain-text caption path.
+     * @param Document The document, for the inline editor; may
+     *        be null.
+     */
+    void setNameNode(xmlNodePtr NameNode, const DocDocument* Document);
+
+    /**
+     * @brief The figure's <name> node, edited in place.
+     *
+     * The caller reads this after acceptance to carry the
+     * edited runs into the figure it writes back: the node
+     * already holds the runs, so its text must not be written
+     * back over it as plain text.
+     * @return The node passed to setNameNode, or null.
+     */
+    xmlNodePtr nameNode() const;
 
     /**
      * @brief Sets the figure's anchor.
@@ -212,8 +253,19 @@ private:
      */
     void fillTagTable(const QVector<FigureTagRow>& Rows);
 
+    /**
+     * @brief Opens the inline editor on the figure's <name>
+     *        node and refreshes the caption preview.
+     *
+     * Does nothing when no <name> node was given.
+     */
+    void OnEditCaption();
+
     FigureCanvas* _Canvas = nullptr;
     QLineEdit* _CaptionEdit = nullptr;
+    QPushButton* _EditCaptionButton = nullptr;
+    xmlNodePtr _NameNode = nullptr;
+    const DocDocument* _Document = nullptr;
     QLineEdit* _AnchorEdit = nullptr;
     QTableWidget* _TagTable = nullptr;
     QDialogButtonBox* _Buttons = nullptr;

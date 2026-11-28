@@ -12,6 +12,9 @@
 
 #include "FigureEditor.h"
 
+#include "DocModel.h"
+#include "TextEditor.h"
+
 #include <QButtonGroup>
 #include <QDialogButtonBox>
 #include <QFontDatabase>
@@ -526,9 +529,24 @@ FigureEditorDialog::FigureEditorDialog(QWidget* Parent) : QDialog(Parent)
     ToolRow->addStretch(1);
 
     _CaptionEdit = new QLineEdit(this);
+    _CaptionEdit->setReadOnly(true);
+    // The caption holds formatted text, so the preview is
+    // display-only and the button opens the inline editor.
+    // It stays disabled until a <name> node is given, since
+    // only then is there a node to edit in place.
+    _EditCaptionButton = new QPushButton(tr("Edit Caption"), this);
+    _EditCaptionButton->setToolTip(tr("Edit the caption, including formatted text."));
+    _EditCaptionButton->setEnabled(false);
+    connect(_EditCaptionButton, &QPushButton::clicked,
+            this, &FigureEditorDialog::OnEditCaption);
+    QWidget* CaptionWidget = new QWidget(this);
+    QHBoxLayout* CaptionLayout = new QHBoxLayout(CaptionWidget);
+    CaptionLayout->setContentsMargins(0, 0, 0, 0);
+    CaptionLayout->addWidget(_CaptionEdit, 1);
+    CaptionLayout->addWidget(_EditCaptionButton);
     _AnchorEdit = new QLineEdit(this);
     QFormLayout* Fields = new QFormLayout();
-    Fields->addRow(tr("Caption:"), _CaptionEdit);
+    Fields->addRow(tr("Caption:"), CaptionWidget);
     Fields->addRow(tr("Anchor:"), _AnchorEdit);
 
     _TagTable = new QTableWidget(0, 3, this);
@@ -602,12 +620,49 @@ QString FigureEditorDialog::artworkText() const
 
 void FigureEditorDialog::setCaption(const QString& Caption)
 {
-    _CaptionEdit->setText(Caption);
+    // With a <name> node the preview shows the node's text,
+    // so a string here must not overwrite it: the node is the
+    // caption's home, the string is only its starting value
+    // for callers that pass no node.
+    if (_NameNode == nullptr) {
+        _CaptionEdit->setText(Caption);
+    }
 }
 
 QString FigureEditorDialog::caption() const
 {
+    if (_NameNode != nullptr) {
+        return DocDocument::NodeText(_NameNode).trimmed();
+    }
     return _CaptionEdit->text().trimmed();
+}
+
+void FigureEditorDialog::setNameNode(xmlNodePtr NameNode,
+                                     const DocDocument* Document)
+{
+    _NameNode = NameNode;
+    _Document = Document;
+    if (_NameNode != nullptr) {
+        _CaptionEdit->setText(DocDocument::NodeText(_NameNode).trimmed());
+    }
+    _EditCaptionButton->setEnabled(_NameNode != nullptr);
+}
+
+xmlNodePtr FigureEditorDialog::nameNode() const
+{
+    return _NameNode;
+}
+
+void FigureEditorDialog::OnEditCaption()
+{
+    if (_NameNode == nullptr) {
+        return;
+    }
+    if (!TextEditor::EditInlineElement(this, tr("Edit Caption"), _NameNode,
+                                       QStringLiteral("name"), _Document)) {
+        return;
+    }
+    _CaptionEdit->setText(DocDocument::NodeText(_NameNode).trimmed());
 }
 
 void FigureEditorDialog::setAnchor(const QString& Anchor)

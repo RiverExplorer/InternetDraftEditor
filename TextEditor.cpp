@@ -31,6 +31,7 @@
 #include <QFont>
 #include <QFontInfo>
 #include <QFontMetrics>
+#include <QFontMetricsF>
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QHelpEvent>
@@ -42,6 +43,8 @@
 #include <QMessageBox>
 #include <QMimeData>
 #include <QMouseEvent>
+#include <QPaintEvent>
+#include <QPainter>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRegularExpression>
@@ -398,6 +401,17 @@ static QTextTable* TableOfBlock(QTextDocument* Document, const QTextBlock& Block
 }
 
 /**
+ * @brief The column the margin guide marks, in characters.
+ *
+ * The literal-line limit (Bug 458): a sourcecode or artwork line
+ * longer than this draws an xml2rfc warning. The guide in
+ * DocTextEdit::paintEvent marks it while the cursor sits in a
+ * literal block. Keep in step with MaxLiteralLineLength in
+ * DocModel.cpp.
+ */
+const int DocMarginGuideColumn = 69;
+
+/**
  * @brief The font families code is shown in.
  * @return The monospace families, in preference order.
  */
@@ -438,9 +452,17 @@ static QTextCharFormat CodeCharFormat()
 class DocTextEdit : public QTextEdit
 {
 public:
-    explicit DocTextEdit(QWidget* Parent = nullptr) : QTextEdit(Parent) {}
+    explicit DocTextEdit(QWidget* Parent = nullptr) : QTextEdit(Parent)
+    {
+        // Bug 548: the margin guide depends on the cursor's block,
+        // so repaint when the cursor moves: the guide appears or
+        // disappears as the cursor enters or leaves a literal block.
+        connect(this, &QTextEdit::cursorPositionChanged,
+                this, [this]() { viewport()->update(); });
+    }
 
 protected:
+    void paintEvent(QPaintEvent* Event) override;
     void insertFromMimeData(const QMimeData* Source) override;
     QMimeData* createMimeDataFromSelection() const override;
 };
@@ -637,6 +659,8 @@ static const DocTagInfo TagInfos[] = {
  * The rules come from the content models in v3.rng. "t" is the
  * paragraph itself; "td" and "th" are table cells, which hold
  * the 13-element cell set: no contact, list, spanx, or vspace.
+ * "annotation", "refcontent", and "name" are the inline-element
+ * dialog's containers: their sets are the schema's own (v3.rng).
  * Containers missing here (u, spanx, bcp14,
  * eref, relref, contact children) hold no tags the menu offers.
  */
@@ -657,6 +681,9 @@ static const DocNestingRule NestingRules[] = {
     {"tt", "bcp14 br cref em eref iref relref strong sub sup xref"},
     {"xref", "em strong sub sup tt"},
     {"cref", "br em eref relref strong sub sup tt xref"},
+    {"annotation", "bcp14 cref em eref iref relref spanx strong sub sup tt u xref"},
+    {"refcontent", "bcp14 em strong sub sup tt"},
+    {"name", "bcp14 br cref em eref iref relref strong sub sup tt xref"},
 };
 
 /**
@@ -2468,30 +2495,23 @@ static void BuildNodeRuns(const QVector<DocEvent>& Events, int& Pos,
 static QString SrcPlaceholderText(const QString& Src);
 
 /**
- * @brief Reads one block as a paragraph, from its fragments.
+ * @brief Appends one block's runs as events, in fragment order.
  *
  * Fragments carry the tag stacks, so the events open and close
  * tags where the stacks change. Soft line breaks inside a block
  * read back as newlines (Bug 461), so the lines typed in a
  * paragraph show again on load; a forced break still comes
- * from the Break menu item.
- * @param Block The block.
- * @return The paragraph.
+ * from the Break menu item. Display-only marks (an option
+ * marker, a source placeholder) convert to no run, keeping
+ * only text typed beside them. NodeFromBlock and the
+ * inline-element dialog share this, so both read a block the
+ * same way.
+ * @param Events The events to append to.
+ * @param Block The block to read.
  */
-/**
- * @brief Reads one block as a <t> node, from its fragments.
- *
- * Fragments carry the tag stacks, so the events open and close
- * tags where the stacks change. Soft line breaks inside a block
- * read back as newlines (Bug 461), so the lines typed in a
- * paragraph show again on load; a forced break still comes
- * from the Break menu item.
- * @param Block The block.
- * @return The <t> node; the caller owns it.
- */
-static xmlNodePtr NodeFromBlock(const QTextBlock& Block)
+static void AppendBlockEvents(QVector<DocEvent>& Events,
+                              const QTextBlock& Block)
 {
-    QVector<DocEvent> Events;
     DocTagStack Current;
     for (QTextBlock::iterator It = Block.begin(); !It.atEnd(); ++It) {
         QTextFragment Fragment = It.fragment();
@@ -2562,6 +2582,34 @@ static xmlNodePtr NodeFromBlock(const QTextBlock& Block)
         Event.EventKind = DocEvent::Kind::CloseTag;
         Events.append(Event);
     }
+}
+
+/**
+ * @brief Reads one block as a paragraph, from its fragments.
+ *
+ * Fragments carry the tag stacks, so the events open and close
+ * tags where the stacks change. Soft line breaks inside a block
+ * read back as newlines (Bug 461), so the lines typed in a
+ * paragraph show again on load; a forced break still comes
+ * from the Break menu item.
+ * @param Block The block.
+ * @return The paragraph.
+ */
+/**
+ * @brief Reads one block as a <t> node, from its fragments.
+ *
+ * Fragments carry the tag stacks, so the events open and close
+ * tags where the stacks change. Soft line breaks inside a block
+ * read back as newlines (Bug 461), so the lines typed in a
+ * paragraph show again on load; a forced break still comes
+ * from the Break menu item.
+ * @param Block The block.
+ * @return The <t> node; the caller owns it.
+ */
+static xmlNodePtr NodeFromBlock(const QTextBlock& Block)
+{
+    QVector<DocEvent> Events;
+    AppendBlockEvents(Events, Block);
     xmlNodePtr Paragraph = NewNode("t");
     int Pos = 0;
     // The display names ride on the block's own text document,
@@ -3565,6 +3613,369 @@ static void InsertNodeRuns(QTextCursor& Cursor, xmlNodePtr Node)
     DocTagStack Stack;
     InsertNodeChildren(Cursor, Node, Stack);
 }
+
+/**
+ * @brief Tests whether an element holds nothing worth keeping.
+ *
+ * An element counts as empty when it has no element or comment
+ * children and its text is empty. A comment on its own counts
+ * as content: it is a node the author put there, not blank text.
+ * @param Element The element; null counts as empty.
+ * @return True when the element holds no text and no element
+ *         or comment children.
+ */
+static bool ElementIsEmpty(xmlNodePtr Element)
+{
+    if (Element == nullptr) {
+        return true;
+    }
+    for (xmlNodePtr Child = Element->children; Child != nullptr;
+         Child = Child->next) {
+        if (Child->type == XML_ELEMENT_NODE ||
+            Child->type == XML_COMMENT_NODE) {
+            return false;
+        }
+    }
+    return DocDocument::NodeText(Element).isEmpty();
+}
+
+namespace {
+
+/**
+ * @brief One toggle button: the tag it adds or removes, and its label.
+ */
+struct DocInlineToggle
+{
+    const char* Tag;
+    const char* Label;
+};
+
+/**
+ * @brief The six formatting tags the inline dialog offers, in
+ *        button order.
+ */
+static const DocInlineToggle InlineToggles[] = {
+    {"strong", "Bold"},
+    {"em", "Italic"},
+    {"tt", "Teletype"},
+    {"sub", "Subscript"},
+    {"sup", "Superscript"},
+    {"bcp14", "BCP 14"},
+};
+
+/**
+ * @brief The pop-up dialog that edits one inline element's runs.
+ *
+ * The element's children show as formatted text in a small
+ * edit, with six toggle buttons for the formatting tags. The
+ * other tags the element may hold (links, references,
+ * comments) have no buttons: they stay in the runs with their
+ * attributes, so they survive the round trip untouched. Enter
+ * adds a soft line break instead of a new paragraph, since the
+ * element holds inline content only. OK writes the runs back
+ * into the element; Cancel leaves it alone.
+ */
+class DocInlineDialog : public QDialog
+{
+public:
+    /**
+     * @brief Builds the dialog and fills the edit from the element.
+     * @param Parent The dialog parent.
+     * @param Title The dialog window title.
+     * @param Element The live element to edit; borrowed.
+     * @param ContainerName The element name: "annotation",
+     *        "refcontent", or "name".
+     * @param Document The document, for display names; may be null.
+     */
+    DocInlineDialog(QWidget* Parent, const QString& Title,
+                    xmlNodePtr Element, const QString& ContainerName,
+                    const DocDocument* Document)
+        : QDialog(Parent), _ContainerName(ContainerName)
+    {
+        setWindowTitle(Title);
+        resize(480, 300);
+
+        _Edit = new QTextEdit(this);
+        _Edit->installEventFilter(this);
+        // The document belongs to the edit, so it outlives every
+        // use the edit makes of it and goes away with the edit.
+        QTextDocument* EditDocument = new QTextDocument(_Edit);
+        EditDocument->setProperty(
+            DisplayNamesProperty, DisplayNamesFromDocument(Document));
+        QTextCursor Cursor(EditDocument);
+        InsertNodeRuns(Cursor, Element);
+        _Edit->setDocument(EditDocument);
+        QTextCursor Start(EditDocument);
+        Start.setPosition(0);
+        _Edit->setTextCursor(Start);
+
+        QHBoxLayout* ButtonRow = new QHBoxLayout();
+        for (const DocInlineToggle& Toggle : InlineToggles) {
+            QPushButton* Button =
+                new QPushButton(tr(Toggle.Label), this);
+            Button->setCheckable(true);
+            QString Tag = QString::fromLatin1(Toggle.Tag);
+            connect(Button, &QPushButton::toggled, this,
+                    [this, Tag](bool Checked) {
+                        OnToggle(Tag, Checked);
+                    });
+            _Buttons.append(Button);
+            ButtonRow->addWidget(Button);
+        }
+        ButtonRow->addStretch();
+
+        QDialogButtonBox* Buttons = new QDialogButtonBox(
+            QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+        connect(Buttons, &QDialogButtonBox::accepted,
+                this, &QDialog::accept);
+        connect(Buttons, &QDialogButtonBox::rejected,
+                this, &QDialog::reject);
+
+        QVBoxLayout* Layout = new QVBoxLayout(this);
+        Layout->addWidget(_Edit);
+        Layout->addLayout(ButtonRow);
+        Layout->addWidget(Buttons);
+
+        connect(_Edit, &QTextEdit::cursorPositionChanged,
+                this, [this]() { UpdateButtons(); });
+        UpdateButtons();
+    }
+
+    /**
+     * @brief Writes the edited runs back into the element.
+     *
+     * Every block is read with AppendBlockEvents, so the dialog
+     * reads blocks exactly the way NodeFromBlock does; blocks
+     * are joined with one space, so pasted multi-paragraph text
+     * reads back as flowing prose. The old children are cleared
+     * first, then the runs are built into the element.
+     * @param Element The live element to write into.
+     * @return True when the element still holds text or element
+     *         or comment children after the write.
+     */
+    bool WriteBack(xmlNodePtr Element)
+    {
+        QTextDocument* Document = _Edit->document();
+        QVector<DocEvent> Events;
+        bool FirstBlock = true;
+        for (QTextBlock Block = Document->begin(); Block.isValid();
+             Block = Block.next()) {
+            if (!FirstBlock) {
+                DocEvent Event;
+                Event.EventKind = DocEvent::Kind::TextRun;
+                Event.Text = QStringLiteral(" ");
+                Events.append(Event);
+            }
+            FirstBlock = false;
+            AppendBlockEvents(Events, Block);
+        }
+        DocDocument::ClearChildren(Element);
+        int Pos = 0;
+        BuildNodeRuns(Events, Pos, Element,
+                      DisplayNamesForDocument(Document));
+        return !ElementIsEmpty(Element);
+    }
+
+protected:
+    /**
+     * @brief Turns Enter into a soft line break in the edit.
+     *
+     * The element holds inline content only, so it stays one
+     * block: Return and Enter (Shift+Enter included) insert the
+     * soft-break character instead of starting a new paragraph.
+     * @param Watched The object the event is for.
+     * @param Event The event.
+     * @return True when the key was handled here.
+     */
+    bool eventFilter(QObject* Watched, QEvent* Event) override
+    {
+        if (Watched == _Edit && Event->type() == QEvent::KeyPress) {
+            QKeyEvent* Key = static_cast<QKeyEvent*>(Event);
+            if (Key->key() == Qt::Key_Return ||
+                Key->key() == Qt::Key_Enter) {
+                QTextCursor Cursor = _Edit->textCursor();
+                Cursor.insertText(QString(SoftBreakChar));
+                _Edit->setTextCursor(Cursor);
+                return true;
+            }
+        }
+        return QDialog::eventFilter(Watched, Event);
+    }
+
+private:
+    /**
+     * @brief Applies or removes one tag, from its toggle button.
+     *
+     * With a selection the tag is applied to, or removed from,
+     * every fragment the selection touches, the same way the
+     * main editor's ChangeStacks does: a fragment that already
+     * holds the tag is left alone when adding, and a fragment
+     * is only added to where the schema allows the tag under
+     * its innermost tag, or under the container when the
+     * fragment holds no tag. With no selection the caret's
+     * format is changed, so text typed next takes the tag.
+     * @param Tag The tag to apply or remove.
+     * @param Checked True to add the tag, false to remove it.
+     */
+    void OnToggle(const QString& Tag, bool Checked)
+    {
+        QTextCursor Cursor = _Edit->textCursor();
+        if (Cursor.hasSelection()) {
+            ApplyToSelection(Tag, Checked);
+        } else {
+            DocTagStack Stack = StackOf(Cursor.charFormat());
+            DocTagStack Changed;
+            if (Checked) {
+                DocTagEntry Entry;
+                Entry.Name = Tag;
+                Changed = StackWithTag(Stack, Entry);
+            } else {
+                Changed = StackWithoutLast(Stack, Tag);
+            }
+            QTextCharFormat Format;
+            Format.setProperty(DocStackProperty, StackToVariant(Changed));
+            ApplyStackVisuals(Format, Changed);
+            _Edit->setCurrentCharFormat(Format);
+        }
+        UpdateButtons();
+    }
+
+    /**
+     * @brief Applies or removes one tag across the selection.
+     *
+     * The fragment formats are snapshotted first: changing
+     * formats splits fragments, which would disturb a live
+     * walk. Marker characters keep their marker styling on top
+     * of the changed stack. Option markers are display only
+     * and never take a tag.
+     * @param Tag The tag to apply or remove.
+     * @param Add True to add the tag, false to remove it.
+     */
+    void ApplyToSelection(const QString& Tag, bool Add)
+    {
+        QTextDocument* Document = _Edit->document();
+        QTextCursor Cursor = _Edit->textCursor();
+        int Start = Cursor.selectionStart();
+        int End = Cursor.selectionEnd();
+        struct FragmentChange
+        {
+            int From;
+            int To;
+            QTextCharFormat Format;
+        };
+        QVector<FragmentChange> Changes;
+        QTextBlock Block = Document->findBlock(Start);
+        while (Block.isValid() && Block.position() < End) {
+            for (QTextBlock::iterator It = Block.begin(); !It.atEnd();
+                 ++It) {
+                QTextFragment Fragment = It.fragment();
+                int FragStart = Fragment.position();
+                int FragEnd = FragStart + Fragment.length();
+                int From = FragStart > Start ? FragStart : Start;
+                int To = FragEnd < End ? FragEnd : End;
+                if (From >= To) {
+                    continue;
+                }
+                if (Fragment.charFormat()
+                        .property(DocOptionMarkerProperty)
+                        .isValid()) {
+                    continue;
+                }
+                DocTagStack Stack = StackOf(Fragment.charFormat());
+                DocTagStack Changed;
+                if (Add) {
+                    QString Parent = !Stack.isEmpty()
+                        ? Stack.last().Name : _ContainerName;
+                    if (StackHolds(Stack, Tag) ||
+                        !CanContain(Parent, Tag)) {
+                        continue;
+                    }
+                    DocTagEntry Entry;
+                    Entry.Name = Tag;
+                    Changed = StackWithTag(Stack, Entry);
+                } else {
+                    if (!StackHolds(Stack, Tag)) {
+                        continue;
+                    }
+                    Changed = StackWithoutTag(Stack, Tag);
+                }
+                QTextCharFormat Format = Fragment.charFormat();
+                Format.setProperty(DocStackProperty,
+                                   StackToVariant(Changed));
+                ApplyStackVisuals(Format, Changed);
+                QVariant MarkerValue =
+                    Format.property(DocMarkerProperty);
+                if (MarkerValue.isValid()) {
+                    ApplyMarkerVisuals(Format,
+                                       EntryFromVariant(MarkerValue));
+                }
+                FragmentChange Change;
+                Change.From = From;
+                Change.To = To;
+                Change.Format = Format;
+                Changes.append(Change);
+            }
+            Block = Block.next();
+        }
+        QTextCursor Guard(Document);
+        Guard.beginEditBlock();
+        for (const FragmentChange& Change : Changes) {
+            QTextCursor FragCursor(Document);
+            FragCursor.setPosition(Change.From);
+            FragCursor.setPosition(Change.To, QTextCursor::KeepAnchor);
+            FragCursor.setCharFormat(Change.Format);
+        }
+        Guard.endEditBlock();
+    }
+
+    /**
+     * @brief Refreshes the toggle buttons from the caret's stack.
+     *
+     * A button reads checked when the stack at the caret holds
+     * its tag; the stack property is the source of truth, never
+     * the shown weight or slant, since BCP 14 and Strong both
+     * show bold. A button is offered when the container allows
+     * its tag and every tag in the stack allows it nested inside
+     * (a tag with no nesting rule allows nothing further, so no
+     * more formatting is offered inside a BCP 14 run, as in the
+     * main editor). A tag already present can always be switched
+     * off again: the rules decide what can be added, not what
+     * can be removed. Without that, a checked button would go
+     * dead — no rule lists a tag inside itself — and the tag
+     * could never be removed from the dialog. With a selection
+     * the caret's stack decides, as in the main editor's menu.
+     */
+    void UpdateButtons()
+    {
+        QTextCursor Cursor = _Edit->textCursor();
+        DocTagStack Stack = StackOf(Cursor.charFormat());
+        for (int i = 0; i < _Buttons.size() &&
+             i < static_cast<int>(sizeof(InlineToggles) /
+                                  sizeof(InlineToggles[0]));
+             ++i) {
+            QString Tag = QString::fromLatin1(InlineToggles[i].Tag);
+            bool Held = StackHolds(Stack, Tag);
+            bool Allowed = CanContain(_ContainerName, Tag);
+            if (Allowed && !Held) {
+                for (const DocTagEntry& Entry : Stack) {
+                    if (!CanContain(Entry.Name, Tag)) {
+                        Allowed = false;
+                        break;
+                    }
+                }
+            }
+            QSignalBlocker Blocker(_Buttons[i]);
+            _Buttons[i]->setChecked(Held);
+            _Buttons[i]->setEnabled(Held || Allowed);
+        }
+    }
+
+    QTextEdit* _Edit = nullptr;
+    QString _ContainerName;
+    QVector<QPushButton*> _Buttons;
+};
+
+} // namespace
 
 /**
  * @brief Inserts a list paragraph at the cursor, in a fresh block.
@@ -6446,6 +6857,50 @@ static void InsertHtmlPaste(QTextCursor& Cursor, const QString& Html)
     FlushPre();
 }
 
+/**
+ * @brief Paints the text, plus the margin guide in a literal block.
+ *
+ * After the base paint, when the cursor sits in a sourcecode or
+ * figure-artwork block, a dashed vertical line marks the column
+ * where the literal-line limit falls (Bug 548), so the user can
+ * see while typing whether a line is reaching the limit. Plain
+ * paragraphs get no guide. The x offset is the block's text start
+ * (the cursor rectangle at the block start already accounts for
+ * the document margin, the block indent, and the scroll offset)
+ * plus the column times the monospace character width; a
+ * floating-point width is used, since an integer width rounded
+ * per character would drift over 69 columns.
+ * @param Event The paint event.
+ */
+void DocTextEdit::paintEvent(QPaintEvent* Event)
+{
+    QTextEdit::paintEvent(Event);
+    QTextBlock Block = textCursor().block();
+    if (!IsSourceCodeBlock(Block) && !IsFigureArtworkBlock(Block)) {
+        return;
+    }
+    QFont CodeFont = font();
+    CodeFont.setFamilies(CodeFontFamilies());
+    QFontMetricsF Metrics(CodeFont);
+    qreal CharWidth = Metrics.horizontalAdvance(QLatin1Char('x'));
+    if (CharWidth <= 0) {
+        return;
+    }
+    QTextCursor At(document());
+    At.setPosition(Block.position());
+    qreal TextStartX = cursorRect(At).left();
+    qreal GuideX = TextStartX + DocMarginGuideColumn * CharWidth;
+    QPainter Painter(viewport());
+    // Bug 548: the guide colour is the link/border blue already
+    // used for links and the checked-button border, so it fits
+    // the theme; dashed reads as a guide, not a caret or text.
+    QPen Pen(QColor(QStringLiteral("#B0C4E8")));
+    Pen.setStyle(Qt::DashLine);
+    Painter.setPen(Pen);
+    Painter.drawLine(QPointF(GuideX, 0),
+                     QPointF(GuideX, viewport()->height()));
+}
+
 void DocTextEdit::insertFromMimeData(const QMimeData* Source)
 {
     if (IsPlaceholderBlock(textCursor().block())) {
@@ -8468,6 +8923,10 @@ bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
             Cursor.setCharFormat(CodeCharFormat());
             _TextEdit->setTextCursor(Cursor);
             Cursor.endEditBlock();
+            // A new block makes Qt jump the view to the top
+            // (Bug 545): bring it back to the cursor, which
+            // is where the typing goes.
+            _TextEdit->ensureCursorVisible();
             return true;
         }
     }
@@ -8503,6 +8962,10 @@ bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
         }
         _TextEdit->setTextCursor(Cursor);
         Cursor.endEditBlock();
+        // A new block makes Qt jump the view to the top
+        // (Bug 545): bring it back to the cursor, which
+        // is where the typing goes.
+        _TextEdit->ensureCursorVisible();
         return true;
     }
     if (Cursor.currentTable() != nullptr && (Plain || ShiftOnly) &&
@@ -8663,6 +9126,10 @@ bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
             Cursor.setCharFormat(Typing);
             _TextEdit->setTextCursor(Cursor);
             Cursor.endEditBlock();
+            // A new block makes Qt jump the view to the top
+            // (Bug 545): bring it back to the cursor, which
+            // is where the typing goes.
+            _TextEdit->ensureCursorVisible();
             return true;
         }
         if (Plain && Role == QLatin1String("definition")) {
@@ -8702,6 +9169,10 @@ bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
             Cursor.setCharFormat(Typing);
             _TextEdit->setTextCursor(Cursor);
             Cursor.endEditBlock();
+            // A new block makes Qt jump the view to the top
+            // (Bug 545): bring it back to the cursor, which
+            // is where the typing goes.
+            _TextEdit->ensureCursorVisible();
             return true;
         }
         if ((Plain && Role == QLatin1String("term")) ||
@@ -8719,6 +9190,10 @@ bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
             Cursor.setCharFormat(Typing);
             _TextEdit->setTextCursor(Cursor);
             Cursor.endEditBlock();
+            // A new block makes Qt jump the view to the top
+            // (Bug 545): bring it back to the cursor, which
+            // is where the typing goes.
+            _TextEdit->ensureCursorVisible();
             return true;
         }
         // Shift+Enter in a term keeps the edit's own soft break.
@@ -8746,6 +9221,10 @@ bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
         Cursor.setCharFormat(Typing);
         _TextEdit->setTextCursor(Cursor);
         Cursor.endEditBlock();
+        // A new block makes Qt jump the view to the top
+        // (Bug 545): bring it back to the cursor, which
+        // is where the typing goes.
+        _TextEdit->ensureCursorVisible();
         return true;
     }
     if (Plain && Role == QLatin1String("continuation")) {
@@ -8783,6 +9262,10 @@ bool TextEditor::eventFilter(QObject* Watched, QEvent* Event)
         Cursor.setCharFormat(Typing);
         _TextEdit->setTextCursor(Cursor);
         Cursor.endEditBlock();
+        // A new block makes Qt jump the view to the top
+        // (Bug 545): bring it back to the cursor, which
+        // is where the typing goes.
+        _TextEdit->ensureCursorVisible();
         return true;
     }
     // Enter in an item keeps the edit's own handling: a new item.
@@ -12707,6 +13190,30 @@ bool TextEditor::PickXrefForm(QWidget* Parent, const QString& Anchor,
     return true;
 }
 
+bool TextEditor::EditInlineElement(QWidget* Parent, const QString& Title,
+                                   xmlNodePtr Element,
+                                   const QString& ContainerName,
+                                   const DocDocument* Document)
+{
+    if (Element == nullptr) {
+        return false;
+    }
+    DocInlineDialog Dialog(Parent, Title, Element, ContainerName, Document);
+    if (Dialog.exec() != QDialog::Accepted) {
+        return false;
+    }
+    bool HasContent = Dialog.WriteBack(Element);
+    if (!HasContent &&
+        (ContainerName == QLatin1String("annotation") ||
+         ContainerName == QLatin1String("refcontent"))) {
+        // An annotation or refcontent left empty goes away; a
+        // name stays, even empty, since its owner still needs
+        // the element to fill in.
+        DocDocument::RemoveNode(Element);
+    }
+    return true;
+}
+
 /**
  * @brief Puts the caret just after a link, with the format the
  *        text would have without the link.
@@ -14092,8 +14599,10 @@ void TextEditor::EditFigure()
     // be stale when the author has typed in the figure.
     QStringList ArtLines;
     QString Caption;
+    QVector<QTextBlock> CaptionBlocks;
     for (const QTextBlock& RegionBlock : Region) {
         if (FigureRoleOf(RegionBlock) == QLatin1String("caption")) {
+            CaptionBlocks.append(RegionBlock);
             if (!Caption.isEmpty()) {
                 Caption += QLatin1Char(' ');
             }
@@ -14138,13 +14647,45 @@ void TextEditor::EditFigure()
             xmlFreeNode(Node);
         }
     }
+    // The caption's runs for the markup editor: a <name> node
+    // built from the caption blocks, which hold the current
+    // caption text and its markup (the payload copy may be
+    // stale when the author typed in the caption). The dialog
+    // edits this node in place; the caller transplants its
+    // children into the figure's <name> on accept. Only for a
+    // <figure>: an artset or bare artwork carries no <name>.
+    xmlNodePtr CaptionNameNode = nullptr;
+    if (DocDocument::NodeNameEquals(PayloadNode, "figure")) {
+        CaptionNameNode = NewNode("name");
+        QVector<DocEvent> CaptionEvents;
+        bool FirstCaptionBlock = true;
+        for (const QTextBlock& CaptionBlock : CaptionBlocks) {
+            if (!FirstCaptionBlock) {
+                DocEvent Space;
+                Space.EventKind = DocEvent::Kind::TextRun;
+                Space.Text = QStringLiteral(" ");
+                CaptionEvents.append(Space);
+            }
+            FirstCaptionBlock = false;
+            AppendBlockEvents(CaptionEvents, CaptionBlock);
+        }
+        int CaptionPos = 0;
+        BuildNodeRuns(CaptionEvents, CaptionPos, CaptionNameNode,
+                      DisplayNamesForDocument(Document));
+    }
     FigureEditorDialog Dialog(this);
     Dialog.setArtworkText(ArtworkText);
     Dialog.setCaption(Caption);
+    if (CaptionNameNode != nullptr) {
+        Dialog.setNameNode(CaptionNameNode, _Document);
+    }
     Dialog.setAnchor(SuggestedAnchor);
     Dialog.setTagRows(TagRows);
     if (Dialog.exec() != QDialog::Accepted) {
         xmlFreeNode(PayloadNode);
+        if (CaptionNameNode != nullptr) {
+            xmlFreeNode(CaptionNameNode);
+        }
         return;
     }
     QString NewArtwork = Dialog.artworkText();
@@ -14243,7 +14784,20 @@ void TextEditor::EditFigure()
                 xmlAddChild(FigureInBody, NameNode);
             }
         }
-        DocDocument::SetNodeText(NameNode, NewCaption);
+        // The caption's runs, edited in the dialog, replace
+        // the name's children: SetNodeText would drop the
+        // markup. With no edited node (no caption blocks),
+        // fall back to the plain text.
+        xmlNodePtr EditedName = Dialog.nameNode();
+        if (EditedName != nullptr) {
+            DocDocument::ClearChildren(NameNode);
+            for (xmlNodePtr Child = EditedName->children; Child != nullptr;
+                 Child = Child->next) {
+                xmlAddChild(NameNode, DocDocument::CopyNode(Child));
+            }
+        } else {
+            DocDocument::SetNodeText(NameNode, NewCaption);
+        }
     }
     DocDocument::SetNodeAttribute(FigureInBody, "anchor", NewAnchor);
     // The old tag-list group, by the old anchor: the start
@@ -14303,6 +14857,9 @@ void TextEditor::EditFigure()
         xmlFreeNode(Node);
     }
     xmlFreeNode(PayloadNode);
+    if (CaptionNameNode != nullptr) {
+        xmlFreeNode(CaptionNameNode);
+    }
     // Bug 538: SetBodyNodes rebuilds the text while
     // _SettingParagraphs is set, so OnTextDocumentChanged
     // swallows the change and never emits TextChanged. The

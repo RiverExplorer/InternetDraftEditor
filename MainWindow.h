@@ -233,9 +233,13 @@ private slots:
     void OnMoveReferenceGroupDown();
 
     /**
-     * @brief Writes the edited reference list name into the document.
+     * @brief Opens the inline editor for the shown reference
+     *        list name.
+     *
+     * The list's <name> holds formatted text; the form shows
+     * the plain text and the pop-up edits the runs.
      */
-    void OnReferenceGroupNameEdited(const QString& Text);
+    void OnEditReferenceGroupName();
 
     /**
      * @brief Adds a display name for a reference, asking for the
@@ -259,6 +263,19 @@ private slots:
      *        its anchor first.
      */
     void OnAddReferenceEntry();
+
+    /**
+     * @brief Adds a reference group to the shown list, asking for
+     *        its anchor first, then for its first entry's anchor.
+     *        A group always holds at least one entry.
+     */
+    void OnAddReferenceGroupEntry();
+
+    /**
+     * @brief Adds a reference entry to the shown reference group,
+     *        asking for its anchor first.
+     */
+    void OnAddEntryToReferenceGroup();
 
     /**
      * @brief Carries out a References-menu request from a text editor.
@@ -374,9 +391,50 @@ private slots:
     void OnMoveReferenceEntryDown();
 
     /**
+     * @brief Removes the shown reference group and its entries,
+     *        after confirming. A cited group is refused.
+     */
+    void OnRemoveReferenceGroupEntry();
+
+    /**
+     * @brief Moves the shown reference group up among its list's entries.
+     */
+    void OnMoveReferenceGroupEntryUp();
+
+    /**
+     * @brief Moves the shown reference group down among its list's entries.
+     */
+    void OnMoveReferenceGroupEntryDown();
+
+    /**
+     * @brief Writes the edited reference group fields into the document.
+     */
+    void OnReferenceGroupEntryEdited();
+
+    /**
+     * @brief Fills the reference group form with the shown group.
+     */
+    void FillReferenceGroupEntryForm();
+
+    /**
      * @brief Writes the edited reference entry fields into the document.
+     *
+     * The annotation and refcontent are not written here: they
+     * hold formatted text and are edited in the inline pop-up.
      */
     void OnReferenceEntryEdited();
+
+    /**
+     * @brief Opens the inline editor for the shown entry's
+     *        annotation, creating the element when missing.
+     */
+    void OnEditReferenceAnnotation();
+
+    /**
+     * @brief Opens the inline editor for the shown entry's
+     *        refcontent, creating the element when missing.
+     */
+    void OnEditReferenceRefContent();
 
     /**
      * @brief Writes the reference entry's stream choice into the document.
@@ -637,9 +695,12 @@ private slots:
     void OnDocumentSeriesChanged();
 
     /**
-     * @brief Writes the edited note name into the document.
+     * @brief Opens the inline editor for the note's name.
+     *
+     * The note's <name> holds formatted text; the form shows
+     * the plain text and the pop-up edits the runs.
      */
-    void OnSettingsNoteNameEdited(const QString& Text);
+    void OnEditSettingsNoteName();
 
     /**
      * @brief Writes the note's remove-before-publishing choice
@@ -685,9 +746,14 @@ private slots:
     void OnPostalModeChanged();
 
     /**
-     * @brief Writes the edited section title into the document.
+     * @brief Opens the inline editor for the shown section title.
+     *
+     * The section's <name> holds formatted text; the form shows
+     * the plain text and the pop-up edits the runs. Accepting
+     * refreshes the outline text and the derived anchor, as a
+     * typed title did.
      */
-    void OnSectionTitleEdited(const QString& Text);
+    void OnEditSectionTitle();
 
     /**
      * @brief Writes the edited section anchor into the document.
@@ -718,6 +784,10 @@ private slots:
 private:
     /**
      * @brief The kinds of outline item, stored in Qt::UserRole.
+     *
+     * KindReferenceGroup is a <references> list. A <referencegroup>
+     * element is a different thing — a group of references inside
+     * a list — and has its own kind, KindReferenceGroupEntry.
      */
     enum OutlineKind {
         KindFront,
@@ -731,6 +801,7 @@ private:
         KindReferences,
         KindReferenceGroup,
         KindReferenceEntry,
+        KindReferenceGroupEntry,
         KindReferenceAuthor,
         KindReferenceInclude,
         KindDocumentSettings
@@ -930,6 +1001,44 @@ private:
     xmlNodePtr FindReferenceEntry(const QString& Group, int Entry);
 
     /**
+     * @brief Finds the reference group at a list path and group index.
+     * @param Group The list path, such as "0" or "0.1".
+     * @param GroupIndex The index of the <referencegroup> in that list.
+     * @return The group node (borrowed), or nullptr when an index
+     *         is bad.
+     */
+    xmlNodePtr FindReferenceGroupEntry(const QString& Group, int GroupIndex);
+
+    /**
+     * @brief Finds the reference entry in a group, at a list path,
+     *        group index, and entry index.
+     * @param Group The list path, such as "0" or "0.1".
+     * @param GroupIndex The index of the <referencegroup> in that list.
+     * @param Entry The entry index in that group.
+     * @return The entry node (borrowed), or nullptr when an index
+     *         is bad.
+     */
+    xmlNodePtr FindReferenceEntryInGroup(const QString& Group, int GroupIndex,
+                                         int Entry);
+
+    /**
+     * @brief Returns the reference entry the entry form shows.
+     *
+     * A plain entry in the shown list, or an entry inside the
+     * shown list's reference group when _ReferenceEntryGroupIndex
+     * names one.
+     * @return The entry node (borrowed), or nullptr when none is shown.
+     */
+    xmlNodePtr ShownReferenceEntry();
+
+    /**
+     * @brief Returns the outline key of the reference entry the
+     *        entry form shows, group-aware.
+     * @return The key, such as "refentry:0.2" or "refentry:0.g1.2".
+     */
+    QString ShownReferenceEntryKey() const;
+
+    /**
      * @brief Fills the section form with the shown section.
      */
     void FillSectionForm();
@@ -1098,6 +1207,11 @@ private:
     // has not been filled for this document must not overwrite the
     // loaded abstract.
     bool _AbstractEditCurrent;
+    // Bug 528 fix: true only while the section body editor holds
+    // content filled from the current document. A sync from an
+    // editor that has not been filled for this document must not
+    // overwrite the loaded section body.
+    bool _SectionBodyCurrent;
     std::unique_ptr<SpellChecker> _SpellChecker;
     QString _SelectedKey;
     int _AuthorIndex;
@@ -1105,6 +1219,13 @@ private:
     int _AuthorEntry;
     QString _ReferenceGroupPath;
     int _ReferenceEntryIndex;
+    // The <referencegroup> holding the shown entry, or -1 for a
+    // plain entry in the list. An entry inside a group is
+    // addressed by list path, group index, and entry index.
+    int _ReferenceEntryGroupIndex;
+    // The <referencegroup> the group form shows, as its index
+    // in the shown list, or -1 when no group is shown.
+    int _ReferenceGroupEntryIndex;
     int _ReferenceAuthorIndex;
     int _ReferenceIncludeIndex;
     QString _SectionPath;
@@ -1150,12 +1271,14 @@ private:
     QRadioButton* _EditorRadio;
     QLabel* _AuthorPreservedLabel;
     QLineEdit* _SectionTitleEdit;
+    QPushButton* _EditSectionTitleButton;
     QLineEdit* _SectionAnchorEdit;
     TextEditor* _SectionBodyEdit;
     QLabel* _SectionPreservedLabel;
     QLabel* _SectionRequiredLabel;
     QLineEdit* _ReferenceGroupNameEdit;
     QPushButton* _AddReferenceEntryButton;
+    QPushButton* _AddReferenceGroupButton;
     QPushButton* _AddNestedListButton;
     QLabel* _ReferenceGroupPreservedLabel;
     QLabel* _ReferenceIncludeLabel;
@@ -1172,6 +1295,7 @@ private:
     QComboBox* _ReferenceStreamCombo;
     QTableWidget* _ReferenceSeriesTable;
     QLineEdit* _ReferenceAnnotationEdit;
+    QLineEdit* _ReferenceRefContentEdit;
     QComboBox* _ReferenceMoveToCombo;
     QRadioButton* _ReferenceNormativeRadio;
     QRadioButton* _ReferenceInformativeRadio;
@@ -1187,6 +1311,10 @@ private:
     QRadioButton* _ReferenceEditorRadio;
     QPushButton* _RemoveReferenceAuthorButton;
     QLabel* _ReferenceEntryPreservedLabel;
+    QLineEdit* _ReferenceGroupAnchorEdit;
+    QLineEdit* _ReferenceGroupTargetEdit;
+    QLineEdit* _ReferenceGroupDerivedAnchorEdit;
+    QLabel* _ReferenceGroupEntryPreservedLabel;
     QLineEdit* _SettingsTitleEdit;
     QLineEdit* _SettingsTitleAbbrevEdit;
     QLineEdit* _SettingsTitleAsciiEdit;

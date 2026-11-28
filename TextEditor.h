@@ -174,6 +174,39 @@ public:
                              QString& Section);
 
     /**
+     * @brief Edits one inline element's runs in a small pop-up dialog.
+     *
+     * The element's children show as formatted text: bold, italic,
+     * teletype, subscript, superscript, and BCP 14 each have a
+     * toggle button, and the other tags the element may hold
+     * (links, references, comments) are kept as they are, with
+     * their attributes, rather than offered as buttons. Enter
+     * adds a soft line break instead of a new paragraph, since
+     * the element holds inline content only. The dialog writes
+     * the edited runs back into the element when the user
+     * accepts; cancelling leaves the element untouched.
+     * @param Parent The dialog parent.
+     * @param Title The dialog window title.
+     * @param Element The live element to edit; must be non-null.
+     * @param ContainerName The element name: "annotation",
+     *        "refcontent", or "name". It decides which tags the
+     *        toggle buttons may add, and whether an element left
+     *        empty is removed.
+     * @param Document The document, for display names; may be
+     *        null, in which case no display names are shown.
+     * @return True when the user accepted: the element was
+     *         updated in place, and an annotation or refcontent
+     *         left empty was removed. False when cancelled.
+     * @note A BCP 14 button wraps the text in the tag; the
+     *       keyword itself is just the typed text, and the tag
+     *       does not check the word.
+     */
+    static bool EditInlineElement(QWidget* Parent, const QString& Title,
+                                  xmlNodePtr Element,
+                                  const QString& ContainerName,
+                                  const DocDocument* Document);
+
+    /**
      * @brief Creates the text editor.
      * @param Parent The parent widget, or nullptr.
      */
